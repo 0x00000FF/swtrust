@@ -130,7 +130,10 @@ impl Unmarshal for TpmtSignature {
             }
             alg::HMAC => SignatureValue::Hmac(TpmtHa::unmarshal(r)?),
             alg::NULL => SignatureValue::Null,
-            _ => return Err(TpmRc(rc::SIGNATURE)),
+            // Table 219 makes sigAlg a TPMI_ALG_SIG_SCHEME, and Table 83 gives
+            // that interface type TPM_RC_SCHEME. TPM_RC_SIGNATURE is for a
+            // signature value that fails to verify.
+            _ => return Err(TpmRc(rc::SCHEME)),
         };
         Ok(TpmtSignature {
             sig_alg,
@@ -299,9 +302,15 @@ mod tests {
 
     #[test]
     fn unknown_signature_algorithm_is_rejected() {
+        // Table 219 makes sigAlg an interface type, so a bad selector is
+        // TPM_RC_SCHEME rather than TPM_RC_SIGNATURE.
         assert_eq!(
             TpmtSignature::from_bytes(&[0x00, 0x06]).unwrap_err(),
-            TpmRc(rc::SIGNATURE)
+            TpmRc(rc::SCHEME)
+        );
+        assert_eq!(
+            TpmtSignature::from_bytes(&[0x00, 0x17]).unwrap_err(),
+            TpmRc(rc::SCHEME)
         );
     }
 

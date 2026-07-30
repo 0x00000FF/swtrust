@@ -93,11 +93,14 @@ impl Unmarshal for SchemeXor {
     }
 }
 
-/// True when `id` names a key derivation function, Part 2 Table 82.
+/// True when `id` names a key derivation function this TPM implements.
+///
+/// Part 2 Table 82 also lists TPM_ALG_HKDF, which this TPM does not implement
+/// and therefore does not accept.
 pub fn is_kdf(id: u16) -> bool {
     matches!(
         id,
-        alg::MGF1 | alg::KDF1_SP800_56A | alg::KDF2 | alg::KDF1_SP800_108 | alg::HKDF
+        alg::MGF1 | alg::KDF1_SP800_56A | alg::KDF2 | alg::KDF1_SP800_108
     )
 }
 
@@ -138,9 +141,47 @@ pub enum DetailKind {
     Xor,
 }
 
-/// The detail shape for a signature or key exchange scheme selector.
+/// Selectors a TPMI_ALG_RSA_SCHEME accepts, Part 2 Table 189.
+pub fn is_rsa_scheme(scheme: u16) -> bool {
+    matches!(
+        scheme,
+        alg::RSASSA | alg::RSAPSS | alg::RSAES | alg::OAEP | alg::NULL
+    )
+}
+
+/// Selectors a TPMI_ALG_RSA_DECRYPT accepts, Part 2 Table 192.
+pub fn is_rsa_decrypt_scheme(scheme: u16) -> bool {
+    matches!(scheme, alg::RSAES | alg::OAEP | alg::NULL)
+}
+
+/// Selectors a TPMI_ALG_ECC_SCHEME accepts, Part 2 Table 200.
+pub fn is_ecc_scheme(scheme: u16) -> bool {
+    matches!(
+        scheme,
+        alg::ECDSA | alg::ECDAA | alg::SM2 | alg::ECSCHNORR | alg::ECDH | alg::ECMQV | alg::NULL
+    )
+}
+
+/// Selectors a TPMI_ALG_SIG_SCHEME accepts, Part 2 Table 83.
+pub fn is_signature_scheme(scheme: u16) -> bool {
+    matches!(
+        scheme,
+        alg::RSASSA
+            | alg::RSAPSS
+            | alg::ECDSA
+            | alg::ECDAA
+            | alg::SM2
+            | alg::ECSCHNORR
+            | alg::HMAC
+            | alg::NULL
+    )
+}
+
+/// The detail shape for any asymmetric or signature scheme selector.
 ///
-/// Returns `None` when the selector is not a scheme this TPM accepts.
+/// Returns `None` when the selector names no scheme at all. Which selectors a
+/// particular structure accepts is narrower and is enforced by the
+/// `unmarshal_*` functions below.
 pub fn asym_detail_kind(scheme: u16) -> Option<DetailKind> {
     Some(match scheme {
         alg::NULL => DetailKind::Empty,
@@ -219,14 +260,52 @@ impl Scheme {
         self.detail.hash_alg()
     }
 
-    /// Unmarshal using the asymmetric and signature selector set.
-    pub fn unmarshal_asym(r: &mut Reader<'_>) -> TpmResult<Scheme> {
+    /// Unmarshal a scheme whose selector must satisfy `accepts`.
+    ///
+    /// `code` is the response code the interface type calls for when the
+    /// selector is not one it allows.
+    fn unmarshal_checked(
+        r: &mut Reader<'_>,
+        accepts: fn(u16) -> bool,
+        code: u32,
+    ) -> TpmResult<Scheme> {
         let scheme = r.u16()?;
-        let kind = asym_detail_kind(scheme).ok_or(TpmRc(rc::SCHEME))?;
+        if !accepts(scheme) {
+            return Err(TpmRc(code));
+        }
+        let kind = asym_detail_kind(scheme).ok_or(TpmRc(code))?;
         Ok(Scheme {
             scheme,
             detail: read_detail(r, kind)?,
         })
+    }
+
+    /// Unmarshal a TPMT_RSA_SCHEME, Part 2 Table 191.
+    ///
+    /// Table 189 makes the selector a TPMI_ALG_RSA_SCHEME, whose error is
+    /// TPM_RC_VALUE.
+    pub fn unmarshal_rsa_scheme(r: &mut Reader<'_>) -> TpmResult<Scheme> {
+        Scheme::unmarshal_checked(r, is_rsa_scheme, rc::VALUE)
+    }
+
+    /// Unmarshal a TPMT_RSA_DECRYPT, Part 2 Table 193.
+    pub fn unmarshal_rsa_decrypt(r: &mut Reader<'_>) -> TpmResult<Scheme> {
+        Scheme::unmarshal_checked(r, is_rsa_decrypt_scheme, rc::VALUE)
+    }
+
+    /// Unmarshal a TPMT_ECC_SCHEME, Part 2 Table 203.
+    pub fn unmarshal_ecc_scheme(r: &mut Reader<'_>) -> TpmResult<Scheme> {
+        Scheme::unmarshal_checked(r, is_ecc_scheme, rc::SCHEME)
+    }
+
+    /// Unmarshal a TPMT_SIG_SCHEME, Part 2 Table 183.
+    pub fn unmarshal_sig_scheme(r: &mut Reader<'_>) -> TpmResult<Scheme> {
+        Scheme::unmarshal_checked(r, is_signature_scheme, rc::SCHEME)
+    }
+
+    /// Unmarshal a TPMT_ASYM_SCHEME, which accepts every asymmetric selector.
+    pub fn unmarshal_asym(r: &mut Reader<'_>) -> TpmResult<Scheme> {
+        Scheme::unmarshal_checked(r, |s| asym_detail_kind(s).is_some(), rc::SCHEME)
     }
 
     /// Unmarshal a TPMT_KEYEDHASH_SCHEME, Part 2 Table 179.
@@ -311,14 +390,26 @@ impl SymDef {
         self.algorithm == alg::NULL
     }
 
-    /// True when `id` names a symmetric block cipher, Part 2 Table 80.
+    /// True when `id` names a symmetric block cipher this TPM implements.
+    ///
+    /// Part 2 Table 80 also lists TDES, SM4 and Camellia. Only the algorithms
+    /// this TPM actually offers are accepted, so a template naming another one
+    /// is refused when it is unmarshalled rather than later.
     pub fn is_block_cipher(id: u16) -> bool {
-        matches!(id, alg::AES | alg::SM4 | alg::CAMELLIA | alg::TDES)
+        id == alg::AES
     }
 
     /// True when `id` names a block cipher mode, Part 2 Table 81.
     pub fn is_mode(id: u16) -> bool {
         matches!(id, alg::CTR | alg::OFB | alg::CBC | alg::CFB | alg::ECB)
+    }
+
+    /// True when `key_bits` is a size Part 2 Table 158 allows for `algorithm`.
+    pub fn is_key_size(algorithm: u16, key_bits: u16) -> bool {
+        match algorithm {
+            alg::AES => crate::tpm::config::IMPLEMENTED_AES_KEY_BITS.contains(&key_bits),
+            _ => false,
+        }
     }
 
     /// Unmarshal a TPMT_SYM_DEF, which may select TPM_ALG_XOR.
@@ -342,6 +433,11 @@ impl SymDef {
             return Err(TpmRc(rc::SYMMETRIC));
         }
         let key_bits = r.u16()?;
+        // Table 158 makes the key size an interface type whose error is
+        // TPM_RC_VALUE.
+        if !SymDef::is_key_size(algorithm, key_bits) {
+            return Err(TpmRc(rc::VALUE));
+        }
         let mode = r.u16()?;
         if !SymDef::is_mode(mode) {
             return Err(TpmRc(rc::MODE));

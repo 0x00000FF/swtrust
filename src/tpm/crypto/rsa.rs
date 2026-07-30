@@ -1,4 +1,4 @@
-//! RSA.
+﻿//! RSA.
 //!
 //! Part 1 clause 11.2.4 describes what the TPM needs: key generation that can
 //! be repeated from a seed, the raw RSAEP and RSADP primitives, and the OAEP,
@@ -556,7 +556,7 @@ mod tests {
     use crate::tpm::crypto::rand::{Drbg, SeededRng};
 
     fn rng() -> Drbg {
-        Drbg::new(b"rsa test seed", b"").unwrap()
+        Drbg::new(&[0x5au8; 48], b"rsa").unwrap()
     }
 
     /// A 1024 bit key, which is the smallest the TPM accepts, generated once

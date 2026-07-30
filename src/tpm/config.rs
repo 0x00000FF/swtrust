@@ -83,8 +83,15 @@ pub const MAX_VENDOR_BUFFER_SIZE: usize = 1024;
 pub const MAX_OBJECT_CONTEXT: u32 = 2048;
 /// Largest saved session context.
 pub const MAX_SESSION_CONTEXT: u32 = 1024;
-/// Largest total context blob.
-pub const MAX_CONTEXT_SIZE: usize = 4096;
+/// Largest context that is encrypted and saved.
+///
+/// Part 2 Table 257 sizes this as the larger of the object and session
+/// contexts.
+pub const MAX_CONTEXT_SIZE: usize = if MAX_OBJECT_CONTEXT > MAX_SESSION_CONTEXT {
+    MAX_OBJECT_CONTEXT as usize
+} else {
+    MAX_SESSION_CONTEXT as usize
+};
 /// Largest number of octets accepted by TPM2_StirRandom.
 pub const MAX_RNG_ENTROPY_SIZE: usize = 64;
 /// Largest number of algorithms in a TPML_ALG.

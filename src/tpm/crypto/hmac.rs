@@ -4,9 +4,29 @@
 //! that every hash the TPM implements, including the SHA-3 family, can key an
 //! HMAC. Part 1 clause 11.4.10 defines KDFa and KDFe in terms of that HMAC.
 
-use crate::tpm::error::TpmResult;
+use crate::tpm::constants::rc;
+use crate::tpm::error::{TpmRc, TpmResult};
 
 use super::hash::{block_size, digest_size, Hasher};
+
+/// Largest KDF output the TPM will produce, in octets.
+///
+/// Part 2 Table 7 caps a derivation at TPM_MAX_DERIVATION_BITS. Anything larger
+/// is a malformed request rather than a legitimate key size.
+pub const MAX_KDF_BYTES: usize = crate::tpm::constants::TPM_MAX_DERIVATION_BITS as usize / 8;
+
+/// The octet count for a bit count, rejecting anything out of range.
+fn output_len(bits: u32) -> TpmResult<usize> {
+    let bytes = bits
+        .checked_add(7)
+        .ok_or(TpmRc(rc::VALUE))?
+        / 8;
+    let bytes = bytes as usize;
+    if bytes > MAX_KDF_BYTES {
+        return Err(TpmRc(rc::VALUE));
+    }
+    Ok(bytes)
+}
 
 const IPAD: u8 = 0x36;
 const OPAD: u8 = 0x5c;
@@ -98,7 +118,7 @@ pub fn kdfa(
     context_v: &[u8],
     bits: u32,
 ) -> TpmResult<Vec<u8>> {
-    let out_len = ((bits + 7) / 8) as usize;
+    let out_len = output_len(bits)?;
     let digest_len = digest_size(hash_alg)?;
     let mut out = Vec::with_capacity(out_len + digest_len);
     let mut counter: u32 = 0;
@@ -137,7 +157,7 @@ pub fn kdfe(
     party_v: &[u8],
     bits: u32,
 ) -> TpmResult<Vec<u8>> {
-    let out_len = ((bits + 7) / 8) as usize;
+    let out_len = output_len(bits)?;
     let digest_len = digest_size(hash_alg)?;
     let mut out = Vec::with_capacity(out_len + digest_len);
     let mut counter: u32 = 0;
@@ -163,6 +183,9 @@ pub fn kdfe(
 
 /// MGF1 from RFC 8017 appendix B.2.1, used by OAEP and PSS.
 pub fn mgf1(hash_alg: u16, seed: &[u8], out_len: usize) -> TpmResult<Vec<u8>> {
+    if out_len > MAX_KDF_BYTES {
+        return Err(TpmRc(rc::VALUE));
+    }
     let digest_len = digest_size(hash_alg)?;
     let mut out = Vec::with_capacity(out_len + digest_len);
     let mut counter: u32 = 0;

@@ -229,13 +229,25 @@ macro_rules! tpml {
     };
 }
 
+/// Octets a capability response may carry beyond the capability selector.
+///
+/// Part 2 clause 10.10 defines `MAX_CAP_DATA = MAX_CAP_BUFFER - sizeof(TPM_CAP)
+/// - sizeof(UINT32)`, and every capability list is bounded by how many of its
+/// elements fit in that space.
+pub const MAX_CAP_DATA: usize = config::MAX_CAP_BUFFER - 4 - 4;
+
+/// The element count that fits in a capability response.
+const fn cap_list_max(element_size: usize) -> usize {
+    MAX_CAP_DATA / element_size
+}
+
 tpml! {
     /// TPML_CC, Part 2 Table 122.
-    TpmlCc, u32, 256
+    TpmlCc, u32, cap_list_max(4)
 }
 tpml! {
     /// TPML_CCA, Part 2 Table 123.
-    TpmlCca, CommandAttributes, 256
+    TpmlCca, CommandAttributes, cap_list_max(4)
 }
 tpml! {
     /// TPML_ALG, Part 2 Table 124.
@@ -243,7 +255,7 @@ tpml! {
 }
 tpml! {
     /// TPML_HANDLE, Part 2 Table 125.
-    TpmlHandle, u32, 256
+    TpmlHandle, u32, cap_list_max(4)
 }
 tpml! {
     /// TPML_DIGEST_VALUES, Part 2 Table 127.
@@ -255,27 +267,31 @@ tpml! {
 }
 tpml! {
     /// TPML_ALG_PROPERTY, Part 2 Table 129.
-    TpmlAlgProperty, AlgProperty, config::MAX_ALG_LIST_SIZE
+    TpmlAlgProperty, AlgProperty, cap_list_max(6)
 }
 tpml! {
     /// TPML_TAGGED_TPM_PROPERTY, Part 2 Table 130.
-    TpmlTaggedTpmProperty, TaggedProperty, 128
+    TpmlTaggedTpmProperty, TaggedProperty, cap_list_max(8)
 }
 tpml! {
     /// TPML_TAGGED_PCR_PROPERTY, Part 2 Table 131.
-    TpmlTaggedPcrProperty, TaggedPcrSelect, 64
+    ///
+    /// Each entry is a UINT32 tag and a TPMS_PCR_SELECT.
+    TpmlTaggedPcrProperty, TaggedPcrSelect, cap_list_max(4 + 1 + config::PCR_SELECT_MAX as usize)
 }
 tpml! {
     /// TPML_ECC_CURVE, Part 2 Table 132.
-    TpmlEccCurve, u16, 64
+    TpmlEccCurve, u16, cap_list_max(2)
 }
 tpml! {
     /// TPML_TAGGED_POLICY, Part 2 Table 133.
-    TpmlTaggedPolicy, TaggedPolicy, 32
+    ///
+    /// Each entry is a handle and a TPMT_HA.
+    TpmlTaggedPolicy, TaggedPolicy, cap_list_max(4 + 2 + crate::tpm::structures::base::MAX_DIGEST_SIZE)
 }
 tpml! {
     /// TPML_ACT_DATA, Part 2 Table 134.
-    TpmlActData, ActData, 16
+    TpmlActData, ActData, cap_list_max(12)
 }
 tpml! {
     /// TPML_PUB_KEY, Part 2 Table 135.
@@ -283,11 +299,14 @@ tpml! {
 }
 tpml! {
     /// TPML_SPDM_SESSION_INFO, Part 2 Table 136.
-    TpmlSpdmSessionInfo, SpdmSessionInfo, 16
+    TpmlSpdmSessionInfo, SpdmSessionInfo, cap_list_max(5)
 }
 tpml! {
     /// TPML_VENDOR_PROPERTY, Part 2 Table 137.
-    TpmlVendorProperty, VendorProperty, 32
+    ///
+    /// Each entry is a property identifier and a TPM2B_VENDOR_PROPERTY, whose
+    /// smallest form is an empty buffer.
+    TpmlVendorProperty, VendorProperty, cap_list_max(4 + 2)
 }
 
 /// TPML_DIGEST, Part 2 Table 126.

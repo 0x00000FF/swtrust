@@ -5,3 +5,4 @@ pub mod names;
 pub mod object;
 pub mod pcr;
 pub mod protect;
+pub mod session;

@@ -563,7 +563,7 @@ mod tests {
     use crate::tpm::crypto::rand::{Drbg, SeededRng};
 
     fn rng() -> Drbg {
-        Drbg::new(b"ecc test seed", b"").unwrap()
+        Drbg::new(&[0x3cu8; 48], b"ecc").unwrap()
     }
 
     const CURVES: &[u16] = &[

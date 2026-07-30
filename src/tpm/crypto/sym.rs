@@ -89,9 +89,13 @@ pub fn crypt(
     if !is_supported_mode(mode) {
         return Err(TpmRc(rc::MODE));
     }
-    // Every mode but CTR and OFB needs an IV of exactly one block; those two
-    // also use a full block as the counter or feedback value.
-    if mode != alg::ECB && iv.len() != AES_BLOCK_SIZE {
+    // Every chaining mode needs an IV of exactly one block. ECB has no IV at
+    // all, and Part 3 Table 64 requires its ivIn and ivOut to be empty.
+    if mode == alg::ECB {
+        if !iv.is_empty() {
+            return Err(TpmRc(rc::SIZE));
+        }
+    } else if iv.len() != AES_BLOCK_SIZE {
         return Err(TpmRc(rc::SIZE));
     }
     if matches!(mode, alg::CBC | alg::ECB) && data.len() % AES_BLOCK_SIZE != 0 {

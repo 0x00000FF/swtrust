@@ -1,5 +1,6 @@
 //! Public and sensitive areas from Part 2 clause 12.
 
+use crate::tpm::config;
 use crate::tpm::constants::{alg, rc};
 use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Reader, Unmarshal, Writer};
@@ -104,18 +105,40 @@ impl PublicParms {
             alg::SYMCIPHER => PublicParms::SymCipher {
                 sym: SymDef::unmarshal_sym_def_object(r)?,
             },
-            alg::RSA => PublicParms::Rsa {
-                symmetric: SymDef::unmarshal_sym_def_object(r)?,
-                scheme: Scheme::unmarshal_asym(r)?,
-                key_bits: r.u16()?,
-                exponent: r.u32()?,
-            },
-            alg::ECC => PublicParms::Ecc {
-                symmetric: SymDef::unmarshal_sym_def_object(r)?,
-                scheme: Scheme::unmarshal_asym(r)?,
-                curve_id: r.u16()?,
-                kdf: Scheme::unmarshal_kdf(r)?,
-            },
+            alg::RSA => {
+                let symmetric = SymDef::unmarshal_sym_def_object(r)?;
+                let scheme = Scheme::unmarshal_rsa_scheme(r)?;
+                let key_bits = r.u16()?;
+                // Table 195 makes keyBits a TPMI_RSA_KEY_BITS, whose error is
+                // TPM_RC_VALUE.
+                if !config::IMPLEMENTED_RSA_KEY_BITS.contains(&key_bits) {
+                    return Err(TpmRc(rc::VALUE));
+                }
+                let exponent = r.u32()?;
+                PublicParms::Rsa {
+                    symmetric,
+                    scheme,
+                    key_bits,
+                    exponent,
+                }
+            }
+            alg::ECC => {
+                let symmetric = SymDef::unmarshal_sym_def_object(r)?;
+                let scheme = Scheme::unmarshal_ecc_scheme(r)?;
+                let curve_id = r.u16()?;
+                // Table 201 makes curveID a TPMI_ECC_CURVE, whose error is
+                // TPM_RC_CURVE.
+                if !config::IMPLEMENTED_CURVES.contains(&curve_id) {
+                    return Err(TpmRc(rc::CURVE));
+                }
+                let kdf = Scheme::unmarshal_kdf(r)?;
+                PublicParms::Ecc {
+                    symmetric,
+                    scheme,
+                    curve_id,
+                    kdf,
+                }
+            }
             _ => return Err(TpmRc(rc::TYPE)),
         })
     }

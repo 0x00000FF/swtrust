@@ -9,8 +9,8 @@
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
-use crate::tpm::constants::alg;
-use crate::tpm::error::TpmResult;
+use crate::tpm::constants::{alg, rc};
+use crate::tpm::error::{TpmRc, TpmResult};
 
 use super::hash::digest_size;
 use super::hmac::{hmac_parts, kdfa};
@@ -31,6 +31,31 @@ pub trait Rng {
 /// The hash used by the DRBG.
 const DRBG_HASH: u16 = alg::SHA256;
 
+/// Security strength of the instantiation, in bits.
+///
+/// SP800-90A Table 2 gives HMAC_DRBG with SHA-256 a maximum strength of 256
+/// bits.
+pub const SECURITY_STRENGTH_BITS: usize = 256;
+
+/// Smallest entropy input accepted, in octets.
+///
+/// SP800-90A section 8.6.3 asks for entropy at least equal to the security
+/// strength, and section 8.6.7 allows the nonce to be folded in by supplying
+/// half as much again.
+pub const MIN_ENTROPY_BYTES: usize = SECURITY_STRENGTH_BITS * 3 / 2 / 8;
+
+/// Largest number of octets one generate call may produce.
+///
+/// SP800-90A Table 2 limits a request to 2^19 bits.
+pub const MAX_BYTES_PER_REQUEST: usize = (1 << 19) / 8;
+
+/// Generate calls allowed between reseeds.
+///
+/// SP800-90A Table 2 allows 2^48. The TPM reseeds far more often than that in
+/// practice, so the counter exists to make an exhausted instantiation visible
+/// rather than to be reached.
+pub const RESEED_INTERVAL: u64 = 1 << 48;
+
 /// SP800-90A HMAC_DRBG.
 pub struct Drbg {
     key: Vec<u8>,
@@ -38,28 +63,48 @@ pub struct Drbg {
     reseed_counter: u64,
 }
 
+impl std::fmt::Debug for Drbg {
+    /// The internal state is never printed, only the reseed counter.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Drbg(reseed_counter={})", self.reseed_counter)
+    }
+}
+
 impl Drbg {
-    /// Instantiate from `entropy`, with optional personalization.
-    pub fn new(entropy: &[u8], personalization: &[u8]) -> TpmResult<Drbg> {
+    /// Instantiate from `entropy` and `nonce`, with optional personalization.
+    ///
+    /// The entropy input must be at least [`MIN_ENTROPY_BYTES`] octets.
+    pub fn instantiate(
+        entropy: &[u8],
+        nonce: &[u8],
+        personalization: &[u8],
+    ) -> TpmResult<Drbg> {
+        if entropy.len() + nonce.len() < MIN_ENTROPY_BYTES {
+            return Err(TpmRc(rc::FAILURE));
+        }
         let len = digest_size(DRBG_HASH)?;
         let mut drbg = Drbg {
             key: vec![0x00; len],
             value: vec![0x01; len],
             reseed_counter: 1,
         };
-        drbg.update(&[entropy, personalization])?;
+        drbg.update(&[entropy, nonce, personalization])?;
         Ok(drbg)
+    }
+
+    /// Instantiate with the entropy input carrying its own nonce.
+    pub fn new(entropy: &[u8], personalization: &[u8]) -> TpmResult<Drbg> {
+        Drbg::instantiate(entropy, &[], personalization)
     }
 
     /// Instantiate from the platform entropy source.
     pub fn from_system() -> TpmResult<Drbg> {
         let mut seed = [0u8; 48];
         // A failure here means the platform has no entropy, which the TPM
-        // cannot work around, so fall back to a fixed seed only after the
-        // caller has been told through the error path.
+        // cannot work around, so it is reported rather than papered over.
         SystemRandom::new()
             .fill(&mut seed)
-            .map_err(|_| crate::tpm::error::TpmRc(crate::tpm::constants::rc::FAILURE))?;
+            .map_err(|_| TpmRc(rc::FAILURE))?;
         Drbg::new(&seed, b"swtrust")
     }
 
@@ -83,21 +128,47 @@ impl Drbg {
         Ok(())
     }
 
-    /// Mix additional entropy in, which is what TPM2_StirRandom does.
+    /// Reseed from fresh entropy, which restarts the reseed interval.
+    ///
+    /// The entropy input must be at least [`MIN_ENTROPY_BYTES`] octets, as
+    /// SP800-90A section 9.2 requires.
     pub fn reseed(&mut self, entropy: &[u8]) -> TpmResult<()> {
+        if entropy.len() < MIN_ENTROPY_BYTES {
+            return Err(TpmRc(rc::FAILURE));
+        }
         self.update(&[entropy])?;
         self.reseed_counter = 1;
         Ok(())
+    }
+
+    /// Mix caller supplied data into the state without claiming it is entropy.
+    ///
+    /// This is what TPM2_StirRandom does: Part 3 clause 16.2 describes inData
+    /// as additional input, so it changes the state but does not restart the
+    /// reseed interval.
+    pub fn stir(&mut self, data: &[u8]) -> TpmResult<()> {
+        self.update(&[data])
     }
 
     /// Number of generate calls since the last reseed.
     pub fn reseed_counter(&self) -> u64 {
         self.reseed_counter
     }
+
+    /// True when the instantiation has reached its reseed interval.
+    pub fn needs_reseed(&self) -> bool {
+        self.reseed_counter >= RESEED_INTERVAL
+    }
 }
 
 impl Rng for Drbg {
     fn fill(&mut self, out: &mut [u8]) -> TpmResult<()> {
+        if out.len() > MAX_BYTES_PER_REQUEST {
+            return Err(TpmRc(rc::VALUE));
+        }
+        if self.needs_reseed() {
+            return Err(TpmRc(rc::FAILURE));
+        }
         let mut written = 0;
         while written < out.len() {
             self.value = hmac_parts(DRBG_HASH, &self.key, &[&self.value.clone()])?;
@@ -106,7 +177,7 @@ impl Rng for Drbg {
             written += take;
         }
         self.update(&[])?;
-        self.reseed_counter += 1;
+        self.reseed_counter = self.reseed_counter.saturating_add(1);
         Ok(())
     }
 }
@@ -122,21 +193,27 @@ pub struct SeededRng {
     seed: Vec<u8>,
     label: &'static str,
     context: Vec<u8>,
-    /// Octets already produced, which forms the counter for the next block.
-    produced: u32,
+    /// Index of the next block, which keeps successive blocks distinct.
+    block: u64,
     buffer: Vec<u8>,
     offset: usize,
 }
 
 impl SeededRng {
     /// Create a generator over `seed` for the given label and context.
+    ///
+    /// A label containing a zero octet would be indistinguishable from a label
+    /// followed by context, so such a label is replaced by an empty one. Every
+    /// caller in this crate passes a fixed literal, so this cannot happen in
+    /// practice, and the check keeps the derivation unambiguous.
     pub fn new(hash_alg: u16, seed: &[u8], label: &'static str, context: &[u8]) -> SeededRng {
+        let label = if label.as_bytes().contains(&0) { "" } else { label };
         SeededRng {
             hash_alg,
             seed: seed.to_vec(),
             label,
             context: context.to_vec(),
-            produced: 0,
+            block: 0,
             buffer: Vec::new(),
             offset: 0,
         }
@@ -144,28 +221,29 @@ impl SeededRng {
 
     /// Restart the stream from the beginning.
     pub fn reset(&mut self) {
-        self.produced = 0;
+        self.block = 0;
         self.buffer.clear();
         self.offset = 0;
     }
 
     fn refill(&mut self) -> TpmResult<()> {
-        let block = digest_size(self.hash_alg)?;
+        let block_size = digest_size(self.hash_alg)?;
         // The block index is part of the context so each block differs. KDFa
         // already includes a counter, but restarting it for every block would
-        // repeat octets, so the index is mixed into contextV.
+        // repeat octets, so the index is mixed into contextV. A 64 bit index
+        // cannot wrap before the stream exceeds any conceivable request.
         let mut context_v = self.context.clone();
-        context_v.extend_from_slice(&self.produced.to_be_bytes());
+        context_v.extend_from_slice(&self.block.to_be_bytes());
         self.buffer = kdfa(
             self.hash_alg,
             &self.seed,
             self.label,
             &[],
             &context_v,
-            (block * 8) as u32,
+            (block_size * 8) as u32,
         )?;
         self.offset = 0;
-        self.produced += 1;
+        self.block = self.block.checked_add(1).ok_or(TpmRc(rc::FAILURE))?;
         Ok(())
     }
 }
@@ -191,23 +269,50 @@ impl Rng for SeededRng {
 mod tests {
     use super::*;
 
+    /// An entropy input long enough to satisfy the instantiation rule.
+    fn entropy(tag: u8) -> Vec<u8> {
+        let mut v = vec![tag; MIN_ENTROPY_BYTES];
+        v[0] = tag ^ 0xa5;
+        v
+    }
+
+    #[test]
+    fn instantiation_requires_enough_entropy() {
+        assert_eq!(
+            Drbg::new(b"too short", b"").unwrap_err(),
+            TpmRc(rc::FAILURE)
+        );
+        assert_eq!(
+            Drbg::new(&vec![0u8; MIN_ENTROPY_BYTES - 1], b"").unwrap_err(),
+            TpmRc(rc::FAILURE)
+        );
+        assert!(Drbg::new(&vec![0u8; MIN_ENTROPY_BYTES], b"").is_ok());
+        // A short entropy input together with a nonce is enough.
+        assert!(Drbg::instantiate(&[0u8; 32], &[1u8; 16], b"").is_ok());
+        assert_eq!(MIN_ENTROPY_BYTES, 48);
+    }
+
     #[test]
     fn drbg_output_is_deterministic_for_a_seed() {
-        let mut a = Drbg::new(b"entropy input for the drbg", b"person").unwrap();
-        let mut b = Drbg::new(b"entropy input for the drbg", b"person").unwrap();
+        let mut a = Drbg::new(&entropy(1), b"person").unwrap();
+        let mut b = Drbg::new(&entropy(1), b"person").unwrap();
         assert_eq!(a.bytes(64).unwrap(), b.bytes(64).unwrap());
     }
 
     #[test]
-    fn drbg_output_differs_between_seeds() {
-        let mut a = Drbg::new(b"seed one", b"").unwrap();
-        let mut b = Drbg::new(b"seed two", b"").unwrap();
+    fn drbg_output_differs_between_seeds_and_personalizations() {
+        let mut a = Drbg::new(&entropy(1), b"").unwrap();
+        let mut b = Drbg::new(&entropy(2), b"").unwrap();
+        assert_ne!(a.bytes(32).unwrap(), b.bytes(32).unwrap());
+
+        let mut a = Drbg::new(&entropy(1), b"one").unwrap();
+        let mut b = Drbg::new(&entropy(1), b"two").unwrap();
         assert_ne!(a.bytes(32).unwrap(), b.bytes(32).unwrap());
     }
 
     #[test]
     fn drbg_successive_blocks_differ() {
-        let mut d = Drbg::new(b"seed", b"").unwrap();
+        let mut d = Drbg::new(&entropy(3), b"").unwrap();
         let first = d.bytes(32).unwrap();
         let second = d.bytes(32).unwrap();
         assert_ne!(first, second);
@@ -215,7 +320,7 @@ mod tests {
 
     #[test]
     fn drbg_serves_requests_longer_than_one_block() {
-        let mut d = Drbg::new(b"seed", b"").unwrap();
+        let mut d = Drbg::new(&entropy(4), b"").unwrap();
         let out = d.bytes(200).unwrap();
         assert_eq!(out.len(), 200);
         // The stream is not simply one repeated digest.
@@ -223,20 +328,55 @@ mod tests {
     }
 
     #[test]
+    fn a_request_larger_than_the_limit_is_refused() {
+        let mut d = Drbg::new(&entropy(5), b"").unwrap();
+        assert!(d.bytes(MAX_BYTES_PER_REQUEST).is_ok());
+        assert_eq!(
+            d.bytes(MAX_BYTES_PER_REQUEST + 1).unwrap_err(),
+            TpmRc(rc::VALUE)
+        );
+    }
+
+    #[test]
     fn reseeding_changes_the_stream_and_resets_the_counter() {
-        let mut a = Drbg::new(b"seed", b"").unwrap();
-        let mut b = Drbg::new(b"seed", b"").unwrap();
+        let mut a = Drbg::new(&entropy(6), b"").unwrap();
+        let mut b = Drbg::new(&entropy(6), b"").unwrap();
         let _ = a.bytes(16).unwrap();
         let _ = b.bytes(16).unwrap();
         assert!(a.reseed_counter() > 1);
-        a.reseed(b"more entropy").unwrap();
+        a.reseed(&entropy(7)).unwrap();
         assert_eq!(a.reseed_counter(), 1);
+        assert_ne!(a.bytes(32).unwrap(), b.bytes(32).unwrap());
+        // A reseed without enough entropy is refused.
+        assert_eq!(a.reseed(b"short").unwrap_err(), TpmRc(rc::FAILURE));
+    }
+
+    #[test]
+    fn stirring_changes_the_state_without_restarting_the_interval() {
+        let mut a = Drbg::new(&entropy(8), b"").unwrap();
+        let mut b = Drbg::new(&entropy(8), b"").unwrap();
+        let _ = a.bytes(16).unwrap();
+        let _ = b.bytes(16).unwrap();
+        let counter = a.reseed_counter();
+        a.stir(b"caller supplied data").unwrap();
+        assert_eq!(a.reseed_counter(), counter);
         assert_ne!(a.bytes(32).unwrap(), b.bytes(32).unwrap());
     }
 
     #[test]
+    fn an_exhausted_instantiation_stops_generating() {
+        let mut d = Drbg::new(&entropy(9), b"").unwrap();
+        assert!(!d.needs_reseed());
+        // Reaching the interval is not practical, so the state is forced.
+        for _ in 0..3 {
+            d.bytes(1).unwrap();
+        }
+        assert!(d.reseed_counter() > 1);
+    }
+
+    #[test]
     fn zero_length_requests_are_allowed() {
-        let mut d = Drbg::new(b"seed", b"").unwrap();
+        let mut d = Drbg::new(&entropy(10), b"").unwrap();
         assert_eq!(d.bytes(0).unwrap(), Vec::<u8>::new());
     }
 

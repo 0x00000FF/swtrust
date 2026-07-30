@@ -13,10 +13,36 @@ pub const SIZEOF_TPMU_HA: usize = MAX_DIGEST_SIZE;
 pub const SIZEOF_TPMT_HA: usize = 2 + SIZEOF_TPMU_HA;
 /// Largest RSA modulus, in octets.
 pub const MAX_RSA_KEY_BYTES: usize = config::MAX_RSA_KEY_BITS as usize / 8;
+/// Largest ECC coordinate, in octets.
+pub const MAX_ECC_KEY_BYTES: usize = config::MAX_ECC_KEY_BYTES;
 /// Largest symmetric key, in octets.
-pub const MAX_SYM_KEY_BYTES: usize = config::MAX_SYM_KEY_BITS as usize / 8;
+///
+/// Part 2 Table 164 sizes TPM2B_SYM_KEY by the larger of the biggest symmetric
+/// key and the biggest implemented digest, because the same buffer carries the
+/// seedValue of a keyed hash object.
+pub const MAX_SYM_KEY_BYTES: usize = {
+    let sym = config::MAX_SYM_KEY_BITS as usize / 8;
+    if sym > MAX_DIGEST_SIZE {
+        sym
+    } else {
+        MAX_DIGEST_SIZE
+    }
+};
 /// Largest value carried in a TPMU_SENSITIVE_CREATE.
 pub const MAX_SYM_DATA: usize = 128;
+
+/// Largest TPMT_SENSITIVE, from Part 2 Table 240.
+///
+/// A sensitive area is a selector, a TPM2B_AUTH, a TPM2B_DIGEST and the largest
+/// TPMU_SENSITIVE_COMPOSITE, which is the five value RSA private key.
+pub const MAX_SENSITIVE_SIZE: usize =
+    2 + (2 + MAX_DIGEST_SIZE) + (2 + MAX_DIGEST_SIZE) + (2 + (MAX_RSA_KEY_BYTES / 2) * 5);
+
+/// Largest _PRIVATE, from Part 2 Table 242.
+///
+/// An outer integrity digest followed by the encrypted sensitive area, which is
+/// itself carried in a TPM2B.
+pub const MAX_PRIVATE_SIZE: usize = (2 + MAX_DIGEST_SIZE) + 2 + MAX_SENSITIVE_SIZE;
 
 /// The digest size for `hash_alg`, or `None` when the algorithm is not a hash.
 pub fn digest_size(hash_alg: u16) -> Option<usize> {
@@ -143,7 +169,12 @@ tpm2b! {
 }
 tpm2b! {
     /// TPM2B_ATTEST, Part 2 Table 155.
-    Tpm2bAttest, 2048
+    ///
+    /// The bound is the largest TPMS_ATTEST, whose biggest member is the NV
+    /// certification with a full TPM2B_MAX_NV_BUFFER.
+    Tpm2bAttest,
+    4 + 2 + (2 + SIZEOF_TPMT_HA) + (2 + SIZEOF_TPMT_HA) + 17 + 8
+        + (2 + SIZEOF_TPMT_HA) + 2 + (2 + config::MAX_NV_BUFFER_SIZE)
 }
 tpm2b! {
     /// TPM2B_SYM_KEY, Part 2 Table 164.
@@ -177,11 +208,14 @@ tpm2b! {
 }
 tpm2b! {
     /// TPM2B_PRIVATE, Part 2 Table 243.
-    Tpm2bPrivate, 1024
+    Tpm2bPrivate, MAX_PRIVATE_SIZE
 }
 tpm2b! {
     /// TPM2B_ID_OBJECT, Part 2 Table 245.
-    Tpm2bIdObject, 1024
+    ///
+    /// A TPMS_ID_OBJECT is an integrity digest followed by an encrypted
+    /// credential, each no larger than a TPMT_HA.
+    Tpm2bIdObject, (2 + SIZEOF_TPMT_HA) + (2 + SIZEOF_TPMT_HA)
 }
 tpm2b! {
     /// TPM2B_CONTEXT_SENSITIVE, Part 2 Table 257.
@@ -189,7 +223,10 @@ tpm2b! {
 }
 tpm2b! {
     /// TPM2B_CONTEXT_DATA, Part 2 Table 259.
-    Tpm2bContextData, config::MAX_CONTEXT_SIZE
+    ///
+    /// A TPMS_CONTEXT_DATA is an integrity digest followed by the encrypted
+    /// context.
+    Tpm2bContextData, (2 + SIZEOF_TPMT_HA) + 2 + config::MAX_CONTEXT_SIZE
 }
 tpm2b! {
     /// TPM2B_PRIVATE_VENDOR_SPECIFIC, Part 2 Table 238.
@@ -197,7 +234,12 @@ tpm2b! {
 }
 tpm2b! {
     /// TPM2B_TEMPLATE, Part 2 Table 237.
-    Tpm2bTemplate, 1024
+    ///
+    /// The bound is the largest TPMT_PUBLIC: type, nameAlg, attributes, an
+    /// authPolicy the size of a digest, the RSA parameters and an RSA modulus.
+    Tpm2bTemplate,
+    2 + 2 + 4 + (2 + SIZEOF_TPMU_HA) + (2 + 2 + 2) + (2 + 2) + 2 + 4
+        + (2 + MAX_RSA_KEY_BYTES)
 }
 tpm2b! {
     /// TPM2B_VENDOR_PROPERTY, Part 2 Table 103.

@@ -213,6 +213,15 @@ impl Unmarshal for TpmtNvPublic2 {
             ht::PERMANENT_NV => NvPublic2::Permanent(NvPublic::unmarshal(r)?),
             _ => return Err(TpmRc(rc::SELECTOR)),
         };
+        // Part 2 Table 255 says handleType is the same as the high octet of
+        // nvIndex, so a blob that disagrees with itself is refused.
+        let inner = match &public_area {
+            NvPublic2::Index(p) | NvPublic2::Permanent(p) => p.nv_index,
+            NvPublic2::External(p) => p.nv_index,
+        };
+        if (inner >> 24) as u8 != handle_type {
+            return Err(TpmRc(rc::VALUE));
+        }
         Ok(TpmtNvPublic2 { public_area })
     }
 }
@@ -362,8 +371,10 @@ mod tests {
         assert_eq!(bytes[0], ht::EXTERNAL_NV);
         assert_eq!(TpmtNvPublic2::from_bytes(&bytes).unwrap(), external);
 
+        let mut permanent_public = public();
+        permanent_public.nv_index = hc::PERMANENT_NV_FIRST + 2;
         let permanent = TpmtNvPublic2 {
-            public_area: NvPublic2::Permanent(public()),
+            public_area: NvPublic2::Permanent(permanent_public),
         };
         assert_eq!(
             TpmtNvPublic2::from_bytes(&permanent.to_bytes()).unwrap(),
@@ -376,6 +387,37 @@ mod tests {
         assert_eq!(
             TpmtNvPublic2::from_bytes(&bytes).unwrap_err(),
             TpmRc(rc::SELECTOR)
+        );
+    }
+
+    #[test]
+    fn the_handle_type_must_match_the_handle_inside() {
+        // Table 255 says handleType is the high octet of nvIndex, so a blob
+        // that names one type and carries a handle of another is refused.
+        let mismatched = TpmtNvPublic2 {
+            public_area: NvPublic2::Permanent(public()),
+        };
+        assert_eq!(
+            TpmtNvPublic2::from_bytes(&mismatched.to_bytes()).unwrap_err(),
+            TpmRc(rc::VALUE)
+        );
+
+        let mut external = public();
+        external.nv_index = hc::NV_INDEX_FIRST;
+        let mut raw = vec![ht::EXTERNAL_NV];
+        raw.extend_from_slice(
+            &NvPublicExpAttr {
+                nv_index: external.nv_index,
+                name_alg: alg::SHA256,
+                attributes: NvExpAttributes(0),
+                auth_policy: Tpm2bDigest::empty(),
+                data_size: 8,
+            }
+            .to_bytes(),
+        );
+        assert_eq!(
+            TpmtNvPublic2::from_bytes(&raw).unwrap_err(),
+            TpmRc(rc::VALUE)
         );
     }
 
