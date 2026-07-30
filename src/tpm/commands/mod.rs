@@ -1,5 +1,6 @@
 //! Command implementations from TPM 2.0 Library Part 3.
 
+pub mod context;
 pub mod crypto;
 pub mod dispatch;
 pub mod execute;
@@ -106,7 +107,10 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::Policy_AC_SendSelect => policy::policy_ac_send_select(state, request),
 
         // Part 3 clause 28, context management.
+        cc::ContextSave => context::context_save(state, request),
+        cc::ContextLoad => context::context_load(state, request),
         cc::FlushContext => policy::flush_context(state, request),
+        cc::EvictControl => context::evict_control(state, request),
 
         // Part 3 clause 22, integrity collection.
         cc::PCR_Extend => pcr::pcr_extend(state, request),
