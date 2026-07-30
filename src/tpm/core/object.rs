@@ -1,0 +1,592 @@
+//! Loaded objects and the transient object slots, Part 1 clauses 25 and 30.
+
+use std::collections::BTreeMap;
+
+use crate::tpm::config;
+use crate::tpm::constants::{alg, hc, rc};
+use crate::tpm::error::{TpmRc, TpmResult};
+use crate::tpm::structures::attributes::ObjectAttributes;
+use crate::tpm::structures::keys::{TpmtPublic, TpmtSensitive};
+
+use super::names;
+
+/// What an object slot holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Object {
+    pub public: TpmtPublic,
+    /// Absent for an object loaded with only a public area.
+    pub sensitive: Option<TpmtSensitive>,
+    pub name: Vec<u8>,
+    pub qualified_name: Vec<u8>,
+    /// The hierarchy the object belongs to, or TPM_RH_NULL.
+    pub hierarchy: u32,
+    /// Set when the object was created by this TPM rather than imported or
+    /// loaded from outside, which TPM2_CertifyCreation needs.
+    pub tpm_generated: bool,
+}
+
+impl Object {
+    /// Build an object and compute its Name and Qualified Name.
+    pub fn new(
+        public: TpmtPublic,
+        sensitive: Option<TpmtSensitive>,
+        hierarchy: u32,
+        parent_qualified_name: &[u8],
+        tpm_generated: bool,
+    ) -> TpmResult<Object> {
+        let name = names::object_name(&public)?;
+        let qualified_name =
+            names::qualified_name(public.name_alg, parent_qualified_name, &name)?;
+        Ok(Object {
+            public,
+            sensitive,
+            name,
+            qualified_name,
+            hierarchy,
+            tpm_generated,
+        })
+    }
+
+    /// True when only the public area is loaded.
+    pub fn is_public_only(&self) -> bool {
+        self.sensitive.is_none()
+    }
+
+    /// True when the object may parent other objects.
+    ///
+    /// Part 1 clause 25.2 calls an object with both restricted and decrypt set,
+    /// and a symmetric definition, a Storage Key.
+    pub fn is_storage_key(&self) -> bool {
+        self.public
+            .object_attributes
+            .has(ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT)
+            && !self.is_public_only()
+    }
+
+    /// The authorization value of the object.
+    pub fn auth_value(&self) -> &[u8] {
+        match &self.sensitive {
+            Some(s) => s.auth_value.as_slice(),
+            None => &[],
+        }
+    }
+
+    /// The seed used to protect this object's children.
+    pub fn seed_value(&self) -> &[u8] {
+        match &self.sensitive {
+            Some(s) => s.seed_value.as_slice(),
+            None => &[],
+        }
+    }
+
+    /// The nameAlg, which fixes the digest used for the object's children.
+    pub fn name_alg(&self) -> u16 {
+        self.public.name_alg
+    }
+}
+
+/// A sequence in progress, created by TPM2_HashSequenceStart,
+/// TPM2_HMAC_Start or an event sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sequence {
+    /// The kind of sequence and the state it needs.
+    pub kind: SequenceKind,
+    /// The authorization value given when the sequence was started.
+    pub auth: Vec<u8>,
+    /// Everything fed in so far.
+    ///
+    /// The data is buffered rather than folded into a running hash state so a
+    /// sequence can be saved and reloaded by TPM2_ContextSave, which needs the
+    /// state to be serialisable.
+    pub buffer: Vec<u8>,
+}
+
+/// The three kinds of sequence Part 3 clause 17 defines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SequenceKind {
+    /// TPM2_HashSequenceStart with a hash algorithm.
+    Hash { hash_alg: u16 },
+    /// TPM2_HMAC_Start, which carries the key and algorithm of the object.
+    Hmac { hash_alg: u16, key: Vec<u8> },
+    /// An event sequence, which feeds every allocated PCR bank.
+    Event,
+}
+
+/// Largest amount a single sequence will buffer.
+///
+/// A sequence has no length limit in the specification, but a software TPM
+/// cannot grow without bound, so a sequence that exceeds this reports
+/// TPM_RC_MEMORY rather than exhausting the host.
+pub const MAX_SEQUENCE_BYTES: usize = 64 * 1024 * 1024;
+
+impl Sequence {
+    /// Append to the sequence.
+    pub fn update(&mut self, data: &[u8]) -> TpmResult<()> {
+        if self.buffer.len().saturating_add(data.len()) > MAX_SEQUENCE_BYTES {
+            return Err(TpmRc(rc::MEMORY));
+        }
+        self.buffer.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// The hash algorithm of a hash or HMAC sequence.
+    pub fn hash_alg(&self) -> Option<u16> {
+        match &self.kind {
+            SequenceKind::Hash { hash_alg } => Some(*hash_alg),
+            SequenceKind::Hmac { hash_alg, .. } => Some(*hash_alg),
+            SequenceKind::Event => None,
+        }
+    }
+
+    /// True when this is an event sequence.
+    pub fn is_event(&self) -> bool {
+        matches!(self.kind, SequenceKind::Event)
+    }
+}
+
+/// What occupies a transient handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slot {
+    Object(Box<Object>),
+    Sequence(Box<Sequence>),
+}
+
+impl Slot {
+    /// The object in this slot, or TPM_RC_HANDLE when it holds a sequence.
+    pub fn as_object(&self) -> TpmResult<&Object> {
+        match self {
+            Slot::Object(o) => Ok(o),
+            Slot::Sequence(_) => Err(TpmRc(rc::HANDLE)),
+        }
+    }
+
+    /// The sequence in this slot, or TPM_RC_MODE when it holds an object.
+    pub fn as_sequence(&self) -> TpmResult<&Sequence> {
+        match self {
+            Slot::Sequence(s) => Ok(s),
+            Slot::Object(_) => Err(TpmRc(rc::MODE)),
+        }
+    }
+
+    /// The sequence in this slot, for modification.
+    pub fn as_sequence_mut(&mut self) -> TpmResult<&mut Sequence> {
+        match self {
+            Slot::Sequence(s) => Ok(s),
+            Slot::Object(_) => Err(TpmRc(rc::MODE)),
+        }
+    }
+
+    /// The authorization value of whatever is in the slot.
+    pub fn auth_value(&self) -> &[u8] {
+        match self {
+            Slot::Object(o) => o.auth_value(),
+            Slot::Sequence(s) => &s.auth,
+        }
+    }
+
+    /// The Name of whatever is in the slot.
+    ///
+    /// A sequence object has no public area, so Part 1 clause 32.4.2 gives it
+    /// an empty Name.
+    pub fn name(&self) -> &[u8] {
+        match self {
+            Slot::Object(o) => &o.name,
+            Slot::Sequence(_) => &[],
+        }
+    }
+}
+
+/// The transient object slots.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectSlots {
+    slots: BTreeMap<u32, Slot>,
+}
+
+impl ObjectSlots {
+    pub fn new() -> ObjectSlots {
+        ObjectSlots::default()
+    }
+
+    /// Number of occupied slots.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Slots still free.
+    pub fn available(&self) -> usize {
+        config::MAX_LOADED_OBJECTS as usize - self.slots.len()
+    }
+
+    /// Put `slot` in the lowest free transient handle.
+    pub fn insert(&mut self, slot: Slot) -> TpmResult<u32> {
+        if self.slots.len() >= config::MAX_LOADED_OBJECTS as usize {
+            return Err(TpmRc(rc::OBJECT_MEMORY));
+        }
+        for i in 0..config::MAX_LOADED_OBJECTS as u32 {
+            let handle = hc::TRANSIENT_FIRST + i;
+            if !self.slots.contains_key(&handle) {
+                self.slots.insert(handle, slot);
+                return Ok(handle);
+            }
+        }
+        Err(TpmRc(rc::OBJECT_MEMORY))
+    }
+
+    /// Put `slot` at a specific handle, which context load needs.
+    pub fn insert_at(&mut self, handle: u32, slot: Slot) -> TpmResult<()> {
+        if !Self::is_transient(handle) {
+            return Err(TpmRc(rc::HANDLE));
+        }
+        if self.slots.contains_key(&handle) {
+            return Err(TpmRc(rc::HANDLE));
+        }
+        if self.slots.len() >= config::MAX_LOADED_OBJECTS as usize {
+            return Err(TpmRc(rc::OBJECT_MEMORY));
+        }
+        self.slots.insert(handle, slot);
+        Ok(())
+    }
+
+    pub fn get(&self, handle: u32) -> TpmResult<&Slot> {
+        self.slots.get(&handle).ok_or(TpmRc(rc::HANDLE))
+    }
+
+    pub fn get_mut(&mut self, handle: u32) -> TpmResult<&mut Slot> {
+        self.slots.get_mut(&handle).ok_or(TpmRc(rc::HANDLE))
+    }
+
+    /// The object at `handle`, or TPM_RC_HANDLE.
+    pub fn object(&self, handle: u32) -> TpmResult<&Object> {
+        self.get(handle)?.as_object()
+    }
+
+    /// Remove and return the slot at `handle`.
+    pub fn remove(&mut self, handle: u32) -> TpmResult<Slot> {
+        self.slots.remove(&handle).ok_or(TpmRc(rc::HANDLE))
+    }
+
+    /// True when the handle is in the transient range.
+    pub fn is_transient(handle: u32) -> bool {
+        (hc::TRANSIENT_FIRST..=hc::TRANSIENT_LAST).contains(&handle)
+    }
+
+    /// Every occupied handle, in increasing order.
+    pub fn handles(&self) -> Vec<u32> {
+        self.slots.keys().copied().collect()
+    }
+
+    /// Drop every object whose hierarchy is `hierarchy`.
+    ///
+    /// TPM2_Clear and TPM2_HierarchyControl both need this so that objects
+    /// under a hierarchy that has gone away cannot still be used.
+    pub fn flush_hierarchy(&mut self, hierarchy: u32) {
+        self.slots.retain(|_, slot| match slot {
+            Slot::Object(o) => o.hierarchy != hierarchy,
+            Slot::Sequence(_) => true,
+        });
+    }
+
+    /// Drop every object whose stClear attribute is set.
+    pub fn flush_st_clear(&mut self) {
+        self.slots.retain(|_, slot| match slot {
+            Slot::Object(o) => !o
+                .public
+                .object_attributes
+                .has(ObjectAttributes::ST_CLEAR),
+            Slot::Sequence(_) => true,
+        });
+    }
+
+    /// Drop everything, which a TPM Reset does.
+    pub fn clear(&mut self) {
+        self.slots.clear();
+    }
+}
+
+/// Check that a public area is internally consistent, Part 3 clause 12.2.2.
+///
+/// The checks that do not depend on the parent or on other command parameters
+/// live here so that TPM2_Create, TPM2_CreatePrimary, TPM2_Load and
+/// TPM2_LoadExternal all apply the same rules.
+pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
+    let attrs = public.object_attributes;
+
+    // A restricted key must be either a signing key or a decryption key, not
+    // both, and a decryption key must name a symmetric algorithm.
+    let sign = attrs.has(ObjectAttributes::SIGN_ENCRYPT);
+    let decrypt = attrs.has(ObjectAttributes::DECRYPT);
+    if attrs.has(ObjectAttributes::RESTRICTED) && sign && decrypt {
+        return Err(TpmRc(rc::ATTRIBUTES));
+    }
+
+    // fixedTPM requires fixedParent: an object that cannot leave the TPM
+    // cannot be re-parented either.
+    if attrs.has(ObjectAttributes::FIXED_TPM) && !attrs.has(ObjectAttributes::FIXED_PARENT) {
+        return Err(TpmRc(rc::ATTRIBUTES));
+    }
+
+    // encryptedDuplication and fixedTPM cannot both be set, because an object
+    // that never leaves the TPM is never duplicated.
+    if attrs.has(ObjectAttributes::ENCRYPTED_DUPLICATION)
+        && attrs.has(ObjectAttributes::FIXED_TPM)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES));
+    }
+
+    // A signing key that is not asymmetric and not a keyed hash cannot sign.
+    if sign && public.object_type == alg::SYMCIPHER && attrs.has(ObjectAttributes::RESTRICTED) {
+        return Err(TpmRc(rc::ATTRIBUTES));
+    }
+
+    // The name algorithm must be a hash unless the object cannot be a parent.
+    if public.name_alg == alg::NULL
+        && attrs.has(ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT)
+    {
+        return Err(TpmRc(rc::HASH));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tpm::constants::{curve, rh};
+    use crate::tpm::structures::base::Tpm2bDigest;
+    use crate::tpm::structures::keys::{PublicId, PublicParms};
+    use crate::tpm::structures::schemes::{Scheme, SymDef};
+
+    fn public(attrs: u32) -> TpmtPublic {
+        TpmtPublic {
+            object_type: alg::ECC,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(attrs),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::Ecc {
+                symmetric: SymDef::null(),
+                scheme: Scheme::hash(alg::ECDSA, alg::SHA256),
+                curve_id: curve::NIST_P256,
+                kdf: Scheme::null(),
+            },
+            unique: PublicId::Ecc(Default::default()),
+        }
+    }
+
+    fn object(attrs: u32) -> Object {
+        Object::new(public(attrs), None, rh::OWNER, &rh::OWNER.to_be_bytes(), true).unwrap()
+    }
+
+    fn sequence() -> Slot {
+        Slot::Sequence(Box::new(Sequence {
+            kind: SequenceKind::Hash {
+                hash_alg: alg::SHA256,
+            },
+            auth: b"auth".to_vec(),
+            buffer: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn an_object_carries_its_name_and_qualified_name() {
+        let o = object(ObjectAttributes::SIGN_ENCRYPT);
+        assert_eq!(o.name, names::object_name(&o.public).unwrap());
+        assert_eq!(o.name.len(), 34);
+        assert_eq!(o.qualified_name.len(), 34);
+        assert!(o.is_public_only());
+        assert_eq!(o.auth_value(), b"");
+        assert_eq!(o.name_alg(), alg::SHA256);
+    }
+
+    #[test]
+    fn slots_are_allocated_from_the_transient_range() {
+        let mut slots = ObjectSlots::new();
+        let a = slots
+            .insert(Slot::Object(Box::new(object(ObjectAttributes::SIGN_ENCRYPT))))
+            .unwrap();
+        let b = slots.insert(sequence()).unwrap();
+        assert_eq!(a, hc::TRANSIENT_FIRST);
+        assert_eq!(b, hc::TRANSIENT_FIRST + 1);
+        assert!(ObjectSlots::is_transient(a));
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots.handles(), vec![a, b]);
+    }
+
+    #[test]
+    fn a_freed_handle_is_reused() {
+        let mut slots = ObjectSlots::new();
+        let a = slots
+            .insert(Slot::Object(Box::new(object(ObjectAttributes::SIGN_ENCRYPT))))
+            .unwrap();
+        let _b = slots.insert(sequence()).unwrap();
+        slots.remove(a).unwrap();
+        let c = slots.insert(sequence()).unwrap();
+        assert_eq!(c, a);
+    }
+
+    #[test]
+    fn the_slot_count_is_bounded() {
+        let mut slots = ObjectSlots::new();
+        for _ in 0..config::MAX_LOADED_OBJECTS {
+            slots.insert(sequence()).unwrap();
+        }
+        assert_eq!(slots.available(), 0);
+        assert_eq!(slots.insert(sequence()).unwrap_err(), TpmRc(rc::OBJECT_MEMORY));
+    }
+
+    #[test]
+    fn an_unknown_handle_reports_tpm_rc_handle() {
+        let slots = ObjectSlots::new();
+        assert_eq!(slots.get(hc::TRANSIENT_FIRST).unwrap_err(), TpmRc(rc::HANDLE));
+        assert_eq!(
+            slots.object(hc::TRANSIENT_FIRST).unwrap_err(),
+            TpmRc(rc::HANDLE)
+        );
+    }
+
+    #[test]
+    fn a_sequence_slot_is_not_an_object() {
+        let mut slots = ObjectSlots::new();
+        let h = slots.insert(sequence()).unwrap();
+        assert_eq!(slots.object(h).unwrap_err(), TpmRc(rc::HANDLE));
+        assert!(slots.get(h).unwrap().as_sequence().is_ok());
+        assert_eq!(slots.get(h).unwrap().auth_value(), b"auth");
+        assert!(slots.get(h).unwrap().name().is_empty());
+
+        let o = slots
+            .insert(Slot::Object(Box::new(object(ObjectAttributes::SIGN_ENCRYPT))))
+            .unwrap();
+        assert_eq!(
+            slots.get(o).unwrap().as_sequence().unwrap_err(),
+            TpmRc(rc::MODE)
+        );
+    }
+
+    #[test]
+    fn insert_at_places_a_slot_at_a_chosen_handle() {
+        let mut slots = ObjectSlots::new();
+        let handle = hc::TRANSIENT_FIRST + 3;
+        slots.insert_at(handle, sequence()).unwrap();
+        assert!(slots.get(handle).is_ok());
+        // The same handle cannot be taken twice.
+        assert_eq!(
+            slots.insert_at(handle, sequence()).unwrap_err(),
+            TpmRc(rc::HANDLE)
+        );
+        // Only transient handles are allowed.
+        assert_eq!(
+            slots.insert_at(hc::PERSISTENT_FIRST, sequence()).unwrap_err(),
+            TpmRc(rc::HANDLE)
+        );
+    }
+
+    #[test]
+    fn flushing_a_hierarchy_leaves_sequences_alone() {
+        let mut slots = ObjectSlots::new();
+        let owner = slots
+            .insert(Slot::Object(Box::new(object(ObjectAttributes::SIGN_ENCRYPT))))
+            .unwrap();
+        let mut other = object(ObjectAttributes::SIGN_ENCRYPT);
+        other.hierarchy = rh::PLATFORM;
+        let platform = slots.insert(Slot::Object(Box::new(other))).unwrap();
+        let seq = slots.insert(sequence()).unwrap();
+
+        slots.flush_hierarchy(rh::OWNER);
+        assert!(slots.get(owner).is_err());
+        assert!(slots.get(platform).is_ok());
+        assert!(slots.get(seq).is_ok());
+    }
+
+    #[test]
+    fn flushing_st_clear_drops_only_marked_objects() {
+        let mut slots = ObjectSlots::new();
+        let plain = slots
+            .insert(Slot::Object(Box::new(object(ObjectAttributes::SIGN_ENCRYPT))))
+            .unwrap();
+        let marked = slots
+            .insert(Slot::Object(Box::new(object(
+                ObjectAttributes::SIGN_ENCRYPT | ObjectAttributes::ST_CLEAR,
+            ))))
+            .unwrap();
+        slots.flush_st_clear();
+        assert!(slots.get(plain).is_ok());
+        assert!(slots.get(marked).is_err());
+    }
+
+    #[test]
+    fn sequences_buffer_their_input() {
+        let mut s = Sequence {
+            kind: SequenceKind::Hash {
+                hash_alg: alg::SHA256,
+            },
+            auth: Vec::new(),
+            buffer: Vec::new(),
+        };
+        s.update(b"abc").unwrap();
+        s.update(b"def").unwrap();
+        assert_eq!(s.buffer, b"abcdef");
+        assert_eq!(s.hash_alg(), Some(alg::SHA256));
+        assert!(!s.is_event());
+
+        let e = Sequence {
+            kind: SequenceKind::Event,
+            auth: Vec::new(),
+            buffer: Vec::new(),
+        };
+        assert!(e.is_event());
+        assert_eq!(e.hash_alg(), None);
+    }
+
+    #[test]
+    fn a_sequence_is_bounded() {
+        let mut s = Sequence {
+            kind: SequenceKind::Event,
+            auth: Vec::new(),
+            buffer: vec![0u8; MAX_SEQUENCE_BYTES],
+        };
+        assert_eq!(s.update(b"x").unwrap_err(), TpmRc(rc::MEMORY));
+    }
+
+    #[test]
+    fn public_area_consistency_rules() {
+        // A restricted key cannot both sign and decrypt.
+        assert_eq!(
+            validate_public(&public(
+                ObjectAttributes::RESTRICTED
+                    | ObjectAttributes::SIGN_ENCRYPT
+                    | ObjectAttributes::DECRYPT
+            ))
+            .unwrap_err(),
+            TpmRc(rc::ATTRIBUTES)
+        );
+        // fixedTPM without fixedParent is refused.
+        assert_eq!(
+            validate_public(&public(ObjectAttributes::FIXED_TPM)).unwrap_err(),
+            TpmRc(rc::ATTRIBUTES)
+        );
+        // encryptedDuplication with fixedTPM is refused.
+        assert_eq!(
+            validate_public(&public(
+                ObjectAttributes::FIXED_TPM
+                    | ObjectAttributes::FIXED_PARENT
+                    | ObjectAttributes::ENCRYPTED_DUPLICATION
+            ))
+            .unwrap_err(),
+            TpmRc(rc::ATTRIBUTES)
+        );
+        // A parent needs a name algorithm.
+        let mut p = public(ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT);
+        p.name_alg = alg::NULL;
+        assert_eq!(validate_public(&p).unwrap_err(), TpmRc(rc::HASH));
+        // An ordinary signing key passes.
+        assert!(validate_public(&public(
+            ObjectAttributes::FIXED_TPM
+                | ObjectAttributes::FIXED_PARENT
+                | ObjectAttributes::SIGN_ENCRYPT
+        ))
+        .is_ok());
+    }
+}
