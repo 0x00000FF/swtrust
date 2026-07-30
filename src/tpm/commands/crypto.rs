@@ -278,7 +278,7 @@ pub fn event_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRe
 
 /// The signing scheme a command uses: the object's when it has one, otherwise
 /// the caller's.
-fn signing_scheme(object: &Object, supplied: &Scheme) -> TpmResult<Scheme> {
+pub fn signing_scheme(object: &Object, supplied: &Scheme) -> TpmResult<Scheme> {
     let object_scheme = object.public.scheme().copied().unwrap_or_default();
     if object_scheme.is_null() {
         if supplied.is_null() {
@@ -294,7 +294,7 @@ fn signing_scheme(object: &Object, supplied: &Scheme) -> TpmResult<Scheme> {
 }
 
 /// Sign `digest` with `object` using `scheme`.
-fn sign_digest(
+pub fn sign_digest(
     state: &mut TpmState,
     object: &Object,
     scheme: &Scheme,

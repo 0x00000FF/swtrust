@@ -1,5 +1,6 @@
 //! Command implementations from TPM 2.0 Library Part 3.
 
+pub mod attest;
 pub mod context;
 pub mod crypto;
 pub mod dispatch;
@@ -66,6 +67,20 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::SequenceUpdate => crypto::sequence_update(state, request),
         cc::SequenceComplete => crypto::sequence_complete(state, request),
         cc::EventSequenceComplete => crypto::event_sequence_complete(state, request),
+
+        // Part 3 clause 18, attestation.
+        cc::Certify => attest::certify(state, request),
+        cc::CertifyCreation => attest::certify_creation(state, request),
+        cc::Quote => attest::quote(state, request),
+        cc::GetTime => attest::get_time(state, request),
+        cc::GetSessionAuditDigest => attest::get_session_audit_digest(state, request),
+        cc::GetCommandAuditDigest => attest::get_command_audit_digest(state, request),
+        cc::NV_Certify => attest::nv_certify(state, request),
+
+        // Part 3 clause 21, auditing.
+        cc::SetCommandCodeAuditStatus => {
+            attest::set_command_code_audit_status(state, request)
+        }
 
         // Part 3 clause 19 and 20, signing and verification.
         cc::EC_Ephemeral => crypto::ec_ephemeral(state, request),
