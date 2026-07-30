@@ -681,15 +681,50 @@ fn check_policy(
     Ok(())
 }
 
-/// Roll the session nonces forward and build the response authorization area.
+/// Roll every session nonce forward and return the new values.
+///
+/// This runs before the response parameter is encrypted because Part 1 clause
+/// 21.3 keys that encryption with the new nonceTPM.
+pub fn roll_response_nonces(state: &mut TpmState, request: &Request) -> TpmResult<Vec<Vec<u8>>> {
+    let mut out = Vec::with_capacity(request.sessions.len());
+    for input in &request.sessions {
+        if input.handle == rh::RS_PW {
+            out.push(Vec::new());
+            continue;
+        }
+        let nonce_len = match state.sessions.get(input.handle) {
+            Ok(s) => s.nonce_tpm.len(),
+            Err(_) => {
+                // The command may have flushed the session it was given.
+                out.push(Vec::new());
+                continue;
+            }
+        };
+        let new_nonce = state.rng.bytes(nonce_len)?;
+        if let Ok(s) = state.sessions.get_mut(input.handle) {
+            s.nonce_tpm = new_nonce.clone();
+            s.nonce_caller = input.nonce_caller.clone();
+        }
+        out.push(new_nonce);
+    }
+    Ok(out)
+}
+
+/// Build the response authorization area.
+///
+/// `nonces` holds the values [`roll_response_nonces`] produced and
+/// `auth_values` the authorization value of each authorized entity, which the
+/// response HMAC key needs just as the command HMAC key did.
 pub fn build_response_sessions(
     state: &mut TpmState,
     request: &Request,
     response_code: u32,
     parameters: &[u8],
+    nonces: &[Vec<u8>],
+    auth_values: &[Vec<u8>],
 ) -> TpmResult<Vec<u8>> {
     let mut w = Writer::new();
-    for input in &request.sessions {
+    for (index, input) in request.sessions.iter().enumerate() {
         if input.handle == rh::RS_PW {
             AuthResponse {
                 nonce: Tpm2bNonce::empty(),
@@ -699,33 +734,46 @@ pub fn build_response_sessions(
             .marshal(&mut w);
             continue;
         }
-
-        let (auth_hash, nonce_len) = {
-            let s = state.sessions.get(input.handle)?;
-            (s.auth_hash, s.nonce_tpm.len())
-        };
-        let new_nonce = state.rng.bytes(nonce_len)?;
-        let rp = session::rp_hash(auth_hash, response_code, request.code, parameters)?;
-
-        let hmac = {
-            let s = state.sessions.get_mut(input.handle)?;
-            s.nonce_tpm = new_nonce.clone();
-            s.nonce_caller = input.nonce_caller.clone();
-            // The response HMAC uses the same key as the command HMAC. A
-            // policy session that carries no HMAC answers with none.
-            if s.is_policy() && !s.policy.auth_value_needed && !s.policy.password_needed {
-                Vec::new()
-            } else {
-                let key = s.session_key.clone();
-                session::auth_hmac(
-                    auth_hash,
-                    &key,
-                    &rp,
-                    &new_nonce,
-                    &input.nonce_caller,
-                    input.attributes,
-                )?
+        let new_nonce = nonces.get(index).cloned().unwrap_or_default();
+        let Ok(s) = state.sessions.get(input.handle) else {
+            // The session went away, so there is nothing to answer with.
+            AuthResponse {
+                nonce: Tpm2bNonce::new(new_nonce)?,
+                session_attributes: input.attributes,
+                hmac: Tpm2bAuth::empty(),
             }
+            .marshal(&mut w);
+            continue;
+        };
+
+        let auth_hash = s.auth_hash;
+        let rp = session::rp_hash(auth_hash, response_code, request.code, parameters)?;
+        // The response HMAC uses the same key as the command HMAC. A policy
+        // session that proved nothing but its policy answers with none.
+        let carries_hmac = !s.is_policy()
+            || s.policy.auth_value_needed
+            || s.policy.password_needed
+            || !s.session_key.is_empty();
+        let hmac = if carries_hmac {
+            let entity_name = request
+                .handles
+                .get(index)
+                .map(|h| handle_name(state, *h))
+                .transpose()?
+                .unwrap_or_default();
+            let auth = auth_values.get(index).cloned().unwrap_or_default();
+            let s = state.sessions.get(input.handle)?;
+            let key = s.hmac_key(&entity_name, &auth);
+            session::auth_hmac(
+                auth_hash,
+                &key,
+                &rp,
+                &new_nonce,
+                &input.nonce_caller,
+                input.attributes,
+            )?
+        } else {
+            Vec::new()
         };
 
         AuthResponse {
@@ -1006,7 +1054,9 @@ mod tests {
         let auth = password_auth(b"");
         let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
         let req = parse(&state, &buf, 0).unwrap();
-        let area = build_response_sessions(&mut state, &req, rc::SUCCESS, &[]).unwrap();
+        let nonces = roll_response_nonces(&mut state, &req).unwrap();
+        let area =
+            build_response_sessions(&mut state, &req, rc::SUCCESS, &[], &nonces, &[]).unwrap();
         // A password session answers with empty nonce and HMAC.
         assert_eq!(area, vec![0x00, 0x00, 0x01, 0x00, 0x00]);
     }

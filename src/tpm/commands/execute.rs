@@ -41,8 +41,6 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         return Err(TpmRc(rc::PP));
     }
 
-    dispatch::decrypt_parameters(state, &mut request)?;
-
     // Every handle that carries an authorization is checked in order.
     let mut names: Vec<Vec<u8>> = Vec::with_capacity(request.handles.len());
     for h in &request.handles {
@@ -69,6 +67,10 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         }
     }
 
+    // Part 3 clause 5.6 checks each authorization before clause 5.7 decrypts a
+    // parameter, and Part 1 clause 18.4 computes cpHash over the parameters as
+    // they arrived, so the encrypted form is what the HMAC covers.
+    let mut auth_values: Vec<Vec<u8>> = Vec::with_capacity(request.sessions.len());
     for index in 0..request.info.auth_handles as usize {
         if index >= request.sessions.len() {
             return Err(TpmRc(rc::AUTH_MISSING).with_session(index + 1));
@@ -84,9 +86,21 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         let name_refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
         let cp = session::cp_hash(auth_hash, request.code, &name_refs, &request.parameters)?;
         dispatch::check_authorization(state, &request, index, &entity, &cp)?;
+        auth_values.push(entity.auth.clone());
     }
 
+    dispatch::decrypt_parameters(state, &mut request)?;
+
     let response = super::run_command(state, &request)?;
+
+    // The response nonces are rolled forward before the response parameter is
+    // encrypted, because Part 1 clause 21.3 keys that encryption with the new
+    // nonceTPM.
+    let nonces = if request.tag == st::SESSIONS {
+        dispatch::roll_response_nonces(state, &request)?
+    } else {
+        Vec::new()
+    };
 
     let mut parameters = response.parameters.clone();
     dispatch::encrypt_parameters(state, &request, &mut parameters)?;
@@ -100,7 +114,14 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     }
     body.bytes(&parameters);
     if request.tag == st::SESSIONS {
-        let area = dispatch::build_response_sessions(state, &request, rc::SUCCESS, &parameters)?;
+        let area = dispatch::build_response_sessions(
+            state,
+            &request,
+            rc::SUCCESS,
+            &parameters,
+            &nonces,
+            &auth_values,
+        )?;
         body.bytes(&area);
     }
     let body = body.finish()?;
