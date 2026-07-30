@@ -2,7 +2,9 @@
 
 pub mod dispatch;
 pub mod execute;
+pub mod hierarchy;
 pub mod management;
+pub mod nv;
 pub mod pcr;
 pub mod table;
 
@@ -43,8 +45,47 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::PCR_SetAuthValue => pcr::pcr_set_auth_value(state, request),
         cc::PCR_Reset => pcr::pcr_reset(state, request),
 
+        // Part 3 clause 24, hierarchy administration.
+        cc::HierarchyControl => hierarchy::hierarchy_control(state, request),
+        cc::SetPrimaryPolicy => hierarchy::set_primary_policy(state, request),
+        cc::ChangePPS => hierarchy::change_pps(state, request),
+        cc::ChangeEPS => hierarchy::change_eps(state, request),
+        cc::Clear => hierarchy::clear(state, request),
+        cc::ClearControl => hierarchy::clear_control(state, request),
+        cc::HierarchyChangeAuth => hierarchy::hierarchy_change_auth(state, request),
+
+        // Part 3 clause 25, dictionary attack functions.
+        cc::DictionaryAttackLockReset => {
+            hierarchy::dictionary_attack_lock_reset(state, request)
+        }
+        cc::DictionaryAttackParameters => {
+            hierarchy::dictionary_attack_parameters(state, request)
+        }
+
+        // Part 3 clause 26, miscellaneous management.
+        cc::PP_Commands => hierarchy::pp_commands(state, request),
+        cc::SetAlgorithmSet => hierarchy::set_algorithm_set(state, request),
+        cc::ReadOnlyControl => hierarchy::read_only_control(state, request),
+
         // Part 3 clause 30, capabilities.
         cc::GetCapability => management::get_capability(state, request),
+
+        // Part 3 clause 31, NV storage.
+        cc::NV_DefineSpace => nv::nv_define_space(state, request),
+        cc::NV_DefineSpace2 => nv::nv_define_space2(state, request),
+        cc::NV_UndefineSpace => nv::nv_undefine_space(state, request),
+        cc::NV_UndefineSpaceSpecial => nv::nv_undefine_space_special(state, request),
+        cc::NV_ReadPublic => nv::nv_read_public(state, request),
+        cc::NV_ReadPublic2 => nv::nv_read_public2(state, request),
+        cc::NV_Write => nv::nv_write(state, request),
+        cc::NV_Increment => nv::nv_increment(state, request),
+        cc::NV_Extend => nv::nv_extend(state, request),
+        cc::NV_SetBits => nv::nv_set_bits(state, request),
+        cc::NV_WriteLock => nv::nv_write_lock(state, request),
+        cc::NV_GlobalWriteLock => nv::nv_global_write_lock(state, request),
+        cc::NV_Read => nv::nv_read(state, request),
+        cc::NV_ReadLock => nv::nv_read_lock(state, request),
+        cc::NV_ChangeAuth => nv::nv_change_auth(state, request),
 
         // Part 3 clause 34, field upgrade.
         cc::FirmwareRead => management::firmware_read(state, request),
