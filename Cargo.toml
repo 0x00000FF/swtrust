@@ -1,0 +1,32 @@
+[package]
+name = "swtrust"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Software TPM 2.0 for Windows"
+license = "Apache-2.0"
+
+[lib]
+name = "swtrust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "swtrust"
+path = "src/main.rs"
+
+[dependencies]
+aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
+aws-lc-sys = "0.43"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = 2
