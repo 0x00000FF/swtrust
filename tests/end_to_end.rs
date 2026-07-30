@@ -480,6 +480,310 @@ fn an_unsupported_curve_is_refused() {
 }
 
 #[test]
+fn a_trial_policy_session_accumulates_a_digest() {
+    let h = Harness::started("policy");
+
+    // TPM2_StartAuthSession with a trial session over SHA-256.
+    let mut p = Writer::new();
+    p.u16(32); // nonceCaller
+    p.bytes(&[0xa5u8; 32]);
+    p.u16(0); // no salt
+    p.u8(0x03); // TPM_SE_TRIAL
+    p.u16(alg::NULL); // symmetric
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let session = reader.u32().unwrap();
+    assert_eq!(session >> 24, 0x03, "policy session handle range");
+    let nonce_size = reader.u16().unwrap();
+    assert_eq!(nonce_size, 32);
+
+    // The digest starts as zeros.
+    let get_digest = command(st::NO_SESSIONS, cc::PolicyGetDigest, &[session], None, &[]);
+    let r = h.send(&get_digest);
+    assert_eq!(r.code, rc::SUCCESS);
+    assert_eq!(r.body, {
+        let mut v = vec![0x00, 0x20];
+        v.extend_from_slice(&[0u8; 32]);
+        v
+    });
+
+    // TPM2_PolicyCommandCode(TPM2_Unseal) extends it.
+    let mut p = Writer::new();
+    p.u32(cc::Unseal);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PolicyCommandCode,
+        &[session],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+
+    let r = h.send(&get_digest);
+    assert_eq!(r.code, rc::SUCCESS);
+    let expected = swtrust::tpm::crypto::hash::digest_parts(
+        alg::SHA256,
+        &[
+            &[0u8; 32],
+            &cc::PolicyCommandCode.to_be_bytes(),
+            &cc::Unseal.to_be_bytes(),
+        ],
+    )
+    .unwrap();
+    assert!(r.body.ends_with(&expected), "policy digest did not match");
+
+    // A second, different command code is refused.
+    let mut p = Writer::new();
+    p.u32(cc::Quote);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PolicyCommandCode,
+        &[session],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code & 0x03f, rc::VALUE & 0x03f);
+
+    // TPM2_PolicyRestart clears it again.
+    let r = h.send(&command(st::NO_SESSIONS, cc::PolicyRestart, &[session], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = h.send(&get_digest);
+    assert!(r.body.ends_with(&[0u8; 32]));
+
+    // TPM2_FlushContext removes the session.
+    let mut p = Writer::new();
+    p.u32(session);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::FlushContext,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    // The handle no longer references a session, which Part 1 clause 12.5
+    // reports as TPM_RC_HANDLE against the first handle.
+    let r = h.send(&get_digest);
+    assert_eq!(r.code & 0x03f, rc::HANDLE & 0x03f);
+}
+
+#[test]
+fn nv_define_write_and_read_round_trip() {
+    let h = Harness::started("nv");
+    let index = hc::NV_INDEX_FIRST + 1;
+
+    // Define a 16 octet ordinary Index writable and readable with its own
+    // authorization value.
+    let mut public = Writer::new();
+    public.u32(index);
+    public.u16(alg::SHA256);
+    public.u32(0x0000_0004 | 0x0004_0000); // AUTHWRITE | AUTHREAD
+    public.u16(0); // no policy
+    public.u16(16);
+    let public = public.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(4);
+    p.bytes(b"nvpw"); // the Index authorization value
+    p.u16(public.len() as u16);
+    p.bytes(&public);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_DefineSpace,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "NV_DefineSpace -> {:08x}", r.code);
+
+    // Reading before a write reports that the Index is uninitialized.
+    let mut p = Writer::new();
+    p.u16(16);
+    p.u16(0);
+    let read = command(
+        st::SESSIONS,
+        cc::NV_Read,
+        &[index, index],
+        Some(&password(b"nvpw")),
+        &p.finish().unwrap(),
+    );
+    let r = h.send(&read);
+    assert_eq!(r.code, rc::NV_UNINITIALIZED);
+
+    // Write, then read it back.
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0x5au8; 16]);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Write,
+        &[index, index],
+        Some(&password(b"nvpw")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "NV_Write -> {:08x}", r.code);
+
+    let r = h.send(&read);
+    assert_eq!(r.code, rc::SUCCESS, "NV_Read -> {:08x}", r.code);
+    // parameterSize, then the TPM2B, then the session area.
+    let mut reader = Reader::new(&r.body);
+    let param_size = reader.u32().unwrap();
+    assert_eq!(param_size, 18);
+    assert_eq!(reader.u16().unwrap(), 16);
+    assert_eq!(reader.take(16).unwrap(), &[0x5au8; 16]);
+
+    // The wrong authorization value is refused.
+    let mut p = Writer::new();
+    p.u16(16);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Read,
+        &[index, index],
+        Some(&password(b"wrong")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code & 0x03f, rc::AUTH_FAIL & 0x03f);
+
+    // TPM2_NV_ReadPublic reports the Index and its Name.
+    let r = h.send(&command(st::NO_SESSIONS, cc::NV_ReadPublic, &[index], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+
+    // Undefining it with owner authorization removes it.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_UndefineSpace,
+        &[rh::OWNER, index],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = h.send(&command(st::NO_SESSIONS, cc::NV_ReadPublic, &[index], None, &[]));
+    assert_eq!(r.code & 0x03f, rc::HANDLE & 0x03f);
+}
+
+#[test]
+fn an_nv_counter_only_advances() {
+    let h = Harness::started("nvcounter");
+    let index = hc::NV_INDEX_FIRST + 7;
+
+    let mut public = Writer::new();
+    public.u32(index);
+    public.u16(alg::SHA256);
+    // AUTHWRITE | AUTHREAD with TPM_NT_COUNTER in bits 7:4.
+    public.u32(0x0000_0004 | 0x0004_0000 | 0x0000_0010);
+    public.u16(0);
+    public.u16(8);
+    let public = public.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(0);
+    p.u16(public.len() as u16);
+    p.bytes(&public);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_DefineSpace,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "define counter -> {:08x}", r.code);
+
+    let increment = command(
+        st::SESSIONS,
+        cc::NV_Increment,
+        &[index, index],
+        Some(&password(b"")),
+        &[],
+    );
+    let mut p = Writer::new();
+    p.u16(8);
+    p.u16(0);
+    let read = command(
+        st::SESSIONS,
+        cc::NV_Read,
+        &[index, index],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    );
+
+    assert_eq!(h.send(&increment).code, rc::SUCCESS);
+    let r = h.send(&read);
+    assert_eq!(r.code, rc::SUCCESS);
+    assert!(r.body.windows(8).any(|w| w == 1u64.to_be_bytes()));
+
+    assert_eq!(h.send(&increment).code, rc::SUCCESS);
+    let r = h.send(&read);
+    assert!(r.body.windows(8).any(|w| w == 2u64.to_be_bytes()));
+
+    // An ordinary write to a counter is refused.
+    let mut p = Writer::new();
+    p.u16(8);
+    p.bytes(&[0u8; 8]);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Write,
+        &[index, index],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code & 0x03f, rc::ATTRIBUTES & 0x03f);
+}
+
+#[test]
+fn hierarchy_authorization_can_be_changed_and_is_enforced() {
+    let h = Harness::started("hierarchyauth");
+
+    // Set ownerAuth.
+    let mut p = Writer::new();
+    p.u16(6);
+    p.bytes(b"secret");
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+
+    // The empty password no longer works.
+    let mut p = Writer::new();
+    p.u16(0);
+    p.bytes(b"");
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code & 0x03f, rc::AUTH_FAIL & 0x03f);
+
+    // The new one does.
+    let mut p = Writer::new();
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"secret")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+}
+
+#[test]
 fn the_vendor_test_command_echoes_its_input() {
     let h = Harness::started("vendor");
     let mut p = Writer::new();

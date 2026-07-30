@@ -6,6 +6,7 @@ pub mod hierarchy;
 pub mod management;
 pub mod nv;
 pub mod pcr;
+pub mod policy;
 pub mod table;
 
 use crate::tpm::constants::{cc, rc};
@@ -35,6 +36,39 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         // Part 3 clause 16, randomness.
         cc::GetRandom => management::get_random(state, request),
         cc::StirRandom => management::stir_random(state, request),
+
+        // Part 3 clause 11, session commands.
+        cc::StartAuthSession => policy::start_auth_session(state, request),
+        cc::PolicyRestart => policy::policy_restart(state, request),
+
+        // Part 3 clause 23, enhanced authorization.
+        cc::PolicySigned => policy::policy_signed(state, request),
+        cc::PolicySecret => policy::policy_secret(state, request),
+        cc::PolicyTicket => policy::policy_ticket(state, request),
+        cc::PolicyOR => policy::policy_or(state, request),
+        cc::PolicyPCR => policy::policy_pcr(state, request),
+        cc::PolicyLocality => policy::policy_locality(state, request),
+        cc::PolicyNV => policy::policy_nv(state, request),
+        cc::PolicyCounterTimer => policy::policy_counter_timer(state, request),
+        cc::PolicyCommandCode => policy::policy_command_code(state, request),
+        cc::PolicyPhysicalPresence => policy::policy_physical_presence(state, request),
+        cc::PolicyCpHash => policy::policy_cp_hash(state, request),
+        cc::PolicyNameHash => policy::policy_name_hash(state, request),
+        cc::PolicyDuplicationSelect => policy::policy_duplication_select(state, request),
+        cc::PolicyAuthorize => policy::policy_authorize(state, request),
+        cc::PolicyAuthValue => policy::policy_auth_value(state, request),
+        cc::PolicyPassword => policy::policy_password(state, request),
+        cc::PolicyGetDigest => policy::policy_get_digest(state, request),
+        cc::PolicyNvWritten => policy::policy_nv_written(state, request),
+        cc::PolicyTemplate => policy::policy_template(state, request),
+        cc::PolicyAuthorizeNV => policy::policy_authorize_nv(state, request),
+        cc::PolicyCapability => policy::policy_capability(state, request),
+        cc::PolicyParameters => policy::policy_parameters(state, request),
+        cc::PolicyTransportSPDM => policy::policy_transport_spdm(state, request),
+        cc::Policy_AC_SendSelect => policy::policy_ac_send_select(state, request),
+
+        // Part 3 clause 28, context management.
+        cc::FlushContext => policy::flush_context(state, request),
 
         // Part 3 clause 22, integrity collection.
         cc::PCR_Extend => pcr::pcr_extend(state, request),
