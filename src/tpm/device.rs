@@ -13,6 +13,7 @@ use crate::logging::Logger;
 use crate::server::Device;
 use crate::tpm::config;
 use crate::tpm::constants::{rc, st};
+use crate::tpm::core::state::TpmState;
 use crate::tpm::error::TpmRc;
 use crate::tpm::marshal::Writer;
 use crate::tpm::persist::StateStore;
@@ -80,26 +81,6 @@ pub fn success_response(tag: u16, body: &[u8]) -> Vec<u8> {
     w.into_vec()
 }
 
-/// Volatile and non-volatile TPM state.
-pub struct TpmState {
-    /// Set once TPM2_Startup has completed.
-    pub started: bool,
-    /// Set while physical presence is asserted by the platform.
-    pub physical_presence: bool,
-    /// Set while NV storage is available.
-    pub nv_available: bool,
-}
-
-impl Default for TpmState {
-    fn default() -> Self {
-        TpmState {
-            started: false,
-            physical_presence: false,
-            nv_available: true,
-        }
-    }
-}
-
 /// A software TPM.
 pub struct Tpm {
     state: Mutex<TpmState>,
@@ -111,10 +92,38 @@ pub struct Tpm {
 
 impl Tpm {
     /// Create a TPM whose non-volatile state lives in `state_dir`.
+    ///
+    /// A state file that is already there is loaded; otherwise the TPM is
+    /// manufactured and the new state is written.
     pub fn new(state_dir: impl AsRef<Path>, logger: Arc<Logger>) -> io::Result<Tpm> {
         let store = StateStore::new(state_dir)?;
+        let state = match store.load()? {
+            Some(data) => match TpmState::load(&data) {
+                Ok(s) => {
+                    logger.line("loaded saved state");
+                    s
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("state file is not usable: {e}"),
+                    ))
+                }
+            },
+            None => {
+                let s = TpmState::manufacture()
+                    .map_err(|e| io::Error::other(format!("cannot manufacture: {e}")))?;
+                logger.line("manufactured a new TPM");
+                let bytes = s
+                    .save()
+                    .map_err(|e| io::Error::other(format!("cannot save state: {e}")))?;
+                store.save(&bytes)?;
+                s
+            }
+        };
+
         Ok(Tpm {
-            state: Mutex::new(TpmState::default()),
+            state: Mutex::new(state),
             powered: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             store,
@@ -133,33 +142,71 @@ impl Tpm {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+
+    /// Write the non-volatile state out.
+    pub fn persist(&self) {
+        let state = self.locked();
+        match state.save() {
+            Ok(bytes) => {
+                if let Err(e) = self.store.save(&bytes) {
+                    self.logger.line(&format!("cannot write state: {e}"));
+                }
+            }
+            Err(e) => self.logger.line(&format!("cannot marshal state: {e}")),
+        }
+    }
+
+    /// True when the command changes anything that must reach the state file.
+    fn writes_nv(code: u32) -> bool {
+        crate::tpm::commands::table::lookup(code)
+            .map(|i| i.nv)
+            .unwrap_or(false)
+    }
 }
 
 impl Device for Tpm {
-    fn execute(&self, _locality: u8, command: &[u8]) -> Vec<u8> {
+    fn execute(&self, locality: u8, command: &[u8]) -> Vec<u8> {
         if !self.powered.load(Ordering::SeqCst) {
             return error_response(TpmRc(rc::INITIALIZE));
         }
-        let header = match parse_header(command) {
-            Ok(h) => h,
-            Err(e) => return error_response(e),
+        let code = parse_header(command).map(|h| h.code).ok();
+        let response = {
+            let mut state = self.locked();
+            crate::tpm::commands::execute::run(&mut state, locality, command)
         };
-        let _state = self.locked();
-        let _ = header;
-        error_response(TpmRc(rc::COMMAND_CODE))
+        // A command that touches non-volatile state is followed by a write so
+        // the state file matches what the TPM reports.
+        if let Some(code) = code {
+            if Tpm::writes_nv(code) {
+                self.persist();
+            }
+        }
+        response
     }
 
     fn power_on(&self) {
         self.powered.store(true, Ordering::SeqCst);
-        let mut state = self.locked();
-        *state = TpmState::default();
+        {
+            let mut state = self.locked();
+            state.started = false;
+            state.objects.clear();
+            state.sessions.clear();
+            state.physical_presence = false;
+            state.failure_mode = false;
+            state.clock.time = 0;
+        }
         self.logger.line("_TPM_Init");
     }
 
     fn power_off(&self) {
+        self.persist();
         self.powered.store(false, Ordering::SeqCst);
-        let mut state = self.locked();
-        *state = TpmState::default();
+        {
+            let mut state = self.locked();
+            state.started = false;
+            state.objects.clear();
+            state.sessions.clear();
+        }
         self.logger.line("power off");
     }
 
@@ -183,11 +230,41 @@ impl Device for Tpm {
         self.cancel.store(asserted, Ordering::SeqCst);
     }
 
-    fn hash_start(&self) {}
+    /// _TPM_Hash_Start begins an H-CRTM event sequence, Part 1 clause 34.3.
+    fn hash_start(&self) {
+        let mut state = self.locked();
+        state.hcrtm_buffer = Some(Vec::new());
+    }
 
-    fn hash_data(&self, _data: &[u8]) {}
+    fn hash_data(&self, data: &[u8]) {
+        let mut state = self.locked();
+        if let Some(buf) = state.hcrtm_buffer.as_mut() {
+            if buf.len().saturating_add(data.len()) <= crate::tpm::config::MAX_BUFFER_SIZE {
+                buf.extend_from_slice(data);
+            }
+        }
+    }
 
-    fn hash_end(&self) {}
+    /// _TPM_Hash_End records the H-CRTM measurement in PCR 17 through 22.
+    fn hash_end(&self) {
+        let mut state = self.locked();
+        let Some(buf) = state.hcrtm_buffer.take() else {
+            return;
+        };
+        // The D-RTM registers are set to zero before the event is recorded.
+        for index in 17..=22u16 {
+            let _ = state.pcr.reset(index, 4);
+        }
+        let algorithms = state.pcr.algorithms();
+        for a in algorithms {
+            let Ok(digest) = crate::tpm::crypto::hash::digest(a, &buf) else {
+                continue;
+            };
+            let _ = state
+                .pcr
+                .extend(crate::tpm::config::HCRTM_PCR, 4, &[(a, digest)]);
+        }
+    }
 
     fn act_get_signaled(&self, _act: u32) -> bool {
         false

@@ -180,6 +180,8 @@ pub struct TpmState {
     pub failure_mode: bool,
     pub self_test_done: bool,
     pub rng: Drbg,
+    /// Data collected between _TPM_Hash_Start and _TPM_Hash_End.
+    pub hcrtm_buffer: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for TpmState {
@@ -233,6 +235,7 @@ impl TpmState {
             failure_mode: false,
             self_test_done: true,
             rng,
+            hcrtm_buffer: None,
         })
     }
 
