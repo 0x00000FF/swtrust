@@ -3,7 +3,7 @@
 use crate::tpm::constants::{alg, cc, rc, rh, se, st};
 use crate::tpm::core::session::{self, Session};
 use crate::tpm::core::state::TpmState;
-use crate::tpm::crypto::{hash, rand::Rng};
+use crate::tpm::crypto::{ecc, hash, rand::Rng};
 use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Unmarshal, Writer};
 use crate::tpm::structures::attributes::LocalityAttributes;
@@ -40,14 +40,16 @@ pub fn start_auth_session(state: &mut TpmState, request: &Request) -> TpmResult<
     if nonce_caller.len() < 16 || nonce_caller.len() > digest_size {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
-    if tpm_key != rh::NULL && !encrypted_salt.is_empty() {
-        // Salt decryption needs the key's private area, which only a loaded
-        // decryption key has.
-        return Err(TpmRc(rc::VALUE).with_handle(1));
-    }
+    // A salt is only meaningful with a key to decrypt it, and a key is only
+    // useful when a salt arrives with it.
     if tpm_key == rh::NULL && !encrypted_salt.is_empty() {
         return Err(TpmRc(rc::VALUE).with_parameter(2));
     }
+    let salt = if tpm_key == rh::NULL {
+        Vec::new()
+    } else {
+        decrypt_salt(state, tpm_key, encrypted_salt.as_slice())?
+    };
 
     let bind_auth = if bind == rh::NULL {
         Vec::new()
@@ -66,7 +68,7 @@ pub fn start_auth_session(state: &mut TpmState, request: &Request) -> TpmResult<
     let session_key = session::derive_session_key(
         auth_hash,
         &bind_auth,
-        &[],
+        &salt,
         &nonce_tpm,
         nonce_caller.as_slice(),
     )?;
@@ -91,6 +93,79 @@ pub fn start_auth_session(state: &mut TpmState, request: &Request) -> TpmResult<
     })
 }
 
+/// Recover the salt a caller encrypted to `tpm_key`.
+///
+/// Part 1 clause 19.6.4.2 protects the salt with the same construction as a
+/// credential: RSA-OAEP with the label "SECRET" for an RSA key, and the KDFe
+/// derivation of the shared point for an ECC key.
+fn decrypt_salt(state: &TpmState, tpm_key: u32, encrypted: &[u8]) -> TpmResult<Vec<u8>> {
+    use crate::tpm::structures::keys::{PublicId, PublicParms};
+
+    let object = if crate::tpm::core::object::ObjectSlots::is_transient(tpm_key) {
+        state.objects.object(tpm_key).map_err(|e| e.with_handle(1))?
+    } else {
+        state
+            .persistent
+            .get(&tpm_key)
+            .ok_or(TpmRc(rc::HANDLE).with_handle(1))?
+    };
+    if !object
+        .public
+        .object_attributes
+        .has(crate::tpm::structures::attributes::ObjectAttributes::DECRYPT)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
+    }
+    let Some(sensitive) = &object.sensitive else {
+        return Err(TpmRc(rc::HANDLE).with_handle(1));
+    };
+    let name_alg = object.public.name_alg;
+
+    match (&object.public.unique, object.public.object_type) {
+        (PublicId::Rsa(modulus), alg::RSA) => {
+            let PublicParms::Rsa { exponent, .. } = object.public.parameters else {
+                return Err(TpmRc(rc::TYPE).with_handle(1));
+            };
+            let key = crate::tpm::crypto::rsa::RsaPrivate::from_prime(
+                modulus.as_slice(),
+                exponent,
+                sensitive.sensitive.as_slice(),
+            )?;
+            let plain = crate::tpm::crypto::rsa::private_op(&key, encrypted)
+                .map_err(|_| TpmRc(rc::VALUE).with_parameter(2))?;
+            crate::tpm::crypto::rsa::oaep_decode(name_alg, &plain, b"SECRET\0")
+                .map_err(|_| TpmRc(rc::VALUE).with_parameter(2))
+        }
+        (PublicId::Ecc(point), alg::ECC) => {
+            let PublicParms::Ecc { curve_id, .. } = object.public.parameters else {
+                return Err(TpmRc(rc::TYPE).with_handle(1));
+            };
+            // The encrypted salt is the caller's ephemeral public point.
+            let peer = crate::tpm::structures::schemes::Tpm2bEccPoint::from_bytes(encrypted)
+                .map_err(|_| TpmRc(rc::VALUE).with_parameter(2))?;
+            let curve = ecc::Curve::new(curve_id)?;
+            let private =
+                crate::tpm::crypto::bn::BigNum::from_bytes(sensitive.sensitive.as_slice())?;
+            let (zx, _) = ecc::ecdh(
+                &curve,
+                &private,
+                peer.point.x.as_slice(),
+                peer.point.y.as_slice(),
+            )
+            .map_err(|_| TpmRc(rc::VALUE).with_parameter(2))?;
+            crate::tpm::crypto::hmac::kdfe(
+                name_alg,
+                &zx,
+                "SECRET",
+                peer.point.x.as_slice(),
+                point.x.as_slice(),
+                (hash::digest_size(name_alg)? * 8) as u32,
+            )
+        }
+        _ => Err(TpmRc(rc::TYPE).with_handle(1)),
+    }
+}
+
 /// TPM2_PolicyRestart, Part 3 clause 11.2.
 pub fn policy_restart(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
@@ -111,20 +186,24 @@ fn policy_session(state: &mut TpmState, handle: u32) -> TpmResult<&mut Session> 
     Ok(s)
 }
 
-/// TPM2_PolicySigned, Part 3 clause 23.3, and TPM2_PolicySecret, clause 23.4,
-/// share this update.
+/// The policy update shared by TPM2_PolicySigned, TPM2_PolicySecret,
+/// TPM2_PolicyTicket and TPM2_PolicyAuthorize.
 ///
-/// `policyDigest = H(policyDigest || commandCode || authName || policyRef)`,
-/// then the cpHash is recorded when one was given.
+/// Part 3 clause 23.2.3 makes this two sequential hashes rather than one:
+///
+/// ```text
+/// policyDigest = H(policyDigest || commandCode || authName)
+/// policyDigest = H(policyDigest || policyRef)
+/// ```
 fn policy_authorization_update(
     s: &mut Session,
     command_code: u32,
     auth_name: &[u8],
     policy_ref: &[u8],
 ) -> TpmResult<()> {
-    let mut data = auth_name.to_vec();
-    data.extend_from_slice(policy_ref);
-    s.extend_policy(command_code, &data)
+    s.extend_policy(command_code, auth_name)?;
+    s.policy.digest = hash::digest_parts(s.auth_hash, &[&s.policy.digest, policy_ref])?;
+    Ok(())
 }
 
 /// The HMAC of an authorization ticket, Part 2 Table 114.
@@ -350,13 +429,17 @@ pub fn policy_or(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let list = TpmlDigest::unmarshal(&mut r)?;
 
     let s = policy_session(state, handle)?;
-    // The current digest must be one of the branches.
-    let matched = list
-        .digests
-        .iter()
-        .any(|d| d.as_slice() == s.policy.digest.as_slice());
-    if !matched {
-        return Err(TpmRc(rc::VALUE).with_parameter(1));
+    // The current digest must be one of the branches. A trial session is
+    // building a policy rather than satisfying one, so Part 3 clause 23.6.3
+    // skips the check for it.
+    if !s.is_trial() {
+        let matched = list
+            .digests
+            .iter()
+            .any(|d| d.as_slice() == s.policy.digest.as_slice());
+        if !matched {
+            return Err(TpmRc(rc::VALUE).with_parameter(1));
+        }
     }
     // The digest is reset and then extended with every branch, so the result
     // is the same whichever branch was taken.
@@ -697,12 +780,16 @@ pub fn policy_authorize(state: &mut TpmState, request: &Request) -> TpmResult<Re
         }
     }
     let s = policy_session(state, handle)?;
-    // The digest restarts and records who approved the policy.
+    // The digest restarts and records who approved the policy, with the same
+    // two step update Part 3 clause 23.2.3 defines.
     let digest_len = hash::digest_size(s.auth_hash)?;
     s.policy.digest = vec![0u8; digest_len];
-    let mut data = key_sign.as_slice().to_vec();
-    data.extend_from_slice(policy_ref.as_slice());
-    s.extend_policy(cc::PolicyAuthorize, &data)?;
+    policy_authorization_update(
+        s,
+        cc::PolicyAuthorize,
+        key_sign.as_slice(),
+        policy_ref.as_slice(),
+    )?;
     respond(|_| Ok(()))
 }
 
@@ -722,11 +809,10 @@ pub fn policy_duplication_select(
     };
 
     let auth_hash = policy_session(state, handle)?.auth_hash;
-    let name_hash = if include_object {
-        hash::digest_parts(auth_hash, &[object_name.as_slice(), new_parent_name.as_slice()])?
-    } else {
-        hash::digest(auth_hash, new_parent_name.as_slice())?
-    };
+    // Part 3 clause 23.15.3 always covers both Names in nameHash; includeObject
+    // only decides whether the object Name goes into the policy digest.
+    let name_hash =
+        hash::digest_parts(auth_hash, &[object_name.as_slice(), new_parent_name.as_slice()])?;
 
     let s = policy_session(state, handle)?;
     if s.policy.cp_hash.is_some() {

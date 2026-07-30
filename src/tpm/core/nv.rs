@@ -27,10 +27,13 @@ pub struct NvIndex {
     /// The stored data. A counter, bit field or PIN Index keeps its value here
     /// in the same marshalled form a read returns.
     pub data: Vec<u8>,
-    /// Set by TPM2_NV_ReadLock, cleared by a Startup(CLEAR) when the Index has
-    /// TPMA_NV_CLEAR_STCLEAR.
+    /// Mirrors TPMA_NV_READLOCKED in the public area.
+    ///
+    /// The lock bits live in the public area because they are part of the
+    /// Index Name, so both views are kept in step by [`NvIndex::set_read_lock`]
+    /// and [`NvIndex::set_write_lock`].
     pub read_locked: bool,
-    /// Set by TPM2_NV_WriteLock or TPM2_NV_GlobalWriteLock.
+    /// Mirrors TPMA_NV_WRITELOCKED in the public area.
     pub write_locked: bool,
 }
 
@@ -52,6 +55,22 @@ impl NvIndex {
 
     fn set_written(&mut self) {
         self.public.attributes = self.public.attributes.with(NvAttributes::WRITTEN);
+    }
+
+    /// Set or clear the read lock, keeping the public area in step.
+    pub fn set_read_lock(&mut self, locked: bool) {
+        self.read_locked = locked;
+        self.public
+            .attributes
+            .set(NvAttributes::READLOCKED, locked);
+    }
+
+    /// Set or clear the write lock, keeping the public area in step.
+    pub fn set_write_lock(&mut self, locked: bool) {
+        self.write_locked = locked;
+        self.public
+            .attributes
+            .set(NvAttributes::WRITELOCKED, locked);
     }
 
     /// The value of a counter Index.
@@ -264,7 +283,7 @@ impl NvStore {
     pub fn global_write_lock(&mut self) {
         for index in self.indices.values_mut() {
             if index.public.attributes.has(NvAttributes::GLOBALLOCK) {
-                index.write_locked = true;
+                index.set_write_lock(true);
             }
         }
     }
@@ -274,26 +293,54 @@ impl NvStore {
     /// A read lock is cleared when the Index has TPMA_NV_CLEAR_STCLEAR and a
     /// write lock when it has TPMA_NV_WRITE_STCLEAR. An Index locked by
     /// TPMA_NV_WRITEDEFINE stays locked.
-    pub fn on_startup_clear(&mut self) {
+    /// Apply a Startup(CLEAR) to the volatile lock state.
+    ///
+    /// Part 1 clause 13.6 fixes the rules: a read lock is dropped when the
+    /// Index has TPMA_NV_READ_STCLEAR, and a write lock when it has
+    /// TPMA_NV_WRITE_STCLEAR, except that an Index with TPMA_NV_WRITEDEFINE
+    /// that has been written stays locked for good. `disorderly` says whether
+    /// the last shutdown failed to save the state, which is when an orderly
+    /// counter has to jump forward to stay monotonic.
+    pub fn on_startup_clear_with(&mut self, disorderly: bool) {
         for index in self.indices.values_mut() {
-            if index.public.attributes.has(NvAttributes::CLEAR_STCLEAR) {
-                index.read_locked = false;
+            if index.public.attributes.has(NvAttributes::READ_STCLEAR) {
+                index.set_read_lock(false);
             }
             if index.public.attributes.has(NvAttributes::WRITE_STCLEAR) {
-                index.write_locked = false;
+                let permanent = index.public.attributes.has(NvAttributes::WRITEDEFINE)
+                    && index.written();
+                if !permanent {
+                    index.set_write_lock(false);
+                }
             }
+            // An orderly Index that is not a counter loses its data, because
+            // the value was only ever held in RAM.
             if index.public.attributes.has(NvAttributes::ORDERLY)
-                && index.index_type() == nt::COUNTER
+                && index.index_type() != nt::COUNTER
+                && disorderly
             {
-                // An orderly counter may have advanced past its last saved
-                // value, so it is stepped forward to stay monotonic.
-                if index.written() {
-                    if let Ok(v) = index.counter_value() {
-                        index.data = v.wrapping_add(1).to_be_bytes().to_vec();
-                    }
+                index.data.clear();
+                index.public.attributes =
+                    index.public.attributes.without(NvAttributes::WRITTEN);
+            }
+            // An orderly counter may have advanced past its last saved value,
+            // so after a disorderly shutdown it steps forward to stay
+            // monotonic.
+            if disorderly
+                && index.public.attributes.has(NvAttributes::ORDERLY)
+                && index.index_type() == nt::COUNTER
+                && index.written()
+            {
+                if let Ok(v) = index.counter_value() {
+                    index.data = v.saturating_add(1).to_be_bytes().to_vec();
                 }
             }
         }
+    }
+
+    /// Apply a Startup(CLEAR) that followed an orderly shutdown.
+    pub fn on_startup_clear(&mut self) {
+        self.on_startup_clear_with(false);
     }
 
     /// Remove every Index that the platform did not create.
@@ -498,17 +545,25 @@ mod tests {
     #[test]
     fn startup_clear_releases_the_locks_that_are_marked() {
         let mut store = NvStore::new();
+        // A read lock is dropped when the Index has READ_STCLEAR and a write
+        // lock when it has WRITE_STCLEAR.
         let mut a = index(
             nt::ORDINARY,
             8,
-            NvAttributes::CLEAR_STCLEAR | NvAttributes::WRITE_STCLEAR,
+            NvAttributes::READ_STCLEAR | NvAttributes::WRITE_STCLEAR,
         );
         a.public.nv_index = hc::NV_INDEX_FIRST;
-        a.read_locked = true;
-        a.write_locked = true;
-        let mut b = index(nt::ORDINARY, 8, NvAttributes::WRITEDEFINE);
+        a.set_read_lock(true);
+        a.set_write_lock(true);
+        // An Index with WRITEDEFINE that has been written stays locked.
+        let mut b = index(
+            nt::ORDINARY,
+            8,
+            NvAttributes::WRITEDEFINE | NvAttributes::WRITE_STCLEAR,
+        );
         b.public.nv_index = hc::NV_INDEX_FIRST + 1;
-        b.write_locked = true;
+        b.write(0, &[1u8; 8]).unwrap();
+        b.set_write_lock(true);
         store.define(a).unwrap();
         store.define(b).unwrap();
 
@@ -519,17 +574,64 @@ mod tests {
     }
 
     #[test]
-    fn an_orderly_counter_steps_forward_on_startup() {
+    fn a_lock_shows_up_in_the_public_area_and_changes_the_name() {
+        // The lock bits are part of the Index Name, so a lock must be visible
+        // in the public area, not only in a side flag.
+        let mut i = index(nt::ORDINARY, 8, NvAttributes::READ_STCLEAR);
+        let before = i.name().unwrap();
+        i.set_read_lock(true);
+        assert!(i.public.attributes.has(NvAttributes::READLOCKED));
+        assert!(i.read_locked);
+        assert_ne!(i.name().unwrap(), before);
+        i.set_read_lock(false);
+        assert!(!i.public.attributes.has(NvAttributes::READLOCKED));
+        assert_eq!(i.name().unwrap(), before);
+
+        i.set_write_lock(true);
+        assert!(i.public.attributes.has(NvAttributes::WRITELOCKED));
+        assert!(i.write_locked);
+    }
+
+    #[test]
+    fn an_orderly_counter_only_steps_after_a_disorderly_shutdown() {
         let mut store = NvStore::new();
         let mut c = index(nt::COUNTER, 8, NvAttributes::ORDERLY);
         c.public.nv_index = hc::NV_INDEX_FIRST;
         store.define(c).unwrap();
         store.get_mut(hc::NV_INDEX_FIRST).unwrap().increment().unwrap();
+
+        // An orderly shutdown saved the value, so it stays where it was.
         store.on_startup_clear();
+        assert_eq!(
+            store.get(hc::NV_INDEX_FIRST).unwrap().counter_value().unwrap(),
+            1
+        );
+        // A disorderly one may have lost an increment, so the counter jumps to
+        // stay monotonic.
+        store.on_startup_clear_with(true);
         assert_eq!(
             store.get(hc::NV_INDEX_FIRST).unwrap().counter_value().unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn orderly_data_is_lost_after_a_disorderly_shutdown() {
+        let mut store = NvStore::new();
+        let mut i = index(nt::ORDINARY, 8, NvAttributes::ORDERLY);
+        i.public.nv_index = hc::NV_INDEX_FIRST;
+        store.define(i).unwrap();
+        store
+            .get_mut(hc::NV_INDEX_FIRST)
+            .unwrap()
+            .write(0, &[7u8; 8])
+            .unwrap();
+
+        store.on_startup_clear();
+        assert!(store.get(hc::NV_INDEX_FIRST).unwrap().written());
+
+        store.on_startup_clear_with(true);
+        assert!(!store.get(hc::NV_INDEX_FIRST).unwrap().written());
     }
 
     #[test]

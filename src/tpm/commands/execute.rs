@@ -89,6 +89,27 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         auth_values.push(entity.auth.clone());
     }
 
+    // A session past the authorization handles carries no authorization, but
+    // if it asks to encrypt or decrypt a parameter, or to audit, it still has
+    // to prove it knows the session key. Part 1 clause 19.6.3 requires the
+    // HMAC on every such session.
+    for index in request.info.auth_handles as usize..request.sessions.len() {
+        let input = &request.sessions[index];
+        if input.handle == crate::tpm::constants::rh::RS_PW {
+            // A password session cannot encrypt, decrypt or audit.
+            if input.attributes.any(
+                crate::tpm::structures::attributes::SessionAttributes::DECRYPT
+                    | crate::tpm::structures::attributes::SessionAttributes::ENCRYPT
+                    | crate::tpm::structures::attributes::SessionAttributes::AUDIT,
+            ) {
+                return Err(TpmRc(rc::ATTRIBUTES).with_session(index + 1));
+            }
+            continue;
+        }
+        let name_refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
+        dispatch::check_unauthorized_session(state, &request, index, &name_refs)?;
+    }
+
     dispatch::decrypt_parameters(state, &mut request)?;
 
     let response = super::run_command(state, &request)?;

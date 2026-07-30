@@ -517,6 +517,50 @@ pub fn check_authorization(
     Ok(())
 }
 
+/// Check a session that carries no authorization but asks to encrypt, decrypt
+/// or audit.
+///
+/// Such a session must still prove that it holds the session key, so its HMAC
+/// is computed over the cpHash with the session key alone as the key.
+pub fn check_unauthorized_session(
+    state: &TpmState,
+    request: &Request,
+    index: usize,
+    names: &[&[u8]],
+) -> TpmResult<()> {
+    let input = &request.sessions[index];
+    let position = index + 1;
+    let s = state
+        .sessions
+        .get(input.handle)
+        .map_err(|_| TpmRc(rc::VALUE).with_session(position))?;
+
+    // A session that asks for nothing needs to prove nothing.
+    if !input.attributes.any(
+        SessionAttributes::DECRYPT | SessionAttributes::ENCRYPT | SessionAttributes::AUDIT,
+    ) {
+        return Ok(());
+    }
+    // An unbound, unsalted session has no key to prove, so there is nothing to
+    // check. Such a session provides no confidentiality anyway.
+    if s.session_key.is_empty() {
+        return Ok(());
+    }
+    let cp = session::cp_hash(s.auth_hash, request.code, names, &request.parameters)?;
+    let expected = session::auth_hmac(
+        s.auth_hash,
+        &s.session_key,
+        &cp,
+        &input.nonce_caller,
+        &s.nonce_tpm,
+        input.attributes,
+    )?;
+    if !constant_time_eq(&expected, &input.hmac) {
+        return Err(TpmRc(rc::AUTH_FAIL).with_session(position));
+    }
+    Ok(())
+}
+
 /// Compare a password authorization.
 fn compare_auth(
     state: &mut TpmState,
@@ -787,13 +831,28 @@ pub fn build_response_sessions(
 }
 
 /// Close every session the caller did not ask to keep.
+///
+/// A policy session that is kept has its policy reset, because Part 1 clause
+/// 19.7.4 spends the satisfied assertions when the session authorizes a
+/// command. Without that a single satisfied policy would authorize an
+/// unlimited number of later commands.
 pub fn close_sessions(state: &mut TpmState, request: &Request) {
-    for input in &request.sessions {
+    for (index, input) in request.sessions.iter().enumerate() {
         if input.handle == rh::RS_PW {
             continue;
         }
         if !input.attributes.has(SessionAttributes::CONTINUE_SESSION) {
             let _ = state.sessions.remove(input.handle);
+            continue;
+        }
+        // Only a session that actually authorized a handle is spent.
+        if index >= request.info.auth_handles as usize {
+            continue;
+        }
+        if let Ok(s) = state.sessions.get_mut(input.handle) {
+            if s.is_policy() {
+                let _ = s.restart_policy();
+            }
         }
     }
 }

@@ -342,7 +342,7 @@ pub fn nv_write_lock(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     if !a.has(NvAttributes::WRITEDEFINE) && !a.has(NvAttributes::WRITE_STCLEAR) {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
     }
-    state.nv.get_mut(nv_handle)?.write_locked = true;
+    state.nv.get_mut(nv_handle)?.set_write_lock(true);
     respond(|_| Ok(()))
 }
 
@@ -384,7 +384,7 @@ pub fn nv_read_lock(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     if !index.public.attributes.has(NvAttributes::READ_STCLEAR) {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
     }
-    state.nv.get_mut(nv_handle)?.read_locked = true;
+    state.nv.get_mut(nv_handle)?.set_read_lock(true);
     respond(|_| Ok(()))
 }
 

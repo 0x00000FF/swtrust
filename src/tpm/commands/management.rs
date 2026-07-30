@@ -549,7 +549,7 @@ fn pcr_properties(property: u32) -> Vec<TaggedPcrSelect> {
         out.push(TaggedPcrSelect { tag, select });
     };
 
-    add(pt_pcr::SAVE, &|_| true);
+    add(pt_pcr::SAVE, &|i| pcr::is_saved(i));
     for (tag, locality) in [
         (pt_pcr::EXTEND_L0, 0u8),
         (pt_pcr::EXTEND_L1, 1),
@@ -691,13 +691,30 @@ mod tests {
         assert!(r0.select.is_selected(16));
         assert!(r0.select.is_selected(23));
         assert!(!r0.select.is_selected(0));
-        // The D-RTM registers reset from locality 4.
+        // The dynamic root of trust registers are not reset by command at any
+        // locality; the TCB registers reset from localities two and three.
         let r4 = find(pt_pcr::RESET_L4);
-        assert!(r4.select.is_selected(17));
-        // PCR 16 does not advance the update counter.
+        assert!(!r4.select.is_selected(17));
+        let r2 = find(pt_pcr::RESET_L2);
+        assert!(r2.select.is_selected(21));
+        assert!(r2.select.is_selected(22));
+        assert!(!r2.select.is_selected(17));
+        // The debug, TCB and application registers do not advance the counter.
         let ni = find(pt_pcr::NO_INCREMENT);
-        assert!(ni.select.is_selected(16));
+        for index in [16usize, 21, 22, 23] {
+            assert!(ni.select.is_selected(index), "PCR {index}");
+        }
         assert!(!ni.select.is_selected(0));
+        // Only the static and application registers are saved.
+        let save = find(pt_pcr::SAVE);
+        assert!(save.select.is_selected(0));
+        assert!(save.select.is_selected(23));
+        assert!(!save.select.is_selected(16));
+        assert!(!save.select.is_selected(17));
+        // The registers a D-RTM resets are reported.
+        let drtm = find(pt_pcr::DRTM_RESET);
+        assert!(drtm.select.is_selected(17));
+        assert!(!drtm.select.is_selected(0));
     }
 
     #[test]

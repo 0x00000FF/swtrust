@@ -155,34 +155,26 @@ pub fn pcr_allocate(state: &mut TpmState, request: &Request) -> TpmResult<Respon
 }
 
 /// TPM2_PCR_SetAuthPolicy, Part 3 clause 22.6.
-pub fn pcr_set_auth_policy(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
+///
+/// The PC Client Platform Profile clause 4.7 has no PCR under policy control,
+/// so this optional command is present and always reports TPM_RC_VALUE rather
+/// than changing state a caller could then not use.
+pub fn pcr_set_auth_policy(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let policy = Tpm2bDigest::unmarshal(&mut r)?;
-    let hash_alg = r.u16()?;
-    let pcr_handle = r.u32()?;
-    pcr_index(pcr_handle).map_err(|e| e.with_parameter(3))?;
-
-    if hash_alg != alg::NULL {
-        let size = crate::tpm::crypto::hash::digest_size(hash_alg)
-            .map_err(|_| TpmRc(rc::HASH).with_parameter(2))?;
-        if policy.len() != size {
-            return Err(TpmRc(rc::SIZE).with_parameter(1));
-        }
-    } else if !policy.is_empty() {
-        return Err(TpmRc(rc::SIZE).with_parameter(1));
-    }
-
-    state.pcr_policy = TpmtHa::new(hash_alg, policy.as_slice().to_vec())?;
-    respond(|_| Ok(()))
+    let _policy = Tpm2bDigest::unmarshal(&mut r)?;
+    let _hash_alg = r.u16()?;
+    let _pcr_handle = r.u32()?;
+    Err(TpmRc(rc::VALUE).with_parameter(3))
 }
 
 /// TPM2_PCR_SetAuthValue, Part 3 clause 22.7.
-pub fn pcr_set_auth_value(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
+///
+/// No PCR of this platform profile has an authorization value, so the command
+/// reports TPM_RC_VALUE.
+pub fn pcr_set_auth_value(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let auth = Tpm2bDigest::unmarshal(&mut r)?;
-    pcr_index(request.handle(0)?).map_err(|e| e.with_handle(1))?;
-    state.pcr_auth = auth.as_slice().to_vec();
-    respond(|_| Ok(()))
+    let _auth = Tpm2bDigest::unmarshal(&mut r)?;
+    Err(TpmRc(rc::VALUE).with_handle(1))
 }
 
 /// TPM2_PCR_Reset, Part 3 clause 22.8.
