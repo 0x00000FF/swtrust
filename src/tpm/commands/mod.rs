@@ -4,6 +4,7 @@ pub mod attest;
 pub mod context;
 pub mod crypto;
 pub mod dispatch;
+pub mod duplication;
 pub mod execute;
 pub mod hierarchy;
 pub mod management;
@@ -11,6 +12,7 @@ pub mod nv;
 pub mod object;
 pub mod pcr;
 pub mod policy;
+pub mod signing;
 pub mod table;
 
 use crate::tpm::constants::{cc, rc};
@@ -47,6 +49,25 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         // Part 3 clause 12.5 and 12.6, credentials.
         cc::MakeCredential => crypto::make_credential(state, request),
         cc::ActivateCredential => crypto::activate_credential(state, request),
+
+        // Part 3 clause 13, duplication.
+        cc::Duplicate => duplication::duplicate(state, request),
+        cc::Rewrap => duplication::rewrap(state, request),
+        cc::Import => duplication::import(state, request),
+
+        // Part 3 clause 32, attached components.
+        cc::AC_GetCapability => duplication::ac_get_capability(state, request),
+        cc::AC_Send => duplication::ac_send(state, request),
+
+        // Part 3 clause 34, field upgrade.
+        cc::FieldUpgradeStart => duplication::field_upgrade_start(state, request),
+        cc::FieldUpgradeData => duplication::field_upgrade_data(state, request),
+
+        // Part 3 clause 37, authenticated timers.
+        cc::ACT_SetTimeout => duplication::act_set_timeout(state, request),
+
+        // Part 3 clause 30.3, setting a capability.
+        cc::SetCapability => duplication::set_capability(state, request),
 
         // Part 3 clause 14, asymmetric primitives.
         cc::RSA_Encrypt => crypto::rsa_encrypt(state, request),
@@ -86,6 +107,21 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::EC_Ephemeral => crypto::ec_ephemeral(state, request),
         cc::Sign => crypto::sign(state, request),
         cc::VerifySignature => crypto::verify_signature(state, request),
+        cc::Commit => signing::commit(state, request),
+        cc::ZGen_2Phase => signing::zgen_2phase(state, request),
+        cc::ECC_Encrypt => signing::ecc_encrypt(state, request),
+        cc::ECC_Decrypt => signing::ecc_decrypt(state, request),
+        cc::Encapsulate => signing::encapsulate(state, request),
+        cc::Decapsulate => signing::decapsulate(state, request),
+        cc::CertifyX509 => signing::certify_x509(state, request),
+
+        // Part 3 clause 20.4 to 20.9, the version 185 signing commands.
+        cc::SignDigest => signing::sign_digest_command(state, request),
+        cc::VerifyDigestSignature => signing::verify_digest_signature(state, request),
+        cc::SignSequenceStart => signing::sign_sequence_start(state, request),
+        cc::SignSequenceComplete => signing::sign_sequence_complete(state, request),
+        cc::VerifySequenceStart => signing::verify_sequence_start(state, request),
+        cc::VerifySequenceComplete => signing::verify_sequence_complete(state, request),
 
         // Part 3 clause 16, randomness.
         cc::GetRandom => management::get_random(state, request),

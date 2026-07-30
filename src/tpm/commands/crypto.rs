@@ -382,6 +382,15 @@ pub fn sign_digest(
 }
 
 /// Verify `signature` over `digest` with the public part of `object`.
+pub fn verify_digest_public(
+    object: &Object,
+    digest: &[u8],
+    signature: &TpmtSignature,
+) -> TpmResult<()> {
+    verify_digest(object, digest, signature)
+}
+
+/// Verify `signature` over `digest` with the public part of `object`.
 fn verify_digest(object: &Object, digest: &[u8], signature: &TpmtSignature) -> TpmResult<()> {
     match (&object.public.unique, &signature.signature) {
         (PublicId::Rsa(modulus), SignatureValue::Rsa(sig)) => {

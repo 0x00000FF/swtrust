@@ -85,22 +85,31 @@ tests/
 
 ## Implemented commands
 
-102 of the 135 commands in the table are implemented:
+All 135 commands in the table are dispatched. 134 carry out their operation;
+TPM2_CertifyX509 is dispatched but answers TPM_RC_COMMAND_CODE because
+building and re-encoding a partial X.509 certificate is not implemented.
+
+By clause:
 
 - clause 9 startup and shutdown, clause 10 self test
 - clause 11 sessions and clause 23 enhanced authorization, every policy
   assertion
 - clause 12 object management, including credentials
+- clause 13 duplication: duplicate, rewrap and import, with the inner and
+  outer wraps of Part 1 clause 23
 - clause 14 asymmetric primitives: RSA encryption and decryption, ECDH key
-  generation and Z generation, curve parameters
+  generation and Z generation, two phase Z generation, ECC encryption and
+  decryption, key encapsulation over ECC, curve parameters
 - clause 15 symmetric primitives: hashing, HMAC, encryption and decryption
 - clause 16 randomness
 - clause 17 hash, HMAC and event sequences
-- clause 19.4 ephemeral EC points, clause 20 signing and verification
+- clause 18 attestation and clause 21 auditing
+- clause 19 commitment and ephemeral EC points, clause 20 signing and
+  verification including the one shot and sequence forms added in version 185
 - clause 22 integrity collection
 - clause 24 hierarchy administration, clause 25 dictionary attack functions,
   clause 26 miscellaneous management
-- clause 28.4 context flushing
+- clause 28 context management and persistent objects
 - clause 30 capabilities, clause 31 NV storage, clause 36 the clock
 - the vendor test command
 
@@ -109,33 +118,19 @@ same TPM2_CreatePrimary always rebuilds the same key, and changing the seed
 with TPM2_Clear, TPM2_ChangePPS or TPM2_ChangeEPS makes every object under
 that hierarchy unloadable.
 
-## Not yet implemented
+## Commands that report a limitation
 
-The remaining 33 commands are declared in the command table and answer
-TPM_RC_COMMAND_CODE until they are written:
-
-- attestation: TPM2_Certify, TPM2_CertifyCreation, TPM2_CertifyX509,
-  TPM2_Quote, TPM2_GetTime, TPM2_GetSessionAuditDigest,
-  TPM2_GetCommandAuditDigest, TPM2_NV_Certify,
-  TPM2_SetCommandCodeAuditStatus
-- duplication: TPM2_Duplicate, TPM2_Rewrap, TPM2_Import
-- context management: TPM2_ContextSave, TPM2_ContextLoad, TPM2_EvictControl
-- split signing: TPM2_Commit, TPM2_ZGen_2Phase, TPM2_ECC_Encrypt,
-  TPM2_ECC_Decrypt
-- one shot and sequence signing added in version 185: TPM2_SignDigest,
-  TPM2_VerifyDigestSignature, TPM2_SignSequenceStart,
-  TPM2_SignSequenceComplete, TPM2_VerifySequenceStart,
-  TPM2_VerifySequenceComplete
-- key encapsulation: TPM2_Encapsulate, TPM2_Decapsulate
-- attached components: TPM2_AC_GetCapability, TPM2_AC_Send
-- field upgrade: TPM2_FieldUpgradeStart, TPM2_FieldUpgradeData
-- authenticated timers: TPM2_ACT_SetTimeout
-- TPM2_SetCapability
-
-The pieces those commands are built from are in place and tested: object slots
-and naming, protected storage wrapping, deterministic RSA and ECC key
-generation, the signature schemes, the attestation structures, the KDFs and
-the session machinery.
+- TPM2_CertifyX509 answers TPM_RC_COMMAND_CODE: completing a partial X.509
+  certificate needs DER encoding that is not implemented.
+- TPM2_ACT_SetTimeout, TPM2_AC_Send and TPM2_SetCapability answer
+  TPM_RC_VALUE because this TPM has no authenticated timers, no attached
+  components and no settable capability.
+- TPM2_FieldUpgradeStart and TPM2_FieldUpgradeData answer TPM_RC_COMMAND_CODE
+  and TPM_RC_UPGRADE because the firmware is not field upgradeable.
+- TPM2_Encapsulate and TPM2_Decapsulate work over ECC. The ML-KEM form is
+  refused with TPM_RC_TYPE, as ML-KEM is not implemented.
+- TPM2_Commit returns a commitment but keeps no commitment table, so the
+  counter it returns is always zero.
 
 ## Algorithms
 
