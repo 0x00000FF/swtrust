@@ -4,6 +4,7 @@
 //! come from Part 2, `crypto` and the state machine from Part 1, and the
 //! command implementations from Part 3.
 
+pub mod commands;
 pub mod config;
 pub mod constants;
 pub mod core;
