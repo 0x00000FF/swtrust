@@ -132,6 +132,19 @@ that hierarchy unloadable.
 - TPM2_Commit returns a commitment but keeps no commitment table, so the
   counter it returns is always zero.
 
+## Platform profile
+
+The PCR locality and attribute matrix follows the PC Client Platform Profile
+clause 4.7.1 Table 14. PCR 0 through 15 hold the static root of trust and no
+command resets them. PCR 16 is the debug register and PCR 23 the application
+register. PCR 17 through 20 belong to the dynamic root of trust and are reset
+by a D-RTM event rather than by command. PCR 21 and 22 are the TCB registers,
+which localities two and three reset. The debug, TCB and application registers
+do not advance the PCR update counter.
+
+No PCR of this profile is under policy or authorization value control, so
+TPM2_PCR_SetAuthPolicy and TPM2_PCR_SetAuthValue report TPM_RC_VALUE.
+
 ## Algorithms
 
 Hashes: SHA-1, SHA-256, SHA-384, SHA-512, SHA3-256, SHA3-384, SHA3-512.
