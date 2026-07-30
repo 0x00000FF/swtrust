@@ -1,4 +1,4 @@
-//! The whole TPM state, and how it is written to and read from the state file.
+﻿//! The whole TPM state, and how it is written to and read from the state file.
 //!
 //! Part 1 clause 14 divides the state into values that survive power loss and
 //! values that do not. The non-volatile part is what [`TpmState::save`] writes;
@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::tpm::config;
 use crate::tpm::constants::{alg, rc, su};
-use crate::tpm::crypto::rand::{Drbg, Rng};
+use crate::tpm::crypto::rand::Drbg;
 use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Reader, Unmarshal, Writer};
 use crate::tpm::structures::attributes::{PermanentAttributes, StartupClearAttributes};

@@ -1,4 +1,4 @@
-//! Duplication, Part 3 clause 13, and the remaining management commands.
+﻿//! Duplication, Part 3 clause 13, and the remaining management commands.
 
 use crate::tpm::constants::{alg, rc, rh};
 use crate::tpm::core::names;
@@ -10,13 +10,13 @@ use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Unmarshal};
 use crate::tpm::structures::attributes::ObjectAttributes;
 use crate::tpm::structures::base::{
-    Tpm2bData, Tpm2bEncryptedSecret, Tpm2bName, Tpm2bPrivate, Tpm2bSymKey,
+    Tpm2bEncryptedSecret, Tpm2bName, Tpm2bPrivate, Tpm2bSymKey,
 };
 use crate::tpm::structures::keys::{PublicId, PublicParms, Tpm2bPublic, TpmtSensitive};
 use crate::tpm::structures::schemes::SymDef;
 
 use super::dispatch::{Request, Response};
-use super::execute::{respond, respond_with_handle};
+use super::execute::respond;
 
 /// The object a handle names, transient or persistent.
 fn object_of(state: &TpmState, handle: u32) -> TpmResult<&Object> {

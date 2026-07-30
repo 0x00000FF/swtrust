@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use swtrust::logging::Logger;
 use swtrust::server::Device;
-use swtrust::tpm::constants::{alg, cap, cc, hc, pt, rc, rh, st, su};
+use swtrust::tpm::constants::{alg, cap, cc, hc, pt, rc, rh, st};
 use swtrust::tpm::device::Tpm;
 use swtrust::tpm::marshal::{Reader, Writer};
 
@@ -982,7 +982,7 @@ fn a_private_area_does_not_load_under_the_wrong_parent() {
     let h = Harness::started("wrongparent");
 
     let template = storage_template();
-    let mut make_primary = |hierarchy: u32| {
+    let make_primary = |hierarchy: u32| {
         let mut p = Writer::new();
         p.u16(4);
         p.u16(0);

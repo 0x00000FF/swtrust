@@ -57,11 +57,14 @@ impl RsaPublic {
 }
 
 /// An RSA private key, held as the public key plus one prime.
+///
+/// The TPM stores only `p` in the sensitive area; `q` and `d` are recovered
+/// from the modulus and the public exponent whenever the key is loaded.
 #[derive(Debug)]
 pub struct RsaPrivate {
     pub public: RsaPublic,
     pub p: BigNum,
-    q: BigNum,
+    pub q: BigNum,
     d: BigNum,
 }
 

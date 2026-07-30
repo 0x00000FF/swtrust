@@ -1,4 +1,4 @@
-//! Startup, self test, randomness, capabilities and the clock.
+﻿//! Startup, self test, randomness, capabilities and the clock.
 //!
 //! These are the commands of Part 3 clauses 9, 10, 16, 30 and 36.
 
@@ -8,7 +8,7 @@ use crate::tpm::core::pcr;
 use crate::tpm::core::state::TpmState;
 use crate::tpm::crypto::{ecc, hash, rand::Rng, sym};
 use crate::tpm::error::{TpmRc, TpmResult};
-use crate::tpm::marshal::{Marshal, Unmarshal, Writer};
+use crate::tpm::marshal::{Marshal, Unmarshal};
 use crate::tpm::structures::attributes::{CommandAttributes, PermanentAttributes};
 use crate::tpm::structures::base::{PcrSelect, Tpm2bDigest};
 use crate::tpm::structures::capability::{Capabilities, CapabilityData};

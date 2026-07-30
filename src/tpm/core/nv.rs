@@ -419,7 +419,7 @@ mod tests {
         let p = i.pin_counters().unwrap();
         assert_eq!(p.pin_count, 2);
         assert_eq!(p.pin_limit, 5);
-        let mut o = index(nt::ORDINARY, 8, 0);
+        let o = index(nt::ORDINARY, 8, 0);
         assert_eq!(o.pin_counters().unwrap_err(), TpmRc(rc::ATTRIBUTES));
     }
 
