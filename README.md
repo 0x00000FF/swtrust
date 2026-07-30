@@ -85,13 +85,24 @@ tests/
 
 ## Implemented commands
 
-Part 3 clause 9 startup and shutdown, clause 10 self test, clause 11 sessions,
-clause 12 object management, clause 14.7 curve parameters, clause 16
-randomness, clause 22 integrity collection, clause 23 enhanced authorization,
-clause 24 hierarchy administration, clause 25 dictionary attack functions,
-clause 26 miscellaneous management, clause 28.4 context flushing, clause 30
-capabilities, clause 31 NV storage, clause 36 the clock, and the vendor test
-command.
+102 of the 135 commands in the table are implemented:
+
+- clause 9 startup and shutdown, clause 10 self test
+- clause 11 sessions and clause 23 enhanced authorization, every policy
+  assertion
+- clause 12 object management, including credentials
+- clause 14 asymmetric primitives: RSA encryption and decryption, ECDH key
+  generation and Z generation, curve parameters
+- clause 15 symmetric primitives: hashing, HMAC, encryption and decryption
+- clause 16 randomness
+- clause 17 hash, HMAC and event sequences
+- clause 19.4 ephemeral EC points, clause 20 signing and verification
+- clause 22 integrity collection
+- clause 24 hierarchy administration, clause 25 dictionary attack functions,
+  clause 26 miscellaneous management
+- clause 28.4 context flushing
+- clause 30 capabilities, clause 31 NV storage, clause 36 the clock
+- the vendor test command
 
 A Primary Object is derived from its hierarchy seed and its template, so the
 same TPM2_CreatePrimary always rebuilds the same key, and changing the seed
@@ -100,23 +111,22 @@ that hierarchy unloadable.
 
 ## Not yet implemented
 
-The following command groups are declared in the command table and answer
+The remaining 33 commands are declared in the command table and answer
 TPM_RC_COMMAND_CODE until they are written:
 
-- cryptographic operations: TPM2_Hash, TPM2_HMAC and the hash, HMAC and event
-  sequences, TPM2_Sign, TPM2_VerifySignature, TPM2_SignDigest,
-  TPM2_VerifyDigestSignature, the signing and verification sequences,
-  TPM2_RSA_Encrypt, TPM2_RSA_Decrypt, TPM2_ECDH_KeyGen, TPM2_ECDH_ZGen,
-  TPM2_ZGen_2Phase, TPM2_ECC_Encrypt, TPM2_ECC_Decrypt, TPM2_Commit,
-  TPM2_EC_Ephemeral, TPM2_EncryptDecrypt, TPM2_EncryptDecrypt2,
-  TPM2_MakeCredential, TPM2_ActivateCredential, TPM2_Encapsulate,
-  TPM2_Decapsulate
 - attestation: TPM2_Certify, TPM2_CertifyCreation, TPM2_CertifyX509,
   TPM2_Quote, TPM2_GetTime, TPM2_GetSessionAuditDigest,
   TPM2_GetCommandAuditDigest, TPM2_NV_Certify,
   TPM2_SetCommandCodeAuditStatus
 - duplication: TPM2_Duplicate, TPM2_Rewrap, TPM2_Import
 - context management: TPM2_ContextSave, TPM2_ContextLoad, TPM2_EvictControl
+- split signing: TPM2_Commit, TPM2_ZGen_2Phase, TPM2_ECC_Encrypt,
+  TPM2_ECC_Decrypt
+- one shot and sequence signing added in version 185: TPM2_SignDigest,
+  TPM2_VerifyDigestSignature, TPM2_SignSequenceStart,
+  TPM2_SignSequenceComplete, TPM2_VerifySequenceStart,
+  TPM2_VerifySequenceComplete
+- key encapsulation: TPM2_Encapsulate, TPM2_Decapsulate
 - attached components: TPM2_AC_GetCapability, TPM2_AC_Send
 - field upgrade: TPM2_FieldUpgradeStart, TPM2_FieldUpgradeData
 - authenticated timers: TPM2_ACT_SetTimeout
@@ -124,7 +134,8 @@ TPM_RC_COMMAND_CODE until they are written:
 
 The pieces those commands are built from are in place and tested: object slots
 and naming, protected storage wrapping, deterministic RSA and ECC key
-generation, the signature schemes, the KDFs and the session machinery.
+generation, the signature schemes, the attestation structures, the KDFs and
+the session machinery.
 
 ## Algorithms
 

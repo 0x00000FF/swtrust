@@ -1,5 +1,6 @@
 //! Command implementations from TPM 2.0 Library Part 3.
 
+pub mod crypto;
 pub mod dispatch;
 pub mod execute;
 pub mod hierarchy;
@@ -41,8 +42,34 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         // Part 3 clause 12.9, parameter checking.
         cc::TestParms => management::test_parms(state, request),
 
-        // Part 3 clause 14.7, curve parameters.
+        // Part 3 clause 12.5 and 12.6, credentials.
+        cc::MakeCredential => crypto::make_credential(state, request),
+        cc::ActivateCredential => crypto::activate_credential(state, request),
+
+        // Part 3 clause 14, asymmetric primitives.
+        cc::RSA_Encrypt => crypto::rsa_encrypt(state, request),
+        cc::RSA_Decrypt => crypto::rsa_decrypt(state, request),
+        cc::ECDH_KeyGen => crypto::ecdh_key_gen(state, request),
+        cc::ECDH_ZGen => crypto::ecdh_zgen(state, request),
         cc::ECC_Parameters => management::ecc_parameters(state, request),
+
+        // Part 3 clause 15, symmetric primitives.
+        cc::EncryptDecrypt => crypto::encrypt_decrypt(state, request, false),
+        cc::EncryptDecrypt2 => crypto::encrypt_decrypt(state, request, true),
+        cc::Hash => crypto::hash_command(state, request),
+        cc::HMAC => crypto::hmac_command(state, request),
+
+        // Part 3 clause 17, hash and HMAC sequences.
+        cc::HMAC_Start => crypto::hmac_start(state, request),
+        cc::HashSequenceStart => crypto::hash_sequence_start(state, request),
+        cc::SequenceUpdate => crypto::sequence_update(state, request),
+        cc::SequenceComplete => crypto::sequence_complete(state, request),
+        cc::EventSequenceComplete => crypto::event_sequence_complete(state, request),
+
+        // Part 3 clause 19 and 20, signing and verification.
+        cc::EC_Ephemeral => crypto::ec_ephemeral(state, request),
+        cc::Sign => crypto::sign(state, request),
+        cc::VerifySignature => crypto::verify_signature(state, request),
 
         // Part 3 clause 16, randomness.
         cc::GetRandom => management::get_random(state, request),

@@ -1094,6 +1094,192 @@ fn a_primary_key_changes_when_the_hierarchy_seed_changes() {
     assert_ne!(before, after, "the endorsement key survived a seed change");
 }
 
+/// An unrestricted ECDSA signing key template on P-256.
+fn signing_template() -> Vec<u8> {
+    let mut t = Writer::new();
+    t.u16(0x0023); // TPM_ALG_ECC
+    t.u16(alg::SHA256);
+    // fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth | sign
+    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000);
+    t.u16(0); // authPolicy
+    t.u16(0x0010); // symmetric TPM_ALG_NULL
+    t.u16(0x0018); // scheme TPM_ALG_ECDSA
+    t.u16(alg::SHA256);
+    t.u16(0x0003); // curve NIST P-256
+    t.u16(0x0010); // kdf TPM_ALG_NULL
+    t.u16(0); // unique x
+    t.u16(0); // unique y
+    t.finish().unwrap()
+}
+
+#[test]
+fn hash_produces_a_known_digest() {
+    let h = Harness::started("hash");
+    let mut p = Writer::new();
+    p.u16(3);
+    p.bytes(b"abc");
+    p.u16(alg::SHA256);
+    p.u32(rh::NULL);
+    let r = h.send(&command(st::NO_SESSIONS, cc::Hash, &[], None, &p.finish().unwrap()));
+    assert_eq!(r.code, rc::SUCCESS);
+    let mut reader = Reader::new(&r.body);
+    let size = reader.u16().unwrap();
+    assert_eq!(size, 32);
+    // FIPS 180-4 known answer for "abc".
+    assert_eq!(
+        reader.take(32).unwrap(),
+        &swtrust::util::hex::decode(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        )
+        .unwrap()[..]
+    );
+}
+
+#[test]
+fn a_hash_sequence_matches_a_single_hash() {
+    let h = Harness::started("hashseq");
+
+    let mut p = Writer::new();
+    p.u16(0); // auth
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::HashSequenceStart,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let sequence = Reader::new(&r.body).u32().unwrap();
+
+    for chunk in [b"a".as_slice(), b"b".as_slice()] {
+        let mut p = Writer::new();
+        p.u16(chunk.len() as u16);
+        p.bytes(chunk);
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::SequenceUpdate,
+            &[sequence],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "SequenceUpdate -> {:08x}", r.code);
+    }
+
+    let mut p = Writer::new();
+    p.u16(1);
+    p.bytes(b"c");
+    p.u32(rh::NULL);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SequenceComplete,
+        &[sequence],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "SequenceComplete -> {:08x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let _param_size = reader.u32().unwrap();
+    let size = reader.u16().unwrap();
+    assert_eq!(
+        reader.take(size as usize).unwrap(),
+        &swtrust::util::hex::decode(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        )
+        .unwrap()[..]
+    );
+
+    // The sequence handle is gone.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SequenceUpdate,
+        &[sequence],
+        Some(&password(b"")),
+        &[0x00, 0x00],
+    ));
+    assert_eq!(r.code & 0x03f, rc::HANDLE & 0x03f);
+}
+
+#[test]
+fn a_signature_from_a_created_key_verifies() {
+    let h = Harness::started("sign");
+
+    let template = signing_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let key = Reader::new(&r.body).u32().unwrap();
+
+    let digest = swtrust::tpm::crypto::hash::digest(alg::SHA256, b"message to sign").unwrap();
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&digest);
+    p.u16(0x0010); // scheme TPM_ALG_NULL, so the key's scheme is used
+    p.u16(0x8024); // TPM_ST_HASHCHECK
+    p.u32(rh::NULL);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Sign,
+        &[key],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Sign -> {:08x}", r.code);
+
+    let mut reader = Reader::new(&r.body);
+    let _param_size = reader.u32().unwrap();
+    let signature = reader.take_rest();
+    // Drop the trailing session area to isolate the signature.
+    let signature = &signature[..signature.len() - 5];
+    assert_eq!(
+        u16::from_be_bytes([signature[0], signature[1]]),
+        0x0018,
+        "TPM_ALG_ECDSA"
+    );
+
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&digest);
+    p.bytes(signature);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::VerifySignature,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "VerifySignature -> {:08x}", r.code);
+
+    // A different digest does not verify.
+    let other = swtrust::tpm::crypto::hash::digest(alg::SHA256, b"another message").unwrap();
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&other);
+    p.bytes(signature);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::VerifySignature,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code & 0x03f, rc::SIGNATURE & 0x03f);
+}
+
 #[test]
 fn the_vendor_test_command_echoes_its_input() {
     let h = Harness::started("vendor");
