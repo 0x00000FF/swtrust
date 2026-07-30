@@ -6,7 +6,10 @@
 //! control that the higher level interface does not offer, such as unpadded
 //! block cipher modes and deterministic key generation from a seed.
 
+pub mod bn;
+pub mod ecc;
 pub mod hash;
 pub mod hmac;
 pub mod rand;
+pub mod rsa;
 pub mod sym;

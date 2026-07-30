@@ -166,8 +166,11 @@ pub const IMPLEMENTED_PCR_BANKS: &[u16] = &[
 ];
 
 /// ECC curves the TPM implements.
+///
+/// NIST P-192 is left out because the underlying library does not provide the
+/// group. Part 2 leaves the curve set to the implementation and reports it
+/// through TPM2_GetCapability(TPM_CAP_ECC_CURVES).
 pub const IMPLEMENTED_CURVES: &[u16] = &[
-    curve::NIST_P192,
     curve::NIST_P224,
     curve::NIST_P256,
     curve::NIST_P384,
