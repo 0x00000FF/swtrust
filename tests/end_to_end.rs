@@ -783,6 +783,317 @@ fn hierarchy_authorization_can_be_changed_and_is_enforced() {
     assert_eq!(r.code, rc::SUCCESS);
 }
 
+/// A restricted ECC storage key template on P-256 with AES-128-CFB.
+fn storage_template() -> Vec<u8> {
+    let mut t = Writer::new();
+    t.u16(0x0023); // TPM_ALG_ECC
+    t.u16(alg::SHA256);
+    // fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth |
+    // restricted | decrypt
+    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0001_0000 | 0x0002_0000);
+    t.u16(0); // authPolicy
+    t.u16(0x0006); // symmetric AES
+    t.u16(128);
+    t.u16(0x0043); // CFB
+    t.u16(0x0010); // scheme TPM_ALG_NULL
+    t.u16(0x0003); // curve NIST P-256
+    t.u16(0x0010); // kdf TPM_ALG_NULL
+    t.u16(0); // unique x
+    t.u16(0); // unique y
+    t.finish().unwrap()
+}
+
+/// A sealed data object template.
+fn sealed_template() -> Vec<u8> {
+    let mut t = Writer::new();
+    t.u16(0x0008); // TPM_ALG_KEYEDHASH
+    t.u16(alg::SHA256);
+    t.u32(0x0040); // userWithAuth
+    t.u16(0); // authPolicy
+    t.u16(0x0010); // scheme TPM_ALG_NULL
+    t.u16(0); // unique
+    t.finish().unwrap()
+}
+
+#[test]
+fn a_primary_key_is_created_and_regenerates_identically() {
+    let h = Harness::started("primary");
+
+    let template = storage_template();
+    let mut p = Writer::new();
+    p.u16(4); // inSensitive
+    p.u16(0); // userAuth
+    p.u16(0); // data
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0); // outsideInfo
+    p.u32(0); // creationPCR
+    let cmd = command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    );
+
+    let r = h.send(&cmd);
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let handle = reader.u32().unwrap();
+    assert_eq!(handle >> 24, 0x80, "transient handle range");
+    let _param_size = reader.u32().unwrap();
+    let public_size = reader.u16().unwrap();
+    let public = reader.take(public_size as usize).unwrap().to_vec();
+    assert!(public_size > 0);
+
+    // Creating it again from the same seed and template gives the same key.
+    let r2 = h.send(&cmd);
+    assert_eq!(r2.code, rc::SUCCESS);
+    let mut reader2 = Reader::new(&r2.body);
+    let handle2 = reader2.u32().unwrap();
+    let _ = reader2.u32().unwrap();
+    let size2 = reader2.u16().unwrap();
+    let public2 = reader2.take(size2 as usize).unwrap().to_vec();
+    assert_eq!(public, public2, "the primary key was not regenerated");
+    assert_ne!(handle, handle2, "each load takes its own handle");
+
+    // TPM2_ReadPublic returns the same public area.
+    let r = h.send(&command(st::NO_SESSIONS, cc::ReadPublic, &[handle], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let mut reader = Reader::new(&r.body);
+    let size = reader.u16().unwrap();
+    assert_eq!(reader.take(size as usize).unwrap(), &public[..]);
+
+    // Flushing frees the slot.
+    let mut p = Writer::new();
+    p.u32(handle);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::FlushContext,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = h.send(&command(st::NO_SESSIONS, cc::ReadPublic, &[handle], None, &[]));
+    assert_eq!(r.code & 0x03f, rc::HANDLE & 0x03f);
+}
+
+#[test]
+fn a_sealed_object_round_trips_through_create_load_and_unseal() {
+    let h = Harness::started("seal");
+
+    // A primary storage key to be the parent.
+    let template = storage_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let parent = Reader::new(&r.body).u32().unwrap();
+
+    // Seal a secret under it.
+    let secret = b"the sealed secret";
+    let template = sealed_template();
+    let mut sensitive = Writer::new();
+    sensitive.u16(2);
+    sensitive.bytes(b"pw");
+    sensitive.u16(secret.len() as u16);
+    sensitive.bytes(secret);
+    let sensitive = sensitive.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(sensitive.len() as u16);
+    p.bytes(&sensitive);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Create,
+        &[parent],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Create -> {:08x}", r.code);
+
+    let mut reader = Reader::new(&r.body);
+    let _param_size = reader.u32().unwrap();
+    let private_size = reader.u16().unwrap();
+    let private = reader.take(private_size as usize).unwrap().to_vec();
+    let public_size = reader.u16().unwrap();
+    let public = reader.take(public_size as usize).unwrap().to_vec();
+
+    // Load it back.
+    let mut p = Writer::new();
+    p.u16(private.len() as u16);
+    p.bytes(&private);
+    p.u16(public.len() as u16);
+    p.bytes(&public);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Load,
+        &[parent],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Load -> {:08x}", r.code);
+    let sealed = Reader::new(&r.body).u32().unwrap();
+
+    // Unseal it with the right authorization value.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Unseal,
+        &[sealed],
+        Some(&password(b"pw")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Unseal -> {:08x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let _param_size = reader.u32().unwrap();
+    let size = reader.u16().unwrap();
+    assert_eq!(reader.take(size as usize).unwrap(), secret);
+
+    // The wrong authorization value fails.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Unseal,
+        &[sealed],
+        Some(&password(b"nope")),
+        &[],
+    ));
+    assert_eq!(r.code & 0x03f, rc::AUTH_FAIL & 0x03f);
+}
+
+#[test]
+fn a_private_area_does_not_load_under_the_wrong_parent() {
+    let h = Harness::started("wrongparent");
+
+    let template = storage_template();
+    let mut make_primary = |hierarchy: u32| {
+        let mut p = Writer::new();
+        p.u16(4);
+        p.u16(0);
+        p.u16(0);
+        p.u16(template.len() as u16);
+        p.bytes(&template);
+        p.u16(0);
+        p.u32(0);
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::CreatePrimary,
+            &[hierarchy],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS);
+        Reader::new(&r.body).u32().unwrap()
+    };
+    let owner_parent = make_primary(rh::OWNER);
+    let platform_parent = make_primary(rh::PLATFORM);
+
+    // Create a child under the owner parent.
+    let child_template = sealed_template();
+    let mut sensitive = Writer::new();
+    sensitive.u16(0);
+    sensitive.u16(4);
+    sensitive.bytes(b"data");
+    let sensitive = sensitive.finish().unwrap();
+    let mut p = Writer::new();
+    p.u16(sensitive.len() as u16);
+    p.bytes(&sensitive);
+    p.u16(child_template.len() as u16);
+    p.bytes(&child_template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Create,
+        &[owner_parent],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let mut reader = Reader::new(&r.body);
+    let _ = reader.u32().unwrap();
+    let private_size = reader.u16().unwrap();
+    let private = reader.take(private_size as usize).unwrap().to_vec();
+    let public_size = reader.u16().unwrap();
+    let public = reader.take(public_size as usize).unwrap().to_vec();
+
+    // Loading it under the other parent fails the integrity check.
+    let mut p = Writer::new();
+    p.u16(private.len() as u16);
+    p.bytes(&private);
+    p.u16(public.len() as u16);
+    p.bytes(&public);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Load,
+        &[platform_parent],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code & 0x03f, rc::INTEGRITY & 0x03f);
+}
+
+#[test]
+fn a_primary_key_changes_when_the_hierarchy_seed_changes() {
+    let h = Harness::started("changeeps");
+
+    let template = storage_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let cmd = command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::ENDORSEMENT],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    );
+
+    let read_public = |body: &[u8]| {
+        let mut reader = Reader::new(body);
+        let _handle = reader.u32().unwrap();
+        let _ = reader.u32().unwrap();
+        let size = reader.u16().unwrap();
+        reader.take(size as usize).unwrap().to_vec()
+    };
+
+    let before = read_public(&h.send(&cmd).body);
+
+    // TPM2_ChangeEPS replaces the endorsement seed.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::ChangeEPS,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "ChangeEPS -> {:08x}", r.code);
+
+    let after = read_public(&h.send(&cmd).body);
+    assert_ne!(before, after, "the endorsement key survived a seed change");
+}
+
 #[test]
 fn the_vendor_test_command_echoes_its_input() {
     let h = Harness::started("vendor");

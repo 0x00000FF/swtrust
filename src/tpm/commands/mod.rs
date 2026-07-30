@@ -5,6 +5,7 @@ pub mod execute;
 pub mod hierarchy;
 pub mod management;
 pub mod nv;
+pub mod object;
 pub mod pcr;
 pub mod policy;
 pub mod table;
@@ -26,6 +27,16 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::SelfTest => management::self_test(state, request),
         cc::IncrementalSelfTest => management::incremental_self_test(state, request),
         cc::GetTestResult => management::get_test_result(state, request),
+
+        // Part 3 clause 12, object management.
+        cc::Create => object::create(state, request),
+        cc::CreateLoaded => object::create_loaded(state, request),
+        cc::CreatePrimary => object::create_primary(state, request),
+        cc::Load => object::load(state, request),
+        cc::LoadExternal => object::load_external(state, request),
+        cc::ReadPublic => object::read_public(state, request),
+        cc::Unseal => object::unseal(state, request),
+        cc::ObjectChangeAuth => object::object_change_auth(state, request),
 
         // Part 3 clause 12.9, parameter checking.
         cc::TestParms => management::test_parms(state, request),

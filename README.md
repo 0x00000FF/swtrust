@@ -86,21 +86,23 @@ tests/
 ## Implemented commands
 
 Part 3 clause 9 startup and shutdown, clause 10 self test, clause 11 sessions,
-clause 12.9 parameter checking, clause 14.7 curve parameters, clause 16
+clause 12 object management, clause 14.7 curve parameters, clause 16
 randomness, clause 22 integrity collection, clause 23 enhanced authorization,
 clause 24 hierarchy administration, clause 25 dictionary attack functions,
 clause 26 miscellaneous management, clause 28.4 context flushing, clause 30
 capabilities, clause 31 NV storage, clause 36 the clock, and the vendor test
 command.
 
+A Primary Object is derived from its hierarchy seed and its template, so the
+same TPM2_CreatePrimary always rebuilds the same key, and changing the seed
+with TPM2_Clear, TPM2_ChangePPS or TPM2_ChangeEPS makes every object under
+that hierarchy unloadable.
+
 ## Not yet implemented
 
 The following command groups are declared in the command table and answer
 TPM_RC_COMMAND_CODE until they are written:
 
-- object management: TPM2_Create, TPM2_CreatePrimary, TPM2_CreateLoaded,
-  TPM2_Load, TPM2_LoadExternal, TPM2_ReadPublic, TPM2_Unseal,
-  TPM2_ObjectChangeAuth
 - cryptographic operations: TPM2_Hash, TPM2_HMAC and the hash, HMAC and event
   sequences, TPM2_Sign, TPM2_VerifySignature, TPM2_SignDigest,
   TPM2_VerifyDigestSignature, the signing and verification sequences,
