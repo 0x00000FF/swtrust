@@ -41,24 +41,32 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         return Err(TpmRc(rc::PP));
     }
 
-    // The lockout authority is unavailable while the TPM is in lockout.
-    if state.lockout.in_lockout {
-        for (i, s) in request.sessions.iter().enumerate() {
-            let _ = s;
-            if request.info.auth_handles as usize > i
-                && request.handles.get(i).copied() == Some(crate::tpm::constants::rh::LOCKOUT)
-            {
-                return Err(TpmRc(rc::LOCKOUT));
-            }
-        }
-    }
-
     dispatch::decrypt_parameters(state, &mut request)?;
 
     // Every handle that carries an authorization is checked in order.
     let mut names: Vec<Vec<u8>> = Vec::with_capacity(request.handles.len());
     for h in &request.handles {
         names.push(dispatch::handle_name(state, *h)?);
+    }
+
+    // While the TPM is in lockout, no authorization value that the dictionary
+    // attack counter protects may be used, and neither may lockoutAuth. Part 1
+    // clause 19.8.3 keeps the exempt entities usable so the platform can still
+    // recover the TPM.
+    if state.lockout.in_lockout {
+        for index in 0..request.info.auth_handles as usize {
+            let Ok(handle) = request.handle(index) else {
+                continue;
+            };
+            if handle == crate::tpm::constants::rh::LOCKOUT {
+                return Err(TpmRc(rc::LOCKOUT));
+            }
+            if let Ok(entity) = dispatch::entity(state, handle) {
+                if entity.uses_lockout {
+                    return Err(TpmRc(rc::LOCKOUT));
+                }
+            }
+        }
     }
 
     for index in 0..request.info.auth_handles as usize {

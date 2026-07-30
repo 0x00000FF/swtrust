@@ -357,6 +357,25 @@ pub fn encrypt_parameters(
     Ok(())
 }
 
+/// The body of the sized parameter at position `index`, counting from zero.
+///
+/// Only the leading parameters that are themselves TPM2B can be located this
+/// way, which is all a policy assertion needs.
+fn first_sized_parameter_at(parameters: &[u8], index: usize) -> Option<&[u8]> {
+    let mut rest = parameters;
+    for _ in 0..index {
+        if rest.len() < 2 {
+            return None;
+        }
+        let size = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+        if rest.len() < 2 + size {
+            return None;
+        }
+        rest = &rest[2 + size..];
+    }
+    first_sized_parameter(rest)
+}
+
 /// The body of the leading TPM2B in a parameter area.
 fn first_sized_parameter(parameters: &[u8]) -> Option<&[u8]> {
     if parameters.len() < 2 {
@@ -491,7 +510,9 @@ pub fn check_authorization(
             return record_failure(state, entity.uses_lockout)
                 .and(Err(TpmRc(rc::AUTH_FAIL).with_session(position)));
         }
-        clear_failures(state);
+        if entity.uses_lockout {
+            clear_failures(state);
+        }
     }
     Ok(())
 }
@@ -504,7 +525,12 @@ fn compare_auth(
     uses_lockout: bool,
 ) -> TpmResult<()> {
     if constant_time_eq(session::trim_auth(given), session::trim_auth(expected)) {
-        clear_failures(state);
+        // Only a success against a protected entity clears the counter. A
+        // success against an exempt entity, such as an object with noDA or the
+        // platform hierarchy, must not let a guessing attack reset it.
+        if uses_lockout {
+            clear_failures(state);
+        }
         Ok(())
     } else {
         record_failure(state, uses_lockout)?;
@@ -582,6 +608,47 @@ fn check_policy(
             return Err(TpmRc(rc::EXPIRED).with_session(position));
         }
     }
+    // TPM2_PolicyPhysicalPresence requires the signal to still be asserted.
+    if s.policy.physical_presence_required && !state.physical_presence {
+        return Err(TpmRc(rc::PP));
+    }
+    // TPM2_PolicyNvWritten fixes what the written bit of the Index must be.
+    if let Some(expected) = s.policy.nv_written {
+        let written = match state.nv.get(request.handles.first().copied().unwrap_or(0)) {
+            Ok(index) => index.written(),
+            Err(_) => return Err(TpmRc(rc::POLICY_FAIL).with_session(position)),
+        };
+        if written != expected {
+            return Err(TpmRc(rc::POLICY_FAIL).with_session(position));
+        }
+    }
+    // TPM2_PolicyNameHash and TPM2_PolicyDuplicationSelect fix the Names the
+    // command may be used with, in place of a cpHash.
+    if let Some(expected) = &s.policy.name_hash {
+        let mut h = crate::tpm::crypto::hash::Hasher::new(s.auth_hash)?;
+        for handle in &request.handles {
+            h.update(&handle_name(state, *handle)?);
+        }
+        if !constant_time_eq(expected, &h.finish()) {
+            return Err(TpmRc(rc::POLICY_FAIL).with_session(position));
+        }
+    }
+    // TPM2_PolicyTemplate fixes the template a creation command may use.
+    if let Some(expected) = &s.policy.template_hash {
+        let template = first_sized_parameter_at(&request.parameters, 1)
+            .ok_or_else(|| TpmRc(rc::POLICY_FAIL).with_session(position))?;
+        let got = crate::tpm::crypto::hash::digest(s.auth_hash, template)?;
+        if !constant_time_eq(expected, &got) {
+            return Err(TpmRc(rc::POLICY_FAIL).with_session(position));
+        }
+    }
+    // TPM2_PolicyParameters fixes the digest of the whole parameter area.
+    if let Some(expected) = &s.policy.parameters_hash {
+        let got = crate::tpm::crypto::hash::digest(s.auth_hash, &request.parameters)?;
+        if !constant_time_eq(expected, &got) {
+            return Err(TpmRc(rc::POLICY_FAIL).with_session(position));
+        }
+    }
 
     // TPM2_PolicyAuthValue and TPM2_PolicyPassword both require the caller to
     // prove the authorization value as well as the policy.
@@ -607,7 +674,9 @@ fn check_policy(
             record_failure(state, entity.uses_lockout)?;
             return Err(TpmRc(rc::AUTH_FAIL).with_session(position));
         }
-        clear_failures(state);
+        if entity.uses_lockout {
+            clear_failures(state);
+        }
     }
     Ok(())
 }
@@ -865,6 +934,57 @@ mod tests {
         let e = entity(&state, rh::OWNER).unwrap();
         check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
         assert_eq!(state.lockout.failed_tries, 0);
+    }
+
+    #[test]
+    fn a_success_against_an_exempt_entity_does_not_reset_the_counter() {
+        // Guessing against a protected entity, then succeeding against an
+        // exempt one, must not clear the dictionary attack counter.
+        let mut state = TpmState::manufacture().unwrap();
+        state.hierarchies.owner.auth = b"secret".to_vec();
+        state.hierarchies.platform.auth = b"known".to_vec();
+
+        let auth = password_auth(b"wrong");
+        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = entity(&state, rh::OWNER).unwrap();
+        let _ = check_authorization(&mut state, &req, 0, &e, &[0u8; 32]);
+        assert_eq!(state.lockout.failed_tries, 1);
+
+        // The platform hierarchy is exempt from the counter.
+        let auth = password_auth(b"known");
+        let buf = command(st::SESSIONS, cc::Clear, &[rh::PLATFORM], &auth, &[]);
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = entity(&state, rh::PLATFORM).unwrap();
+        assert!(!e.uses_lockout);
+        check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
+        assert_eq!(
+            state.lockout.failed_tries, 1,
+            "an exempt success cleared the counter"
+        );
+
+        // A success against the protected entity does clear it.
+        let auth = password_auth(b"secret");
+        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = entity(&state, rh::OWNER).unwrap();
+        check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
+        assert_eq!(state.lockout.failed_tries, 0);
+    }
+
+    #[test]
+    fn a_sized_parameter_can_be_located_by_position() {
+        // Two TPM2B values followed by trailing octets.
+        let params = [0x00u8, 0x02, 1, 2, 0x00, 0x03, 3, 4, 5, 9, 9];
+        assert_eq!(
+            first_sized_parameter_at(&params, 0),
+            Some([1u8, 2].as_slice())
+        );
+        assert_eq!(
+            first_sized_parameter_at(&params, 1),
+            Some([3u8, 4, 5].as_slice())
+        );
+        assert_eq!(first_sized_parameter_at(&params, 5), None);
     }
 
     #[test]

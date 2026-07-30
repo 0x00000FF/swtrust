@@ -1,4 +1,4 @@
-//! NV storage commands, Part 3 clause 31.
+﻿//! NV storage commands, Part 3 clause 31.
 
 use crate::tpm::config;
 use crate::tpm::constants::{rc, rh};
@@ -23,14 +23,21 @@ fn index_of(state: &TpmState, handle: u32) -> TpmResult<&NvIndex> {
 /// Check that the authorization handle may write this Index.
 ///
 /// Part 3 clause 31.2 lets a write be authorized by platform authorization,
-/// owner authorization or the Index itself, according to the attributes.
-fn check_write_authority(index: &NvIndex, auth_handle: u32) -> TpmResult<()> {
+/// owner authorization or the Index itself. When the Index authorizes itself,
+/// clause 5.6.7.2 also fixes which authorization method applies: TPMA_NV_
+/// AUTHWRITE accepts a password or HMAC session and TPMA_NV_POLICYWRITE
+/// accepts a policy session, so one does not stand in for the other.
+fn check_write_authority(index: &NvIndex, auth_handle: u32, is_policy: bool) -> TpmResult<()> {
     let a = index.public.attributes;
     let allowed = match auth_handle {
         rh::PLATFORM => a.has(NvAttributes::PPWRITE),
         rh::OWNER => a.has(NvAttributes::OWNERWRITE),
         h if h == index.public.nv_index => {
-            a.has(NvAttributes::AUTHWRITE) || a.has(NvAttributes::POLICYWRITE)
+            if is_policy {
+                a.has(NvAttributes::POLICYWRITE)
+            } else {
+                a.has(NvAttributes::AUTHWRITE)
+            }
         }
         _ => false,
     };
@@ -42,13 +49,17 @@ fn check_write_authority(index: &NvIndex, auth_handle: u32) -> TpmResult<()> {
 }
 
 /// Check that the authorization handle may read this Index.
-fn check_read_authority(index: &NvIndex, auth_handle: u32) -> TpmResult<()> {
+fn check_read_authority(index: &NvIndex, auth_handle: u32, is_policy: bool) -> TpmResult<()> {
     let a = index.public.attributes;
     let allowed = match auth_handle {
         rh::PLATFORM => a.has(NvAttributes::PPREAD),
         rh::OWNER => a.has(NvAttributes::OWNERREAD),
         h if h == index.public.nv_index => {
-            a.has(NvAttributes::AUTHREAD) || a.has(NvAttributes::POLICYREAD)
+            if is_policy {
+                a.has(NvAttributes::POLICYREAD)
+            } else {
+                a.has(NvAttributes::AUTHREAD)
+            }
         }
         _ => false,
     };
@@ -59,10 +70,27 @@ fn check_read_authority(index: &NvIndex, auth_handle: u32) -> TpmResult<()> {
     }
 }
 
+/// True when the first authorization of the command came from a policy
+/// session rather than a password or HMAC session.
+fn first_auth_is_policy(state: &TpmState, request: &Request) -> bool {
+    let Some(input) = request.sessions.first() else {
+        return false;
+    };
+    if input.handle == rh::RS_PW {
+        return false;
+    }
+    state
+        .sessions
+        .get(input.handle)
+        .map(|s| s.is_policy())
+        .unwrap_or(false)
+}
+
 /// Common checks before any write.
-fn writable(state: &TpmState, handle: u32, auth_handle: u32) -> TpmResult<()> {
+fn writable(state: &TpmState, request: &Request, handle: u32, auth_handle: u32) -> TpmResult<()> {
+    let is_policy = first_auth_is_policy(state, request);
     let index = index_of(state, handle).map_err(|e| e.with_handle(2))?;
-    check_write_authority(index, auth_handle)?;
+    check_write_authority(index, auth_handle, is_policy)?;
     if index.write_locked {
         return Err(TpmRc(rc::NV_LOCKED));
     }
@@ -262,7 +290,7 @@ pub fn nv_write(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
     let data = Tpm2bMaxNvBuffer::unmarshal(&mut r)?;
     let offset = r.u16()?;
 
-    writable(state, nv_handle, auth_handle)?;
+    writable(state, request, nv_handle, auth_handle)?;
     let index = state.nv.get_mut(nv_handle)?;
     if index.index_type() != nt::ORDINARY {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
@@ -277,7 +305,7 @@ pub fn nv_write(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
 pub fn nv_increment(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let auth_handle = request.handle(0)?;
     let nv_handle = request.handle(1)?;
-    writable(state, nv_handle, auth_handle)?;
+    writable(state, request, nv_handle, auth_handle)?;
     state.nv.get_mut(nv_handle)?.increment()?;
     respond(|_| Ok(()))
 }
@@ -288,7 +316,7 @@ pub fn nv_extend(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let nv_handle = request.handle(1)?;
     let mut r = request.reader();
     let data = Tpm2bMaxNvBuffer::unmarshal(&mut r)?;
-    writable(state, nv_handle, auth_handle)?;
+    writable(state, request, nv_handle, auth_handle)?;
     state.nv.get_mut(nv_handle)?.extend(data.as_slice())?;
     respond(|_| Ok(()))
 }
@@ -299,7 +327,7 @@ pub fn nv_set_bits(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     let nv_handle = request.handle(1)?;
     let mut r = request.reader();
     let bits = r.u64()?;
-    writable(state, nv_handle, auth_handle)?;
+    writable(state, request, nv_handle, auth_handle)?;
     state.nv.get_mut(nv_handle)?.set_bits(bits)?;
     respond(|_| Ok(()))
 }
@@ -309,7 +337,7 @@ pub fn nv_write_lock(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let auth_handle = request.handle(0)?;
     let nv_handle = request.handle(1)?;
     let index = index_of(state, nv_handle).map_err(|e| e.with_handle(2))?;
-    check_write_authority(index, auth_handle)?;
+    check_write_authority(index, auth_handle, first_auth_is_policy(state, request))?;
     let a = index.public.attributes;
     if !a.has(NvAttributes::WRITEDEFINE) && !a.has(NvAttributes::WRITE_STCLEAR) {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
@@ -333,7 +361,7 @@ pub fn nv_read(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let offset = r.u16()?;
 
     let index = index_of(state, nv_handle).map_err(|e| e.with_handle(2))?;
-    check_read_authority(index, auth_handle)?;
+    check_read_authority(index, auth_handle, first_auth_is_policy(state, request))?;
     if index.read_locked {
         return Err(TpmRc(rc::NV_LOCKED));
     }
@@ -352,7 +380,7 @@ pub fn nv_read_lock(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let auth_handle = request.handle(0)?;
     let nv_handle = request.handle(1)?;
     let index = index_of(state, nv_handle).map_err(|e| e.with_handle(2))?;
-    check_read_authority(index, auth_handle)?;
+    check_read_authority(index, auth_handle, first_auth_is_policy(state, request))?;
     if !index.public.attributes.has(NvAttributes::READ_STCLEAR) {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
     }
@@ -397,24 +425,51 @@ mod tests {
     #[test]
     fn write_authority_follows_the_attributes() {
         let i = index(NvAttributes::OWNERWRITE, nt::ORDINARY, 8);
-        assert!(check_write_authority(&i, rh::OWNER).is_ok());
+        assert!(check_write_authority(&i, rh::OWNER, false).is_ok());
         assert_eq!(
-            check_write_authority(&i, rh::PLATFORM).unwrap_err(),
+            check_write_authority(&i, rh::PLATFORM, false).unwrap_err(),
             TpmRc(rc::NV_AUTHORIZATION)
         );
 
         let i = index(NvAttributes::AUTHWRITE, nt::ORDINARY, 8);
-        assert!(check_write_authority(&i, i.public.nv_index).is_ok());
-        assert!(check_write_authority(&i, rh::OWNER).is_err());
+        assert!(check_write_authority(&i, i.public.nv_index, false).is_ok());
+        assert!(check_write_authority(&i, rh::OWNER, false).is_err());
     }
 
     #[test]
     fn read_authority_follows_the_attributes() {
         let i = index(NvAttributes::PPREAD, nt::ORDINARY, 8);
-        assert!(check_read_authority(&i, rh::PLATFORM).is_ok());
-        assert!(check_read_authority(&i, rh::OWNER).is_err());
-        let i = index(NvAttributes::POLICYREAD, nt::ORDINARY, 8);
-        assert!(check_read_authority(&i, i.public.nv_index).is_ok());
+        assert!(check_read_authority(&i, rh::PLATFORM, false).is_ok());
+        assert!(check_read_authority(&i, rh::OWNER, false).is_err());
+    }
+
+    #[test]
+    fn the_authorization_method_must_match_the_attribute() {
+        // A policy-only Index is not reachable with a password or HMAC
+        // session, and an authValue-only Index is not reachable with a policy
+        // session. Part 3 clause 5.6.7.2.
+        let policy_only = index(NvAttributes::POLICYREAD, nt::ORDINARY, 8);
+        let handle = policy_only.public.nv_index;
+        assert!(check_read_authority(&policy_only, handle, true).is_ok());
+        assert_eq!(
+            check_read_authority(&policy_only, handle, false).unwrap_err(),
+            TpmRc(rc::NV_AUTHORIZATION)
+        );
+
+        let auth_only = index(NvAttributes::AUTHREAD, nt::ORDINARY, 8);
+        assert!(check_read_authority(&auth_only, handle, false).is_ok());
+        assert_eq!(
+            check_read_authority(&auth_only, handle, true).unwrap_err(),
+            TpmRc(rc::NV_AUTHORIZATION)
+        );
+
+        // The same split applies to writing.
+        let policy_write = index(NvAttributes::POLICYWRITE, nt::ORDINARY, 8);
+        assert!(check_write_authority(&policy_write, handle, true).is_ok());
+        assert!(check_write_authority(&policy_write, handle, false).is_err());
+        let auth_write = index(NvAttributes::AUTHWRITE, nt::ORDINARY, 8);
+        assert!(check_write_authority(&auth_write, handle, false).is_ok());
+        assert!(check_write_authority(&auth_write, handle, true).is_err());
     }
 
     #[test]

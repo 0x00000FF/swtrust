@@ -44,6 +44,10 @@ pub struct PolicyState {
     pub nv_written: Option<bool>,
     /// Set by TPM2_PolicyTemplate.
     pub template_hash: Option<Vec<u8>>,
+    /// Set by TPM2_PolicyParameters.
+    pub parameters_hash: Option<Vec<u8>>,
+    /// Set by TPM2_PolicyPhysicalPresence.
+    pub physical_presence_required: bool,
     /// When the authorization expires, in the TPM's time base.
     pub expiration: Option<u64>,
     /// The nonce that a ticket for this policy is bound to.
