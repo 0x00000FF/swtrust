@@ -30,15 +30,20 @@ pub const HEADER_SIZE: usize = 10;
 
 /// Parse and check the command header.
 ///
-/// The tag is checked first because a bad tag changes the shape of the error
-/// response, then the size is checked against the octets actually received.
+/// Part 3 clause 5.2 fixes the order: the tag is unmarshalled and validated
+/// first, then `commandSize` is checked against the octets actually received,
+/// and only then is the command code read. The tag is therefore checked as
+/// soon as two octets are available, before any judgement about the size.
 pub fn parse_header(buf: &[u8]) -> Result<CommandHeader, TpmRc> {
-    if buf.len() < HEADER_SIZE {
+    if buf.len() < 2 {
         return Err(TpmRc(rc::COMMAND_SIZE));
     }
     let tag = u16::from_be_bytes([buf[0], buf[1]]);
     if tag != st::NO_SESSIONS && tag != st::SESSIONS {
-        return Err(TpmRc(rc::BAD_TAG));
+        return Err(TpmRc(rc::TAG));
+    }
+    if buf.len() < HEADER_SIZE {
+        return Err(TpmRc(rc::COMMAND_SIZE));
     }
     let size = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
     if size as usize != buf.len() {
@@ -54,15 +59,12 @@ pub fn parse_header(buf: &[u8]) -> Result<CommandHeader, TpmRc> {
 /// Build the ten octet response used for every failure.
 ///
 /// Part 2 clause 6.6 requires a failure to carry TPM_ST_NO_SESSIONS, a size of
-/// ten and the response code, except when the tag itself was not recognised.
+/// ten and the response code. The TPM 1.2 compatible TPM_TAG_RSP_COMMAND form
+/// is only for a TPM that implements 1.2 compatibility, which this one does
+/// not, so an unrecognised tag is reported as TPM_RC_TAG.
 pub fn error_response(code: TpmRc) -> Vec<u8> {
-    let tag = if code == TpmRc(rc::BAD_TAG) {
-        st::RSP_COMMAND
-    } else {
-        st::NO_SESSIONS
-    };
     let mut w = Writer::with_capacity(HEADER_SIZE);
-    w.u16(tag);
+    w.u16(st::NO_SESSIONS);
     w.u32(HEADER_SIZE as u32);
     w.u32(code.value());
     w.into_vec()
@@ -208,11 +210,36 @@ mod tests {
     }
 
     #[test]
-    fn unrecognised_tag_is_rejected() {
+    fn unrecognised_tag_is_rejected_with_tpm_rc_tag() {
+        // TPM_TAG_RQU_COMMAND from TPM 1.2 is not a TPM 2.0 command tag.
         let cmd = [
             0x00u8, 0xc1, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x44,
         ];
-        assert_eq!(parse_header(&cmd).unwrap_err(), TpmRc(rc::BAD_TAG));
+        assert_eq!(parse_header(&cmd).unwrap_err(), TpmRc(rc::TAG));
+        // TPM_ST_NULL is not a command tag either.
+        let cmd = [
+            0x80u8, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x44,
+        ];
+        assert_eq!(parse_header(&cmd).unwrap_err(), TpmRc(rc::TAG));
+    }
+
+    #[test]
+    fn the_tag_is_checked_before_the_size() {
+        // A truncated buffer that already carries a bad tag reports the tag,
+        // matching the validation order of Part 3 clause 5.2.
+        assert_eq!(parse_header(&[0x00, 0xc1]).unwrap_err(), TpmRc(rc::TAG));
+        assert_eq!(
+            parse_header(&[0x00, 0xc1, 0x00, 0x00]).unwrap_err(),
+            TpmRc(rc::TAG)
+        );
+        // A good tag with too few octets is a size problem.
+        assert_eq!(
+            parse_header(&[0x80, 0x01, 0x00, 0x00]).unwrap_err(),
+            TpmRc(rc::COMMAND_SIZE)
+        );
+        // Fewer than two octets cannot carry a tag at all.
+        assert_eq!(parse_header(&[0x80]).unwrap_err(), TpmRc(rc::COMMAND_SIZE));
+        assert_eq!(parse_header(&[]).unwrap_err(), TpmRc(rc::COMMAND_SIZE));
     }
 
     #[test]
@@ -221,7 +248,15 @@ mod tests {
             0x80u8, 0x01, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x01, 0x44,
         ];
         assert_eq!(parse_header(&cmd).unwrap_err(), TpmRc(rc::COMMAND_SIZE));
-        assert_eq!(parse_header(&cmd[..4]).unwrap_err(), TpmRc(rc::COMMAND_SIZE));
+    }
+
+    #[test]
+    fn size_above_the_maximum_is_rejected() {
+        let mut cmd = vec![0x80u8, 0x01];
+        cmd.extend_from_slice(&(config::MAX_COMMAND_SIZE + 1).to_be_bytes());
+        cmd.extend_from_slice(&[0x00, 0x00, 0x01, 0x44]);
+        cmd.resize((config::MAX_COMMAND_SIZE + 1) as usize, 0);
+        assert_eq!(parse_header(&cmd).unwrap_err(), TpmRc(rc::COMMAND_SIZE));
     }
 
     #[test]
@@ -231,9 +266,10 @@ mod tests {
             r,
             vec![0x80, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x00]
         );
-        // A bad tag is reported with the TPM 1.2 compatible response tag.
-        let r = error_response(TpmRc(rc::BAD_TAG));
-        assert_eq!(&r[0..2], &st::RSP_COMMAND.to_be_bytes());
+        // Every failure, including a bad tag, uses TPM_ST_NO_SESSIONS.
+        let r = error_response(TpmRc(rc::TAG));
+        assert_eq!(&r[0..2], &st::NO_SESSIONS.to_be_bytes());
+        assert_eq!(&r[6..10], &rc::TAG.to_be_bytes());
     }
 
     #[test]

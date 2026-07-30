@@ -56,7 +56,12 @@ pub const ACK_OK: u32 = 0;
 
 /// Largest buffer accepted from a client, which bounds memory use if a peer
 /// sends a bogus length.
-pub const MAX_TRANSFER: u32 = 16 * 1024 * 1024;
+///
+/// Commands are limited to `config::MAX_COMMAND_SIZE` by the TPM itself. This
+/// bound applies to the transport, and covers the H-CRTM data blobs as well as
+/// commands, so it is set well above the command limit but far below anything
+/// that would strain memory.
+pub const MAX_TRANSFER: u32 = 64 * 1024;
 
 /// Read a big endian UINT32, returning `None` at a clean end of stream.
 pub fn read_u32_opt<R: Read>(r: &mut R) -> io::Result<Option<u32>> {

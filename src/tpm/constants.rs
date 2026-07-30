@@ -30,7 +30,7 @@ pub const TPM_MAX_DERIVATION_BITS: u32 = 8192;
 // ---------------------------------------------------------------------------
 
 pub mod alg {
-    pub const ERROR: u16 = 0x0000;
+    // 0x0000 is reserved by Table 8 and names no algorithm.
     pub const RSA: u16 = 0x0001;
     pub const TDES: u16 = 0x0003;
     pub const SHA1: u16 = 0x0004;
@@ -376,7 +376,7 @@ pub mod rc {
     pub const NV_UNAVAILABLE: u32 = RC_WARN + 0x023;
     pub const NOT_USED: u32 = RC_WARN + 0x07F;
 
-    // Position qualifiers added to format-one codes.
+    // Position qualifiers added to format-one codes, Part 2 Table 18.
     pub const H: u32 = 0x000;
     pub const P: u32 = 0x040;
     pub const S: u32 = 0x800;
@@ -388,6 +388,13 @@ pub mod rc {
     pub const N_6: u32 = 0x600;
     pub const N_7: u32 = 0x700;
     pub const N_8: u32 = 0x800;
+    pub const N_9: u32 = 0x900;
+    pub const N_A: u32 = 0xA00;
+    pub const N_B: u32 = 0xB00;
+    pub const N_C: u32 = 0xC00;
+    pub const N_D: u32 = 0xD00;
+    pub const N_E: u32 = 0xE00;
+    pub const N_F: u32 = 0xF00;
     pub const N_MASK: u32 = 0xF00;
 }
 
@@ -484,6 +491,7 @@ pub mod cap {
     pub const AUTH_POLICIES: u32 = 0x0000_0009;
     pub const ACT: u32 = 0x0000_000A;
     pub const PUB_KEYS: u32 = 0x0000_000B;
+    pub const SPDM_SESSION_INFO: u32 = 0x0000_000C;
     pub const LAST: u32 = 0x0000_000C;
     pub const VENDOR_PROPERTY: u32 = 0x0000_0100;
 }
@@ -500,8 +508,9 @@ pub mod pt {
     pub const FAMILY_INDICATOR: u32 = PT_FIXED + 0;
     pub const LEVEL: u32 = PT_FIXED + 1;
     pub const REVISION: u32 = PT_FIXED + 2;
-    pub const ERRATA: u32 = PT_FIXED + 3;
     /// Named TPM_PT_DAY_OF_YEAR before version 185.
+    pub const ERRATA: u32 = PT_FIXED + 3;
+    /// Reported the publication year before version 185, now always zero.
     pub const YEAR: u32 = PT_FIXED + 4;
     pub const MANUFACTURER: u32 = PT_FIXED + 5;
     pub const VENDOR_STRING_1: u32 = PT_FIXED + 6;
@@ -915,23 +924,49 @@ mod tests {
         assert_eq!(hc::HR_AC, 0x9000_0000);
     }
 
+    /// Every code between TPM_CC_FIRST and TPM_CC_LAST that Part 2 Table 12
+    /// leaves unassigned. Everything else in the range must have a name.
+    const UNASSIGNED_COMMAND_CODES: &[u32] = &[
+        0x0000_0123,
+        0x0000_015A,
+        0x0000_015F,
+        0x0000_0166,
+        0x0000_0175,
+        0x0000_01A2,
+    ];
+
     #[test]
-    fn command_codes_are_unique_and_named() {
-        let mut codes: Vec<u32> = (cc::FIRST..=cc::LAST).collect();
-        codes.retain(|c| cc_name(*c).is_some());
-        // Every named code round trips and there are no gaps in naming other
-        // than the reserved values.
-        for c in &codes {
-            assert!(cc_name(*c).is_some(), "missing name for 0x{c:08x}");
+    fn every_assigned_command_code_has_a_name() {
+        for code in cc::FIRST..=cc::LAST {
+            let named = cc_name(code).is_some();
+            let unassigned = UNASSIGNED_COMMAND_CODES.contains(&code);
+            assert_eq!(
+                named, !unassigned,
+                "0x{code:08x} named={named} unassigned={unassigned}"
+            );
         }
-        // Reserved and unassigned codes have no name.
-        assert!(cc_name(0x0000_0123).is_none());
-        assert!(cc_name(0x0000_015A).is_none());
-        assert!(cc_name(0x0000_015F).is_none());
-        assert!(cc_name(0x0000_0166).is_none());
-        assert!(cc_name(0x0000_0175).is_none());
-        assert!(cc_name(0x0000_01A2).is_none());
+        assert!(cc_name(cc::FIRST - 1).is_none());
         assert!(cc_name(cc::LAST + 1).is_none());
+        // The vendor test command sits outside the library range.
+        assert_eq!(cc_name(cc::Vendor_TCG_Test), Some("TPM2_Vendor_TCG_Test"));
+    }
+
+    #[test]
+    fn command_names_are_unique() {
+        let mut names: Vec<&str> = (cc::FIRST..=cc::LAST).filter_map(cc_name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "duplicate command name");
+    }
+
+    #[test]
+    fn command_code_count_matches_the_table() {
+        // Table 12 assigns 134 command codes between TPM_CC_FIRST and
+        // TPM_CC_LAST, two of which share a code with a MAC variant.
+        let assigned = (cc::FIRST..=cc::LAST).filter(|c| cc_name(*c).is_some()).count();
+        let range = (cc::LAST - cc::FIRST + 1) as usize;
+        assert_eq!(assigned, range - UNASSIGNED_COMMAND_CODES.len());
     }
 
     #[test]

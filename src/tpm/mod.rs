@@ -10,3 +10,4 @@ pub mod device;
 pub mod error;
 pub mod marshal;
 pub mod persist;
+pub mod structures;

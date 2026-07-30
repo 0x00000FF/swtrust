@@ -29,32 +29,41 @@ impl TpmRc {
     /// Attach a handle number, 1 through 7, to a format-one code.
     ///
     /// The number is the position of the handle in the handle area, counting
-    /// from one.
+    /// from one. An index outside 1 through 7 cannot be encoded, so the code
+    /// is returned unqualified rather than pointing at the wrong handle.
     pub fn with_handle(self, index: usize) -> TpmRc {
-        self.qualify(rc::H, (index as u32) & 0x7)
+        self.qualify(rc::H, index, 7)
     }
 
     /// Attach a parameter number, 1 through 15, to a format-one code.
     ///
     /// The number counts parameters in the command, starting at one after the
-    /// handle area.
+    /// handle area. An index outside 1 through 15 leaves the code unqualified.
     pub fn with_parameter(self, index: usize) -> TpmRc {
-        self.qualify(rc::P, (index as u32) & 0xF)
+        self.qualify(rc::P, index, 15)
     }
 
     /// Attach a session number, 1 through 7, to a format-one code.
+    ///
+    /// An index outside 1 through 7 leaves the code unqualified.
     pub fn with_session(self, index: usize) -> TpmRc {
-        self.qualify(rc::S, (index as u32) & 0x7)
+        self.qualify(rc::S, index, 7)
     }
 
-    fn qualify(self, kind: u32, n: u32) -> TpmRc {
+    fn qualify(self, kind: u32, index: usize, max: usize) -> TpmRc {
         // Only unqualified format-one codes carry a qualifier. Anything else,
         // including warnings and format-zero codes, is returned unchanged.
         if !self.is_base_format_one() {
             return self;
         }
+        // The number field is one based and narrow. Reporting the wrong
+        // position would be worse than reporting no position, so an index that
+        // does not fit produces the plain error.
+        if index == 0 || index > max {
+            return self;
+        }
         let base = self.0 & 0x03F;
-        TpmRc(rc::RC_FMT1 | base | kind | (n << 8))
+        TpmRc(rc::RC_FMT1 | base | kind | ((index as u32) << 8))
     }
 
     /// True when the code is a format-one code without a qualifier applied.
@@ -138,14 +147,23 @@ mod tests {
     }
 
     #[test]
-    fn qualifier_indexes_are_clamped_to_their_field() {
+    fn qualifier_indexes_cover_the_whole_field() {
         // Handles and sessions have a three bit number, parameters have four.
         assert_eq!(TpmRc(rc::VALUE).with_handle(7).0, 0x784);
         assert_eq!(TpmRc(rc::VALUE).with_session(7).0, 0xF84);
         assert_eq!(TpmRc(rc::VALUE).with_parameter(15).0, 0xFC4);
-        // An out of range index wraps inside its field instead of corrupting
-        // the neighbouring bits.
-        assert_eq!(TpmRc(rc::VALUE).with_session(8).0, 0x884);
+    }
+
+    #[test]
+    fn out_of_range_indexes_leave_the_code_unqualified() {
+        // An index that does not fit the field would name the wrong position,
+        // so the plain format-one code is returned instead.
+        assert_eq!(TpmRc(rc::VALUE).with_handle(8).0, rc::VALUE);
+        assert_eq!(TpmRc(rc::VALUE).with_session(8).0, rc::VALUE);
+        assert_eq!(TpmRc(rc::VALUE).with_parameter(16).0, rc::VALUE);
+        assert_eq!(TpmRc(rc::VALUE).with_handle(0).0, rc::VALUE);
+        assert_eq!(TpmRc(rc::VALUE).with_parameter(0).0, rc::VALUE);
+        assert_eq!(TpmRc(rc::VALUE).with_handle(usize::MAX).0, rc::VALUE);
     }
 
     #[test]

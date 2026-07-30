@@ -33,12 +33,19 @@ impl DateTime {
     }
 }
 
+/// Days that can be converted without the intermediate arithmetic overflowing.
+///
+/// The algorithm shifts the epoch by 719468 days and multiplies the day of the
+/// era by five, so the usable range is far narrower than `i64`. This bound is
+/// still around twenty five billion years either side of the epoch.
+pub const MAX_CIVIL_DAYS: i64 = i64::MAX / 8 - 719_468;
+
 /// Convert days since 1970-01-01 to a civil date.
 ///
-/// This is Howard Hinnant's `civil_from_days` algorithm, valid for the whole
-/// proleptic Gregorian calendar.
+/// This is Howard Hinnant's `civil_from_days` algorithm. Inputs beyond
+/// [`MAX_CIVIL_DAYS`] are clamped so the conversion never overflows.
 pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
+    let z = z.clamp(-MAX_CIVIL_DAYS, MAX_CIVIL_DAYS) + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
@@ -122,6 +129,22 @@ mod tests {
         let dt = from_unix_millis(-1);
         assert_eq!(dt.date_string(), "1969-12-31");
         assert_eq!(dt.timestamp_string(), "1969-12-31 23:59:59.999");
+    }
+
+    #[test]
+    fn extreme_inputs_do_not_overflow() {
+        // Clamping keeps the arithmetic in range for any i64 input.
+        for z in [i64::MIN, i64::MAX, MAX_CIVIL_DAYS, -MAX_CIVIL_DAYS] {
+            let (_, m, d) = civil_from_days(z);
+            assert!((1..=12).contains(&m), "month {m} for {z}");
+            assert!((1..=31).contains(&d), "day {d} for {z}");
+        }
+        for ms in [i64::MIN, i64::MAX] {
+            let dt = from_unix_millis(ms);
+            assert!((1..=12).contains(&dt.month));
+            assert!((1..=31).contains(&dt.day));
+            assert!(dt.hour < 24 && dt.minute < 60 && dt.second < 60 && dt.millis < 1000);
+        }
     }
 
     #[test]

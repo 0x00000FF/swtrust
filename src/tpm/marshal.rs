@@ -93,20 +93,43 @@ impl<'a> Reader<'a> {
 }
 
 /// Writes values into a response buffer.
+///
+/// A TPM2B length field is a UINT16, so a body longer than 65535 octets cannot
+/// be described. Nothing the TPM produces is that large, but rather than
+/// silently write a truncated length the writer records the overflow and
+/// [`Writer::finish`] turns it into TPM_RC_SIZE.
 #[derive(Debug, Default, Clone)]
 pub struct Writer {
     buf: Vec<u8>,
+    overflow: bool,
 }
 
 impl Writer {
     pub fn new() -> Writer {
-        Writer { buf: Vec::new() }
+        Writer {
+            buf: Vec::new(),
+            overflow: false,
+        }
     }
 
     pub fn with_capacity(n: usize) -> Writer {
         Writer {
             buf: Vec::with_capacity(n),
+            overflow: false,
         }
+    }
+
+    /// True when a sized field could not hold its own length.
+    pub fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    /// The octets written, or TPM_RC_SIZE when a length field overflowed.
+    pub fn finish(self) -> TpmResult<Vec<u8>> {
+        if self.overflow {
+            return Err(TpmRc(rc::SIZE));
+        }
+        Ok(self.buf)
     }
 
     pub fn len(&self) -> usize {
@@ -156,7 +179,13 @@ impl Writer {
 
     /// Write a UINT16 length prefix followed by `body`, as a TPM2B does.
     pub fn sized16(&mut self, body: &[u8]) {
-        self.u16(body.len() as u16);
+        match u16::try_from(body.len()) {
+            Ok(n) => self.u16(n),
+            Err(_) => {
+                self.overflow = true;
+                self.u16(0);
+            }
+        }
         self.bytes(body);
     }
 
@@ -168,8 +197,10 @@ impl Writer {
         self.u16(0);
         let start = self.buf.len();
         f(self);
-        let n = (self.buf.len() - start) as u16;
-        self.buf[at..at + 2].copy_from_slice(&n.to_be_bytes());
+        match u16::try_from(self.buf.len() - start) {
+            Ok(n) => self.buf[at..at + 2].copy_from_slice(&n.to_be_bytes()),
+            Err(_) => self.overflow = true,
+        }
     }
 }
 
@@ -310,6 +341,28 @@ mod tests {
         let mut w = Writer::new();
         w.sized16(&[1, 2, 3]);
         assert_eq!(w.as_slice(), &[0x00, 0x03, 1, 2, 3]);
+        assert!(!w.overflowed());
+        assert_eq!(w.finish().unwrap(), vec![0x00, 0x03, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_body_too_long_for_a_uint16_is_reported() {
+        let big = vec![0u8; 65_536];
+        let mut w = Writer::new();
+        w.sized16(&big);
+        assert!(w.overflowed());
+        assert_eq!(w.finish().unwrap_err(), TpmRc(rc::SIZE));
+
+        let mut w = Writer::new();
+        w.sized16_with(|w| w.bytes(&big));
+        assert!(w.overflowed());
+        assert_eq!(w.finish().unwrap_err(), TpmRc(rc::SIZE));
+
+        // The largest body a UINT16 can describe is still accepted.
+        let mut w = Writer::new();
+        w.sized16(&vec![0u8; 65_535]);
+        assert!(!w.overflowed());
+        assert_eq!(&w.as_slice()[0..2], &0xFFFFu16.to_be_bytes());
     }
 
     #[test]

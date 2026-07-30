@@ -18,7 +18,14 @@ pub const HEADER_SIZE: usize = 10;
 pub const SIZE_FIELD_END: usize = 6;
 
 /// Largest command accepted from a client.
-pub const MAX_COMMAND: u32 = 16 * 1024 * 1024;
+///
+/// The TPM itself rejects anything above `config::MAX_COMMAND_SIZE`. This
+/// larger bound is what the transport is willing to read into memory before
+/// handing the buffer over, so a bad length cannot cause a large allocation.
+pub const MAX_COMMAND: u32 = 64 * 1024;
+
+/// Largest number of pipe clients served at once.
+pub const MAX_CONNECTIONS: usize = 64;
 
 /// Read the `commandSize` field out of a partial header.
 pub fn command_size(prefix: &[u8]) -> io::Result<u32> {
@@ -70,15 +77,13 @@ mod imp {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::thread;
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
     };
-    use windows_sys::Win32::Storage::FileSystem::{
-        FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile, PIPE_ACCESS_DUPLEX};
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -153,11 +158,13 @@ mod imp {
             Ok(written as usize)
         }
 
+        /// Nothing is buffered on this side, so there is nothing to flush.
+        ///
+        /// `FlushFileBuffers` on a pipe server blocks until the client has read
+        /// everything already written, which lets a client that stops reading
+        /// stall the TPM. `WriteFile` has already handed the octets to the
+        /// pipe, so the flush would buy nothing.
         fn flush(&mut self) -> io::Result<()> {
-            let ok = unsafe { FlushFileBuffers(self.handle) };
-            if ok == 0 {
-                return Err(io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
-            }
             Ok(())
         }
     }
@@ -217,20 +224,38 @@ mod imp {
         device.power_on();
 
         let connections = AtomicU64::new(0);
+        let active = Arc::new(AtomicUsize::new(0));
         loop {
             let stream = accept(&config.pipe_name)?;
+            if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                active.fetch_sub(1, Ordering::SeqCst);
+                logger.line(&format!(
+                    "refused pipe client, {MAX_CONNECTIONS} already active"
+                ));
+                drop(stream);
+                continue;
+            }
             let id = connections.fetch_add(1, Ordering::SeqCst) + 1;
             let device = device.clone();
-            let logger = logger.clone();
-            thread::spawn(move || {
-                logger.line(&format!("conn={id} open pipe"));
-                if let Err(e) = super::serve_connection(stream, &*device, &logger, id) {
-                    if e.kind() != io::ErrorKind::UnexpectedEof {
-                        logger.line(&format!("conn={id} error: {e}"));
+            let connection_logger = logger.clone();
+            let connection_active = active.clone();
+            let spawned = thread::Builder::new()
+                .name(format!("swtrust-pipe-{id}"))
+                .spawn(move || {
+                    let logger = connection_logger;
+                    logger.line(&format!("conn={id} open pipe"));
+                    if let Err(e) = super::serve_connection(stream, &*device, &logger, id) {
+                        if e.kind() != io::ErrorKind::UnexpectedEof {
+                            logger.line(&format!("conn={id} error: {e}"));
+                        }
                     }
-                }
-                logger.line(&format!("conn={id} closed"));
-            });
+                    logger.line(&format!("conn={id} closed"));
+                    connection_active.fetch_sub(1, Ordering::SeqCst);
+                });
+            if let Err(e) = spawned {
+                active.fetch_sub(1, Ordering::SeqCst);
+                logger.line(&format!("conn={id} cannot start a thread: {e}"));
+            }
         }
     }
 }

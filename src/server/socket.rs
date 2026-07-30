@@ -5,28 +5,59 @@
 //! signals. Each connection is served on its own thread.
 
 use std::io::{self, BufReader, BufWriter, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::cli::Config;
 use crate::logging::Logger;
 use crate::server::simulator::{self as sim, op};
 use crate::server::Device;
 
+/// Largest number of connections served at once, across both ports.
+///
+/// A client that connects and then stalls holds a thread and its buffers, so
+/// the count is capped and further connections are closed immediately.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// How long to wait when waking a blocked listener.
+const WAKE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Shared shutdown flag set by the TPM_STOP request.
+///
+/// Setting the flag is not enough on its own: both accept loops are blocked
+/// inside `accept`, so requesting a shutdown also opens a throwaway connection
+/// to every listener to wake it.
 #[derive(Debug, Default)]
 pub struct Shutdown {
     flag: AtomicBool,
+    listeners: Mutex<Vec<SocketAddr>>,
 }
 
 impl Shutdown {
+    /// Record a listener that must be woken when a shutdown is requested.
+    pub fn register(&self, addr: SocketAddr) {
+        if let Ok(mut l) = self.listeners.lock() {
+            l.push(addr);
+        }
+    }
+
     pub fn requested(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
     }
+
+    /// Set the flag and wake every registered listener.
     pub fn request(&self) {
         self.flag.store(true, Ordering::SeqCst);
+        let addrs = match self.listeners.lock() {
+            Ok(l) => l.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        for addr in addrs {
+            let _ = TcpStream::connect_timeout(&addr, WAKE_TIMEOUT);
+        }
     }
 }
 
@@ -41,23 +72,28 @@ pub fn serve<D: Device + 'static>(
 
     let command = TcpListener::bind(&command_addr)?;
     let platform = TcpListener::bind(&platform_addr)?;
+    let command_local = command.local_addr()?;
+    let platform_local = platform.local_addr()?;
 
     logger.line(&format!(
-        "listening command={} platform={}",
-        command.local_addr()?,
-        platform.local_addr()?
+        "listening command={command_local} platform={platform_local}"
     ));
 
     let shutdown = Arc::new(Shutdown::default());
+    shutdown.register(command_local);
+    shutdown.register(platform_local);
+
     let connections = Arc::new(AtomicU64::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
 
     let platform_thread = {
         let device = device.clone();
         let logger = logger.clone();
         let shutdown = shutdown.clone();
         let connections = connections.clone();
+        let active = active.clone();
         thread::spawn(move || {
-            accept_loop(platform, device, logger, shutdown, connections, false);
+            accept_loop(platform, device, logger, shutdown, connections, active, false);
         })
     };
 
@@ -67,22 +103,23 @@ pub fn serve<D: Device + 'static>(
         logger.clone(),
         shutdown.clone(),
         connections,
+        active,
         true,
     );
 
-    // Unblock the platform listener so the process can exit.
-    let _ = TcpStream::connect(&platform_addr);
     let _ = platform_thread.join();
     logger.line("stopped");
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_loop<D: Device + 'static>(
     listener: TcpListener,
     device: Arc<D>,
     logger: Arc<Logger>,
     shutdown: Arc<Shutdown>,
     connections: Arc<AtomicU64>,
+    active: Arc<AtomicUsize>,
     is_command_port: bool,
 ) {
     for stream in listener.incoming() {
@@ -96,30 +133,49 @@ fn accept_loop<D: Device + 'static>(
                 continue;
             }
         };
+        // Reserve a slot, and give it straight back if the TPM is already
+        // serving as many connections as it will.
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            logger.line(&format!(
+                "refused connection, {MAX_CONNECTIONS} already active"
+            ));
+            drop(stream);
+            continue;
+        }
         let id = connections.fetch_add(1, Ordering::SeqCst) + 1;
         let device = device.clone();
-        let logger = logger.clone();
+        let connection_logger = logger.clone();
         let connection_shutdown = shutdown.clone();
-        thread::spawn(move || {
-            let shutdown = connection_shutdown;
-            let peer = stream
-                .peer_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "unknown".to_string());
-            logger.line(&format!(
-                "conn={id} open {} peer={peer}",
-                if is_command_port { "command" } else { "platform" }
-            ));
-            if let Err(e) = serve_connection(stream, &*device, &logger, &shutdown, id) {
-                if e.kind() != io::ErrorKind::UnexpectedEof
-                    && e.kind() != io::ErrorKind::ConnectionReset
-                    && e.kind() != io::ErrorKind::ConnectionAborted
-                {
-                    logger.line(&format!("conn={id} error: {e}"));
+        let connection_active = active.clone();
+        let spawned = thread::Builder::new()
+            .name(format!("swtrust-conn-{id}"))
+            .spawn(move || {
+                let logger = connection_logger;
+                let shutdown = connection_shutdown;
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                logger.line(&format!(
+                    "conn={id} open {} peer={peer}",
+                    if is_command_port { "command" } else { "platform" }
+                ));
+                if let Err(e) = serve_connection(stream, &*device, &logger, &shutdown, id) {
+                    if e.kind() != io::ErrorKind::UnexpectedEof
+                        && e.kind() != io::ErrorKind::ConnectionReset
+                        && e.kind() != io::ErrorKind::ConnectionAborted
+                    {
+                        logger.line(&format!("conn={id} error: {e}"));
+                    }
                 }
-            }
-            logger.line(&format!("conn={id} closed"));
-        });
+                logger.line(&format!("conn={id} closed"));
+                connection_active.fetch_sub(1, Ordering::SeqCst);
+            });
+        if let Err(e) = spawned {
+            active.fetch_sub(1, Ordering::SeqCst);
+            logger.line(&format!("conn={id} cannot start a thread: {e}"));
+        }
         if shutdown.requested() {
             break;
         }
@@ -462,6 +518,78 @@ mod tests {
         serve_connection(server, &device, &log, &shutdown, 1).unwrap();
         assert!(shutdown.requested());
         assert_eq!(client.join().unwrap(), vec![0, 0, 0, 0]);
+    }
+
+    /// Find a port such that it and the next one are both free.
+    fn free_port_pair() -> u16 {
+        for _ in 0..64 {
+            let Ok(a) = TcpListener::bind("127.0.0.1:0") else {
+                continue;
+            };
+            let port = a.local_addr().unwrap().port();
+            if port == u16::MAX {
+                continue;
+            }
+            let Ok(b) = TcpListener::bind(("127.0.0.1", port + 1)) else {
+                continue;
+            };
+            drop(a);
+            drop(b);
+            return port;
+        }
+        panic!("no free port pair");
+    }
+
+    #[test]
+    fn stop_makes_serve_return() {
+        let port = free_port_pair();
+        let mut config = crate::cli::Config {
+            port,
+            ..Default::default()
+        };
+        let mut log_dir = std::env::temp_dir();
+        log_dir.push(format!(
+            "swtrust-serve-{}-{}",
+            std::process::id(),
+            crate::util::time::unix_millis_now()
+        ));
+        config.log_dir = log_dir.clone();
+
+        let device = Arc::new(FakeDevice::default());
+        let logger = Arc::new(Logger::new(&log_dir, false).unwrap());
+        let served = {
+            let device = device.clone();
+            thread::spawn(move || serve(&config, device, logger))
+        };
+
+        // Wait for both listeners to come up, then ask the TPM to stop.
+        let mut client = None;
+        for _ in 0..200 {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                client = Some(s);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut client = client.expect("command port never accepted a connection");
+        let mut req = Vec::new();
+        sim::write_u32(&mut req, op::STOP).unwrap();
+        client.write_all(&req).unwrap();
+        let mut ack = [0u8; 4];
+        client.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, [0, 0, 0, 0]);
+        drop(client);
+
+        // serve() must return rather than stay blocked in accept().
+        for _ in 0..500 {
+            if served.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(served.is_finished(), "serve did not return after TPM_STOP");
+        served.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&log_dir).ok();
     }
 
     #[test]
