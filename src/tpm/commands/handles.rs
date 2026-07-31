@@ -197,6 +197,9 @@ const ROWS: &[Row] = &[
     (cc::SequenceUpdate, &[H(Object, false)], &[R::User]),
     (cc::SetAlgorithmSet, &[H(Platform, false), H(Platform, false)], &[R::None, R::User]),
     (cc::SetCapability, &[H(HierarchyAuth, true)], &[R::User]),
+    // Part 3 Table 197 writes the type and the name on one line, so this row
+    // is added by hand rather than taken from the table sweep.
+    (cc::SetPrimaryPolicy, &[H(HierarchyPolicy, false)], &[R::User]),
     (cc::SetCommandCodeAuditStatus, &[H(Provision, false)], &[R::User]),
     (cc::Sign, &[H(Object, false)], &[R::User]),
     (cc::SignDigest, &[H(Object, false)], &[R::User]),
@@ -348,6 +351,40 @@ mod tests {
         }
         // TPM2_Clear does not, so the null handle is refused there.
         assert!(!allows(kind(cc::Clear, 0).unwrap(), rh::NULL));
+    }
+
+    #[test]
+    fn every_command_with_handles_has_an_interface_row() {
+        // The three attached component and timer commands check their own
+        // handles, because the entities they name are not implemented.
+        let exempt = [cc::AC_GetCapability, cc::AC_Send, cc::ACT_SetTimeout];
+        for info in crate::tpm::commands::table::COMMANDS {
+            if info.handles == 0 || exempt.contains(&info.code) {
+                continue;
+            }
+            assert!(
+                kind(info.code, 0).is_some(),
+                "no handle interface for {:#010x}",
+                info.code
+            );
+            for i in 0..info.handles as usize {
+                assert!(
+                    kind(info.code, i).is_some(),
+                    "handle {i} of {:#010x} has no interface",
+                    info.code
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_hierarchy_policy_handle_takes_the_four_authorities() {
+        // Part 3 Table 197 gives TPM2_SetPrimaryPolicy TPMI_RH_HIERARCHY_POLICY.
+        let h = kind(cc::SetPrimaryPolicy, 0).unwrap();
+        for handle in [rh::PLATFORM, rh::OWNER, rh::ENDORSEMENT, rh::LOCKOUT] {
+            assert!(allows(h, handle), "{handle:#010x}");
+        }
+        assert!(!allows(h, hc::TRANSIENT_FIRST));
     }
 
     #[test]
