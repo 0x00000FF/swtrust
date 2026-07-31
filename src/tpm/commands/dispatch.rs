@@ -65,12 +65,22 @@ impl Request {
     }
 
     /// True when the command read every octet of its parameter area.
-    ///
-    /// Part 3 clause 5.8.2 refuses a command whose parameter area holds more
-    /// than the schematic defines, so trailing octets cannot ride along with
-    /// an otherwise valid command.
     pub fn parameters_fully_read(&self) -> bool {
         self.consumed.get() >= self.parameters.len()
+    }
+
+    /// Refuse a parameter area that holds more than the command reads.
+    ///
+    /// Part 3 clause 5.8.2 answers TPM_RC_SIZE for surplus octets, and clause
+    /// 5.6 leaves the TPM unchanged when a command fails, so every command
+    /// calls this once it has read its parameters and before it changes
+    /// anything.
+    pub fn end_of_parameters(&self) -> TpmResult<()> {
+        if self.parameters_fully_read() {
+            Ok(())
+        } else {
+            Err(TpmRc(rc::SIZE))
+        }
     }
 
     /// The handle at `index`, or TPM_RC_VALUE when there are fewer.

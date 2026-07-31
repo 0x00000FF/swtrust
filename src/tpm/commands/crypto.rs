@@ -44,6 +44,7 @@ pub fn hash_command(state: &TpmState, request: &Request) -> TpmResult<Response> 
     let data = Tpm2bMaxBuffer::unmarshal(&mut r)?;
     let hash_alg = r.u16()?;
     let hierarchy = r.u32()?;
+    r.expect_end()?;
 
     let digest = hash::digest(hash_alg, data.as_slice())
         .map_err(|_| TpmRc(rc::HASH).with_parameter(2))?;
@@ -289,6 +290,7 @@ pub fn hmac_command(state: &TpmState, request: &Request) -> TpmResult<Response> 
     let mut r = request.reader();
     let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
     let requested = r.u16()?;
+    r.expect_end()?;
 
     let (key, hash_alg) = hmac_key(state, handle, requested)?;
     let digest = mac::hmac(hash_alg, &key, buffer.as_slice())?;
@@ -342,6 +344,7 @@ pub fn hash_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
     let mut r = request.reader();
     let auth = Tpm2bDigest::unmarshal(&mut r)?;
     let hash_alg = r.u16()?;
+    r.expect_end()?;
 
     // TPM_ALG_NULL starts an event sequence, which feeds every PCR bank.
     let kind = if hash_alg == alg::NULL {
@@ -366,6 +369,7 @@ pub fn hmac_start(state: &mut TpmState, request: &Request) -> TpmResult<Response
     let mut r = request.reader();
     let auth = Tpm2bDigest::unmarshal(&mut r)?;
     let requested = r.u16()?;
+    r.expect_end()?;
 
     let (key, hash_alg) = hmac_key(state, key_handle, requested)?;
     let handle = state.objects.insert(Slot::Sequence(Box::new(Sequence {
@@ -381,6 +385,7 @@ pub fn sequence_update(state: &mut TpmState, request: &Request) -> TpmResult<Res
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
+    r.expect_end()?;
     state
         .objects
         .get_mut(handle)
@@ -396,6 +401,7 @@ pub fn sequence_complete(state: &mut TpmState, request: &Request) -> TpmResult<R
     let mut r = request.reader();
     let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
     let hierarchy = r.u32()?;
+    r.expect_end()?;
 
     let sequence = state
         .objects
@@ -436,6 +442,7 @@ pub fn event_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRe
     let sequence_handle = request.handle(1)?;
     let mut r = request.reader();
     let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let sequence = state
         .objects
@@ -667,6 +674,7 @@ pub fn sign(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let digest = Tpm2bDigest::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
     let validation = Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK])?;
+    r.expect_end()?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
@@ -700,6 +708,7 @@ pub fn verify_signature(state: &TpmState, request: &Request) -> TpmResult<Respon
     let mut r = request.reader();
     let digest = Tpm2bDigest::unmarshal(&mut r)?;
     let signature = TpmtSignature::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
     verify_digest(object, digest.as_slice(), &signature)?;
@@ -737,6 +746,7 @@ pub fn rsa_encrypt(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     let message = Tpm2bPublicKeyRsa::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_rsa_decrypt(&mut r)?;
     let label = crate::tpm::structures::base::Tpm2bData::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
@@ -795,6 +805,7 @@ pub fn rsa_decrypt(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let cipher = Tpm2bPublicKeyRsa::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_rsa_decrypt(&mut r)?;
     let label = crate::tpm::structures::base::Tpm2bData::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
     if object.public.object_type != alg::RSA {
@@ -895,6 +906,7 @@ pub fn ecdh_zgen(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
     let in_point = Tpm2bEccPoint::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
     if object.public.object_type != alg::ECC {
@@ -956,6 +968,7 @@ pub fn encrypt_decrypt(
         let data = Tpm2bMaxBuffer::unmarshal(&mut r)?;
         (decrypt, mode, iv, data)
     };
+    r.expect_end()?;
     let decrypt = match decrypt_flag {
         0 => false,
         1 => true,
@@ -1017,6 +1030,7 @@ pub fn make_credential(state: &mut TpmState, request: &Request) -> TpmResult<Res
     let mut r = request.reader();
     let credential = Tpm2bDigest::unmarshal(&mut r)?;
     let object_name = crate::tpm::structures::base::Tpm2bName::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
@@ -1079,6 +1093,7 @@ pub fn activate_credential(state: &TpmState, request: &Request) -> TpmResult<Res
     let mut r = request.reader();
     let credential_blob = Tpm2bIdObject::unmarshal(&mut r)?;
     let secret = Tpm2bEncryptedSecret::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let key = object_of(state, key_handle).map_err(|e| e.with_handle(2))?;
     // Part 3 clause 12.5.1 needs a Storage Key here, the same one that made
@@ -1132,6 +1147,7 @@ pub fn activate_credential(state: &TpmState, request: &Request) -> TpmResult<Res
 pub fn ec_ephemeral(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let curve_id = r.u16()?;
+    r.expect_end()?;
     let key = ecc::generate(curve_id, &mut state.rng)
         .map_err(|_| TpmRc(rc::CURVE).with_parameter(1))?;
     // The commit counter identifies the ephemeral value for a later

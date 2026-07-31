@@ -154,7 +154,6 @@ impl Default for AuditState {
 }
 
 /// Everything the TPM knows.
-#[derive(Clone)]
 pub struct TpmState {
     // Values that survive power loss.
     pub hierarchies: Hierarchies,

@@ -57,7 +57,6 @@ pub const MAX_BYTES_PER_REQUEST: usize = (1 << 19) / 8;
 pub const RESEED_INTERVAL: u64 = 1 << 48;
 
 /// SP800-90A HMAC_DRBG.
-#[derive(Clone)]
 pub struct Drbg {
     key: Vec<u8>,
     value: Vec<u8>,

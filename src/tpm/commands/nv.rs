@@ -172,6 +172,7 @@ pub fn nv_define_space(state: &mut TpmState, request: &Request) -> TpmResult<Res
     let mut r = request.reader();
     let auth = Tpm2bDigest::unmarshal(&mut r)?;
     let public = Tpm2bNvPublic::unmarshal(&mut r)?.nv_public;
+    r.expect_end()?;
     define(state, auth_handle, auth.as_slice().to_vec(), public)
 }
 
@@ -181,6 +182,7 @@ pub fn nv_define_space2(state: &mut TpmState, request: &Request) -> TpmResult<Re
     let mut r = request.reader();
     let auth = Tpm2bDigest::unmarshal(&mut r)?;
     let public2 = Tpm2bNvPublic2::unmarshal(&mut r)?.nv_public;
+    r.expect_end()?;
     let public = match public2.public_area {
         NvPublic2::Index(p) | NvPublic2::Permanent(p) => p,
         NvPublic2::External(_) => {
@@ -294,6 +296,7 @@ pub fn nv_write(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
     let mut r = request.reader();
     let data = Tpm2bMaxNvBuffer::unmarshal(&mut r)?;
     let offset = r.u16()?;
+    r.expect_end()?;
 
     writable(state, request, nv_handle, auth_handle)?;
     let index = state.nv.get_mut(nv_handle)?;
@@ -323,6 +326,7 @@ pub fn nv_extend(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let nv_handle = request.handle(1)?;
     let mut r = request.reader();
     let data = Tpm2bMaxNvBuffer::unmarshal(&mut r)?;
+    r.expect_end()?;
     writable(state, request, nv_handle, auth_handle)?;
     state.nv.get_mut(nv_handle)?.extend(data.as_slice())?;
     note_orderly_write(state, nv_handle);
@@ -335,6 +339,7 @@ pub fn nv_set_bits(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     let nv_handle = request.handle(1)?;
     let mut r = request.reader();
     let bits = r.u64()?;
+    r.expect_end()?;
     writable(state, request, nv_handle, auth_handle)?;
     state.nv.get_mut(nv_handle)?.set_bits(bits)?;
     note_orderly_write(state, nv_handle);
@@ -381,6 +386,7 @@ pub fn nv_read(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let size = r.u16()?;
     let offset = r.u16()?;
+    r.expect_end()?;
 
     let index = index_of(state, nv_handle).map_err(|e| e.with_handle(2))?;
     check_read_authority(index, auth_handle, first_auth_is_policy(state, request))?;
@@ -415,6 +421,7 @@ pub fn nv_change_auth(state: &mut TpmState, request: &Request) -> TpmResult<Resp
     let nv_handle = request.handle(0)?;
     let mut r = request.reader();
     let new_auth = Tpm2bDigest::unmarshal(&mut r)?;
+    r.expect_end()?;
     if new_auth.len() > crate::tpm::structures::base::MAX_DIGEST_SIZE {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }

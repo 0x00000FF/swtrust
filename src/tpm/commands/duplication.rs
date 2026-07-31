@@ -129,6 +129,7 @@ pub fn duplicate(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let mut r = request.reader();
     let encryption_key_in = Tpm2bSymKey::unmarshal(&mut r)?;
     let symmetric_alg = SymDef::unmarshal_sym_def_object(&mut r)?;
+    r.expect_end()?;
 
     let object = object_of(state, object_handle)
         .map_err(|e| e.with_handle(1))?
@@ -228,6 +229,7 @@ pub fn import(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let duplicate_blob = Tpm2bPrivate::unmarshal(&mut r)?;
     let in_symmetric_seed = Tpm2bEncryptedSecret::unmarshal(&mut r)?;
     let symmetric_alg = SymDef::unmarshal_sym_def_object(&mut r)?;
+    r.expect_end()?;
 
     let parent = object_of(state, parent_handle)
         .map_err(|e| e.with_handle(1))?
@@ -317,6 +319,7 @@ pub fn rewrap(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let in_duplicate = Tpm2bPrivate::unmarshal(&mut r)?;
     let name = Tpm2bName::unmarshal(&mut r)?;
     let in_secret = Tpm2bEncryptedSecret::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     // Remove the old parent's outer wrap.
     let body = if old_parent == rh::NULL {
@@ -382,6 +385,7 @@ pub fn act_set_timeout(_state: &mut TpmState, request: &Request) -> TpmResult<Re
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let _start_timeout = r.u32()?;
+    r.expect_end()?;
     if !(crate::tpm::constants::rh::ACT_0..=crate::tpm::constants::rh::ACT_F).contains(&handle) {
         return Err(TpmRc(rc::VALUE).with_handle(1));
     }
@@ -396,6 +400,7 @@ pub fn set_capability(_state: &mut TpmState, request: &Request) -> TpmResult<Res
     let mut r = request.reader();
     let size = r.u16()? as usize;
     let mut inner = r.sub(size)?;
+    r.expect_end()?;
     let _data = CapabilityData::unmarshal(&mut inner)?;
     Err(TpmRc(rc::VALUE).with_parameter(1))
 }
@@ -419,6 +424,7 @@ pub fn ac_get_capability(_state: &TpmState, request: &Request) -> TpmResult<Resp
     let mut r = request.reader();
     let _capability = r.u32()?;
     let _count = r.u32()?;
+    r.expect_end()?;
     respond(|w| {
         w.u8(0);
         w.u32(0);

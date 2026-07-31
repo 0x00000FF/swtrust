@@ -24,6 +24,20 @@ impl<'a> Reader<'a> {
         self.buf.len() - self.pos
     }
 
+    /// Refuse a buffer that holds more than has been read.
+    ///
+    /// Part 3 clause 5.8.2 answers TPM_RC_SIZE when a command carries surplus
+    /// parameter octets. A command calls this once it has read what its
+    /// schematic defines and before it changes anything, so clause 5.6 leaves
+    /// the TPM alone.
+    pub fn expect_end(&self) -> TpmResult<()> {
+        if self.remaining() == 0 {
+            Ok(())
+        } else {
+            Err(TpmRc(rc::SIZE))
+        }
+    }
+
     /// True when every octet has been consumed.
     pub fn is_empty(&self) -> bool {
         self.remaining() == 0

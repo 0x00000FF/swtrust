@@ -117,17 +117,13 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
 
     state.command_audit_suppressed = false;
 
-    // The command action runs against a copy. Part 3 clause 5.6 leaves the
-    // TPM unchanged when a command fails, and clause 5.8.2 cannot know that a
-    // parameter area holds surplus octets until the command has read the ones
-    // it wants. Working on a copy gives both: nothing reaches the TPM until
-    // the action has succeeded and the whole parameter area is accounted for.
-    let mut working = state.clone();
-    let response = super::run_command(&mut working, &request)?;
-    if !request.parameters_fully_read() {
-        return Err(TpmRc(rc::SIZE));
-    }
-    *state = working;
+    let response = super::run_command(state, &request)?;
+
+    // Every command calls Reader::expect_end once it has read its parameters,
+    // so surplus octets are refused before anything changes. This catches a
+    // command that did not, where the only harm is that the response code
+    // arrives after the action rather than before it.
+    request.end_of_parameters()?;
 
     // The response nonces are rolled forward before the response parameter is
     // encrypted, because Part 1 clause 21.3 keys that encryption with the new

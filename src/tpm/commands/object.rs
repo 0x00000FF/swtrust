@@ -218,6 +218,7 @@ pub fn create_primary(state: &mut TpmState, request: &Request) -> TpmResult<Resp
     let in_public = Tpm2bPublic::unmarshal(&mut r)?;
     let outside_info = Tpm2bData::unmarshal(&mut r)?;
     let creation_pcr = TpmlPcrSelection::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     if !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(primary_handle) {
         return Err(TpmRc(rc::VALUE).with_handle(1));
@@ -354,6 +355,7 @@ pub fn create(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let in_public = Tpm2bPublic::unmarshal(&mut r)?;
     let outside_info = Tpm2bData::unmarshal(&mut r)?;
     let creation_pcr = TpmlPcrSelection::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let parent = parent_of(state, parent_handle).map_err(|e| e.with_handle(1))?;
     let template = in_public.public_area;
@@ -425,6 +427,7 @@ pub fn create_loaded(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let mut r = request.reader();
     let in_sensitive = Tpm2bSensitiveCreate::unmarshal(&mut r)?;
     let template_blob = Tpm2bTemplate::unmarshal(&mut r)?;
+    r.expect_end()?;
     let template = TpmtPublic::from_bytes(template_blob.as_slice())
         .map_err(|e| e.with_parameter(2))?;
     object::validate_public(&template).map_err(|e| e.with_parameter(2))?;
@@ -505,6 +508,7 @@ pub fn load(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let in_private = Tpm2bPrivate::unmarshal(&mut r)?;
     let in_public = Tpm2bPublic::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     if in_private.is_empty() {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
@@ -563,6 +567,7 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     };
     let in_public = Tpm2bPublic::unmarshal(&mut r)?;
     let hierarchy = r.u32()?;
+    r.expect_end()?;
 
     let public = in_public.public_area;
     object::validate_public(&public).map_err(|e| e.with_parameter(2))?;
@@ -666,6 +671,7 @@ pub fn object_change_auth(state: &mut TpmState, request: &Request) -> TpmResult<
     let parent_handle = request.handle(1)?;
     let mut r = request.reader();
     let new_auth = Tpm2bDigest::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let parent = parent_of(state, parent_handle).map_err(|e| e.with_handle(2))?;
     let object = state

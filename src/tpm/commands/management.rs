@@ -28,6 +28,7 @@ use super::table;
 pub fn startup(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let startup_type = r.u16()?;
+    r.expect_end()?;
     match startup_type {
         su::CLEAR => state.on_startup_clear()?,
         su::STATE => {
@@ -48,6 +49,7 @@ pub fn startup(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let shutdown_type = r.u16()?;
+    r.expect_end()?;
     match shutdown_type {
         su::CLEAR | su::STATE => {
             state.shutdown_type = shutdown_type;
@@ -68,6 +70,7 @@ pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
 pub fn self_test(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let _full_test = r.u8()?;
+    r.expect_end()?;
     state.self_test_done = true;
     respond(|_| Ok(()))
 }
@@ -79,6 +82,7 @@ pub fn self_test(state: &mut TpmState, request: &Request) -> TpmResult<Response>
 pub fn incremental_self_test(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let to_test = TpmlAlg::unmarshal(&mut r)?;
+    r.expect_end()?;
     for a in &to_test.items {
         if !config::IMPLEMENTED_ALGORITHMS.contains(a) {
             return Err(TpmRc(rc::VALUE).with_parameter(1));
@@ -105,6 +109,7 @@ pub fn get_test_result(state: &TpmState, _request: &Request) -> TpmResult<Respon
 pub fn get_random(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let requested = r.u16()? as usize;
+    r.expect_end()?;
     // Part 3 clause 16.1.3 caps the answer at the size of the largest digest.
     let size = requested.min(crate::tpm::structures::base::MAX_DIGEST_SIZE);
     let bytes = state.rng.bytes(size)?;
@@ -118,6 +123,7 @@ pub fn get_random(state: &mut TpmState, request: &Request) -> TpmResult<Response
 pub fn stir_random(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let data = Tpm2bDigest::unmarshal(&mut r)?;
+    r.expect_end()?;
     if data.len() > config::MAX_RNG_ENTROPY_SIZE {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
@@ -150,6 +156,7 @@ pub fn clock_info(state: &TpmState) -> crate::tpm::structures::attest::ClockInfo
 pub fn clock_set(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let new_time = r.u64()?;
+    r.expect_end()?;
     // Clock only ever advances.
     if new_time < state.clock.clock {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
@@ -164,6 +171,7 @@ pub fn clock_set(state: &mut TpmState, request: &Request) -> TpmResult<Response>
 /// and recorded as having no effect.
 pub fn clock_rate_adjust(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
+    r.expect_end()?;
     let adjust = r.i8()?;
     if !(-3..=3).contains(&adjust) {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
@@ -177,6 +185,7 @@ pub fn test_parms(_state: &TpmState, request: &Request) -> TpmResult<Response> {
     // Unmarshalling already applies every interface type check, so a structure
     // that parses is one the TPM supports.
     let _parms = PublicParmsTagged::unmarshal(&mut r)?;
+    r.expect_end()?;
     respond(|_| Ok(()))
 }
 
@@ -186,6 +195,7 @@ pub fn ecc_parameters(_state: &TpmState, request: &Request) -> TpmResult<Respons
 
     let mut r = request.reader();
     let curve_id = r.u16()?;
+    r.expect_end()?;
     let c = ecc::Curve::new(curve_id).map_err(|_| TpmRc(rc::CURVE).with_parameter(1))?;
     let (p, a, b) = c.parameters()?;
     let (gx, gy) = c.generator_coordinates()?;
@@ -216,6 +226,7 @@ pub fn get_capability(state: &TpmState, request: &Request) -> TpmResult<Response
     let capability = r.u32()?;
     let property = r.u32()?;
     let count = r.u32()? as usize;
+    r.expect_end()?;
 
     let (more, data) = build_capability(state, capability, property, count)?;
     respond(move |w| {
@@ -588,6 +599,7 @@ fn pcr_properties(property: u32) -> Vec<TaggedPcrSelect> {
 pub fn firmware_read(_state: &TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let _sequence = r.u32()?;
+    r.expect_end()?;
     Err(TpmRc(rc::VALUE).with_parameter(1))
 }
 
@@ -599,6 +611,7 @@ pub fn vendor_tcg_test(_state: &TpmState, request: &Request) -> TpmResult<Respon
     use crate::tpm::structures::base::Tpm2bData;
     let mut r = request.reader();
     let data = Tpm2bData::unmarshal(&mut r)?;
+    r.expect_end()?;
     respond(move |w| {
         data.marshal(w);
         Ok(())

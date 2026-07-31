@@ -95,6 +95,7 @@ pub fn certify(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
+    r.expect_end()?;
 
     let object = if crate::tpm::core::object::ObjectSlots::is_transient(object_handle) {
         state.objects.object(object_handle).map_err(|e| e.with_handle(1))?
@@ -130,6 +131,7 @@ pub fn certify_creation(state: &mut TpmState, request: &Request) -> TpmResult<Re
     let creation_hash = Tpm2bDigest::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
     let creation_ticket = Ticket::unmarshal_tagged(&mut r, &[st::CREATION])?;
+    r.expect_end()?;
 
     let object = if crate::tpm::core::object::ObjectSlots::is_transient(object_handle) {
         state
@@ -183,6 +185,7 @@ pub fn quote(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
     let selection = TpmlPcrSelection::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     // The digest uses the nameAlg of the signing key, as clause 18.4.3 says.
     let name_alg = if sign_handle == rh::NULL {
@@ -215,6 +218,7 @@ pub fn get_time(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
     let mut r = request.reader();
     let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
+    r.expect_end()?;
 
     let attested = Attested::Time {
         time: TimeInfo {
@@ -242,6 +246,7 @@ pub fn nv_certify(state: &mut TpmState, request: &Request) -> TpmResult<Response
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
     let size = r.u16()?;
     let offset = r.u16()?;
+    r.expect_end()?;
 
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(3))?;
     // Part 3 clause 31.16.1 certifies only what the authorization is entitled
@@ -278,6 +283,7 @@ pub fn get_session_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
     let mut r = request.reader();
     let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
+    r.expect_end()?;
 
     let session = state
         .sessions
@@ -307,6 +313,7 @@ pub fn get_command_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
     let mut r = request.reader();
     let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
+    r.expect_end()?;
 
     let digest_alg = state.audit.alg;
     let audit_digest = state.audit.digest.clone();
@@ -350,6 +357,7 @@ pub fn set_command_code_audit_status(
     let audit_alg = r.u16()?;
     let set_list = TpmlCc::unmarshal(&mut r)?;
     let clear_list = TpmlCc::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     if audit_alg != alg::NULL && !hash::is_supported(audit_alg) {
         return Err(TpmRc(rc::HASH).with_parameter(1));

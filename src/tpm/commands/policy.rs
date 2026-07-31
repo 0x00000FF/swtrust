@@ -27,6 +27,7 @@ pub fn start_auth_session(state: &mut TpmState, request: &Request) -> TpmResult<
     let session_type = r.u8()?;
     let symmetric = SymDef::unmarshal_sym_def(&mut r)?;
     let auth_hash = r.u16()?;
+    r.expect_end()?;
 
     if !session::is_session_type(session_type) {
         return Err(TpmRc(rc::VALUE).with_parameter(3));
@@ -426,6 +427,7 @@ pub fn policy_signed(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let expiration = r.u32()? as i32;
     let signature =
         crate::tpm::structures::signature::TpmtSignature::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let auth_name = super::dispatch::handle_name(state, auth_object)
         .map_err(|e| e.with_handle(1))?;
@@ -519,6 +521,7 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let cp_hash_a = Tpm2bDigest::unmarshal(&mut r)?;
     let policy_ref = Tpm2bNonce::unmarshal(&mut r)?;
     let expiration = r.u32()? as i32;
+    r.expect_end()?;
 
     let auth_name = super::dispatch::handle_name(state, auth_handle)
         .map_err(|e| e.with_handle(1))?;
@@ -581,6 +584,7 @@ pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let policy_ref = Tpm2bNonce::unmarshal(&mut r)?;
     let auth_name = Tpm2bName::unmarshal(&mut r)?;
     let ticket = Ticket::unmarshal_tagged(&mut r, &[st::AUTH_SIGNED, st::AUTH_SECRET])?;
+    r.expect_end()?;
 
     // A null ticket carries no proof, so it authorizes nothing.
     if ticket.digest.is_empty() {
@@ -635,6 +639,7 @@ pub fn policy_or(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let list = TpmlDigest::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let s = policy_session(state, handle)?;
     // The current digest must be one of the branches. A trial session is
@@ -667,6 +672,7 @@ pub fn policy_pcr(state: &mut TpmState, request: &Request) -> TpmResult<Response
     let mut r = request.reader();
     let expected = Tpm2bDigest::unmarshal(&mut r)?;
     let selection = TpmlPcrSelection::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let auth_hash = policy_session(state, handle)?.auth_hash;
     let filtered = state.pcr.filter_selection(&selection);
@@ -696,6 +702,7 @@ pub fn policy_locality(state: &mut TpmState, request: &Request) -> TpmResult<Res
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let locality = LocalityAttributes::unmarshal(&mut r)?;
+    r.expect_end()?;
     if locality.0 == 0 {
         return Err(TpmRc(rc::RANGE).with_parameter(1));
     }
@@ -722,6 +729,7 @@ pub fn policy_command_code(state: &mut TpmState, request: &Request) -> TpmResult
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let code = r.u32()?;
+    r.expect_end()?;
     if super::table::lookup(code).is_none() {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
@@ -750,6 +758,7 @@ pub fn policy_cp_hash(state: &mut TpmState, request: &Request) -> TpmResult<Resp
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let cp_hash_a = Tpm2bDigest::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let s = policy_session(state, handle)?;
     if cp_hash_a.len() != hash::digest_size(s.auth_hash)? {
@@ -770,6 +779,7 @@ pub fn policy_name_hash(state: &mut TpmState, request: &Request) -> TpmResult<Re
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let name_hash = Tpm2bDigest::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let s = policy_session(state, handle)?;
     if name_hash.len() != hash::digest_size(s.auth_hash)? {
@@ -825,6 +835,7 @@ pub fn policy_nv_written(state: &mut TpmState, request: &Request) -> TpmResult<R
         1 => true,
         _ => return Err(TpmRc(rc::VALUE).with_parameter(1)),
     };
+    r.expect_end()?;
     let s = policy_session(state, handle)?;
     if let Some(existing) = s.policy.nv_written {
         if existing != written {
@@ -841,6 +852,7 @@ pub fn policy_template(state: &mut TpmState, request: &Request) -> TpmResult<Res
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let template_hash = Tpm2bDigest::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let s = policy_session(state, handle)?;
     if template_hash.len() != hash::digest_size(s.auth_hash)? {
@@ -863,6 +875,7 @@ pub fn policy_counter_timer(state: &mut TpmState, request: &Request) -> TpmResul
     let operand_b = Tpm2bOperand::unmarshal(&mut r)?;
     let offset = r.u16()?;
     let operation = r.u16()?;
+    r.expect_end()?;
 
     // The comparison is against the marshalled TPMS_TIME_INFO.
     let time_info = crate::tpm::structures::attest::TimeInfo {
@@ -950,6 +963,7 @@ pub fn policy_authorize(state: &mut TpmState, request: &Request) -> TpmResult<Re
     // Version 185 has three commands that produce a TPMT_TK_VERIFIED, each
     // with its own tag, and Part 3 clause 23.16.1 takes any of them.
     let check_ticket = VerifiedTicket::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     // Part 3 clause 23.16.1 requires keySign to be a well formed Name: a hash
     // algorithm this TPM implements followed by a digest of its size.
@@ -1040,6 +1054,7 @@ pub fn policy_duplication_select(
         1 => true,
         _ => return Err(TpmRc(rc::VALUE).with_parameter(3)),
     };
+    r.expect_end()?;
 
     let auth_hash = policy_session(state, handle)?.auth_hash;
     // Part 3 clause 23.15.3 always covers both Names in nameHash; includeObject
@@ -1071,6 +1086,7 @@ pub fn policy_nv(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let operand_b = Tpm2bOperand::unmarshal(&mut r)?;
     let offset = r.u16()?;
     let operation = r.u16()?;
+    r.expect_end()?;
 
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
     if index.read_locked {
@@ -1138,6 +1154,7 @@ pub fn policy_capability(state: &mut TpmState, request: &Request) -> TpmResult<R
     let operation = r.u16()?;
     let capability = r.u32()?;
     let property = r.u32()?;
+    r.expect_end()?;
 
     let auth_hash = policy_session(state, handle)?.auth_hash;
     let args = hash::digest_parts(
@@ -1160,6 +1177,7 @@ pub fn policy_parameters(state: &mut TpmState, request: &Request) -> TpmResult<R
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let p_hash = Tpm2bDigest::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let s = policy_session(state, handle)?;
     if p_hash.len() != hash::digest_size(s.auth_hash)? {
@@ -1196,6 +1214,7 @@ pub fn policy_ac_send_select(state: &mut TpmState, request: &Request) -> TpmResu
         1 => true,
         _ => return Err(TpmRc(rc::VALUE).with_parameter(4)),
     };
+    r.expect_end()?;
 
     let s = policy_session(state, handle)?;
     let mut data = Vec::new();
@@ -1214,6 +1233,7 @@ pub fn policy_ac_send_select(state: &mut TpmState, request: &Request) -> TpmResu
 pub fn flush_context(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let handle = r.u32()?;
+    r.expect_end()?;
 
     if session::is_session_handle(handle) {
         state

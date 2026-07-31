@@ -27,6 +27,7 @@ pub fn hierarchy_control(state: &mut TpmState, request: &Request) -> TpmResult<R
     let mut r = request.reader();
     let enable = r.u32()?;
     let new_state = yes_no(r.u8()?).map_err(|e| e.with_parameter(2))?;
+    r.expect_end()?;
 
     // Only the platform may turn a hierarchy back on, and only the platform
     // may control phEnable or phEnableNV.
@@ -85,6 +86,7 @@ pub fn set_primary_policy(state: &mut TpmState, request: &Request) -> TpmResult<
     let mut r = request.reader();
     let policy = Tpm2bDigest::unmarshal(&mut r)?;
     let hash_alg = r.u16()?;
+    r.expect_end()?;
 
     if hash_alg == alg::NULL {
         if !policy.is_empty() {
@@ -150,6 +152,7 @@ pub fn clear_control(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let auth_handle = request.handle(0)?;
     let mut r = request.reader();
     let disable = yes_no(r.u8()?).map_err(|e| e.with_parameter(1))?;
+    r.expect_end()?;
 
     // Only the platform may re-enable TPM2_Clear.
     if !disable && auth_handle != rh::PLATFORM {
@@ -166,6 +169,7 @@ pub fn hierarchy_change_auth(state: &mut TpmState, request: &Request) -> TpmResu
     let auth_handle = request.handle(0)?;
     let mut r = request.reader();
     let new_auth = Tpm2bDigest::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     // Part 3 clause 24.9.2 bounds a new authorization value by the digest size
     // of the hash the hierarchy uses.
@@ -202,6 +206,7 @@ pub fn dictionary_attack_parameters(
     let max_tries = r.u32()?;
     let recovery_time = r.u32()?;
     let lockout_recovery = r.u32()?;
+    r.expect_end()?;
 
     state.lockout.max_tries = max_tries;
     state.lockout.recovery_time = recovery_time;
@@ -220,6 +225,7 @@ pub fn pp_commands(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     let mut r = request.reader();
     let set = TpmlCc::unmarshal(&mut r)?;
     let clear = TpmlCc::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     // Part 3 clause 26.2.1 discards a command that cannot be gated rather than
     // failing, and processes setList first so a command in both lists ends up
@@ -243,6 +249,7 @@ pub fn pp_commands(state: &mut TpmState, request: &Request) -> TpmResult<Respons
 pub fn set_algorithm_set(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     state.algorithm_set = r.u32()?;
+    r.expect_end()?;
     respond(|_| Ok(()))
 }
 
@@ -250,6 +257,7 @@ pub fn set_algorithm_set(state: &mut TpmState, request: &Request) -> TpmResult<R
 pub fn read_only_control(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let read_only = yes_no(r.u8()?).map_err(|e| e.with_parameter(1))?;
+    r.expect_end()?;
     state
         .startup_clear
         .set(StartupClearAttributes::READ_ONLY, read_only);

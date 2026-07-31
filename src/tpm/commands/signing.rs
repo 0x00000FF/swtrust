@@ -57,6 +57,7 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
     let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
     let digest = Tpm2bDigest::unmarshal(&mut r)?;
     let validation = Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK])?;
+    r.expect_end()?;
     check_no_context(&context, 1)?;
 
     let object = object_of(state, key_handle)
@@ -97,6 +98,7 @@ pub fn verify_digest_signature(state: &TpmState, request: &Request) -> TpmResult
     let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
     let digest = Tpm2bDigest::unmarshal(&mut r)?;
     let signature = TpmtSignature::unmarshal(&mut r)?;
+    r.expect_end()?;
     check_no_context(&context, 1)?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
@@ -152,6 +154,7 @@ pub fn sign_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
     let mut r = request.reader();
     let auth = Tpm2bDigest::unmarshal(&mut r)?;
     let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
+    r.expect_end()?;
     check_no_context(&context, 2)?;
 
     let object = object_of(state, key_handle)
@@ -210,6 +213,7 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
     let key_handle = request.handle(1)?;
     let mut r = request.reader();
     let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let sequence = state
         .objects
@@ -260,6 +264,7 @@ pub fn verify_sequence_start(state: &mut TpmState, request: &Request) -> TpmResu
     let auth = Tpm2bDigest::unmarshal(&mut r)?;
     let hint = Tpm2bSignatureHint::unmarshal(&mut r)?;
     let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
+    r.expect_end()?;
     // Part 2 Table 222 gives a hint only to EdDSA, which is not implemented.
     if !hint.is_empty() {
         return Err(TpmRc(rc::VALUE).with_parameter(2));
@@ -294,6 +299,7 @@ pub fn verify_sequence_complete(state: &mut TpmState, request: &Request) -> TpmR
     let key_handle = request.handle(1)?;
     let mut r = request.reader();
     let signature = TpmtSignature::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let sequence = state
         .objects
@@ -356,6 +362,7 @@ pub fn ecc_encrypt(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     let mut r = request.reader();
     let plain = Tpm2bMaxBuffer::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_kdf(&mut r)?;
+    r.expect_end()?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
@@ -411,6 +418,7 @@ pub fn ecc_decrypt(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let c2 = Tpm2bMaxBuffer::unmarshal(&mut r)?;
     let c3 = Tpm2bDigest::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_kdf(&mut r)?;
+    r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
     if object.public.object_type != alg::ECC {
@@ -488,6 +496,7 @@ pub fn commit(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let p1 = Tpm2bEccPoint::unmarshal(&mut r)?;
     let s2 = Tpm2bSensitiveData::unmarshal(&mut r)?;
     let y2 = Tpm2bEccParameter::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
@@ -553,6 +562,7 @@ pub fn zgen_2phase(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let in_qe_b = Tpm2bEccPoint::unmarshal(&mut r)?;
     let in_scheme = r.u16()?;
     let _counter = r.u16()?;
+    r.expect_end()?;
 
     if !matches!(in_scheme, alg::ECDH | alg::ECMQV | alg::SM2) {
         return Err(TpmRc(rc::SCHEME).with_parameter(3));
@@ -674,6 +684,7 @@ pub fn decapsulate(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let size = r.u16()? as usize;
     let mut inner = r.sub(size)?;
+    r.expect_end()?;
     let ciphertext = Tpm2bEccPoint::unmarshal(&mut inner)?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
