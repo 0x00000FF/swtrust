@@ -178,13 +178,21 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
     if ObjectSlots::is_transient(handle) {
         let slot = state.objects.get(handle)?;
         let (policy, user_with_auth, no_da) = match slot {
-            crate::tpm::core::object::Slot::Object(o) => (
-                object_policy(&o.public),
-                o.public
-                    .object_attributes
-                    .has(ObjectAttributes::USER_WITH_AUTH),
-                o.public.object_attributes.has(ObjectAttributes::NO_DA),
-            ),
+            crate::tpm::core::object::Slot::Object(o) => {
+                // Part 3 clause 5.6.1 needs both halves of the object to
+                // authorize it, because the authValue lives in the sensitive
+                // area.
+                if o.is_public_only() {
+                    return Err(TpmRc(rc::AUTH_UNAVAILABLE));
+                }
+                (
+                    object_policy(&o.public),
+                    o.public
+                        .object_attributes
+                        .has(ObjectAttributes::USER_WITH_AUTH),
+                    o.public.object_attributes.has(ObjectAttributes::NO_DA),
+                )
+            }
             crate::tpm::core::object::Slot::Sequence(_) => (None, true, true),
         };
         return Ok(Entity {
@@ -1362,6 +1370,34 @@ mod tests {
             );
         }
         out
+    }
+
+    #[test]
+    fn a_public_only_object_cannot_be_authorized() {
+        use crate::tpm::core::object::{Object, Slot};
+        use crate::tpm::structures::attributes::ObjectAttributes;
+        use crate::tpm::structures::base::Tpm2bDigest;
+        use crate::tpm::structures::keys::{PublicId, PublicParms, TpmtPublic};
+        use crate::tpm::structures::schemes::Scheme;
+
+        let mut state = TpmState::manufacture().unwrap();
+        let public = TpmtPublic {
+            object_type: alg::KEYEDHASH,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(ObjectAttributes::USER_WITH_AUTH),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::KeyedHash {
+                scheme: Scheme::null(),
+            },
+            unique: PublicId::KeyedHash(Tpm2bDigest::empty()),
+        };
+        // Part 3 clause 5.6.1 needs the sensitive area, which is absent here.
+        let object = Object::new(public, None, rh::NULL, &[], false).unwrap();
+        let handle = state.objects.insert(Slot::Object(Box::new(object))).unwrap();
+        assert_eq!(
+            entity(&state, handle).map(|_| ()).unwrap_err(),
+            TpmRc(rc::AUTH_UNAVAILABLE)
+        );
     }
 
     #[test]
