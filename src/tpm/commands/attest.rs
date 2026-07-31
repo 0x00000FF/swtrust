@@ -60,11 +60,34 @@ fn attest_and_sign(
     extra_data: &Tpm2bData,
     attested: Attested,
 ) -> TpmResult<(Tpm2bAttest, TpmtSignature)> {
-    let (qualified_signer, object) = if sign_handle == rh::NULL {
-        (Vec::new(), None)
+    let (object, scheme) = if sign_handle == rh::NULL {
+        (None, None)
     } else {
         let object = signing_object(state, sign_handle).map_err(|e| e.with_handle(1))?;
-        (object.qualified_name.clone(), Some(object))
+        let scheme = signing_scheme(&object, in_scheme)?;
+        (Some(object), Some(scheme))
+    };
+
+    // Part 1 clause 44.3.3.3 hides the signer when the scheme is anonymous.
+    let anonymous = scheme
+        .map(|s| crate::tpm::structures::schemes::is_anonymous(s.scheme))
+        .unwrap_or(false);
+
+    // Clause 21.5 says that with an anonymous scheme the qualifiedSigner of
+    // the attestation is an Empty Buffer, because the qualified name would
+    // otherwise say exactly which key signed.
+    let qualified_signer = match (&object, anonymous) {
+        (Some(o), false) => o.qualified_name.clone(),
+        _ => Vec::new(),
+    };
+    // The same clause empties the qualified name of a certified key, which
+    // would name the signer's parentage just as clearly.
+    let attested = match (attested, anonymous) {
+        (Attested::Certify { name, .. }, true) => Attested::Certify {
+            name,
+            qualified_name: Tpm2bName::empty(),
+        },
+        (other, _) => other,
     };
 
     let attest = Attest::new(
@@ -76,14 +99,30 @@ fn attest_and_sign(
     );
     let body = attest.to_bytes();
 
-    let signature = match object {
-        None => TpmtSignature::null(),
-        Some(object) => {
-            let scheme = signing_scheme(&object, in_scheme)?;
+    let signature = match (object, scheme) {
+        (Some(object), Some(scheme)) => {
             let hash_alg = scheme.hash_alg().ok_or(TpmRc(rc::SCHEME).with_parameter(1))?;
-            let digest = hash::digest(hash_alg, &body)?;
+            let digest = if anonymous {
+                // Clause 44.3.3.3 sets both qualifiedSigner and extraData to
+                // the Empty Buffer before the block is hashed, then Equation
+                // 61 gives the value to sign:
+                //   P := H(qualifyingData || H(TPMS_ATTEST))
+                let blinded = Attest::new(
+                    Tpm2bName::empty(),
+                    Tpm2bData::empty(),
+                    attest.clock_info,
+                    attest.firmware_version,
+                    attest.attested.clone(),
+                )
+                .to_bytes();
+                let inner = hash::digest(hash_alg, &blinded)?;
+                hash::digest_parts(hash_alg, &[extra_data.as_slice(), &inner])?
+            } else {
+                hash::digest(hash_alg, &body)?
+            };
             sign_digest(state, &object, &scheme, &digest)?
         }
+        _ => TpmtSignature::null(),
     };
     Ok((Tpm2bAttest::new(body)?, signature))
 }

@@ -582,6 +582,95 @@ fn the_version_185_signing_commands_take_the_commit_counter() {
 }
 
 #[test]
+fn an_ecdaa_attestation_hides_the_signer() {
+    // Part 1 clause 21.5: with an anonymous scheme the qualifiedSigner of the
+    // attestation is an Empty Buffer, and for TPM2_Certify the qualifiedName
+    // of the certified key is emptied too. Without that the signature would
+    // name exactly the key it was meant to hide.
+    let h = harness("anon");
+    // A restricted ECDAA signing key, which is what an attestation needs.
+    let (signer, _) = primary_with(&h, SIGNING | 0x0001_0000, 0x001A, Some(0));
+    let (subject, _) = primary_with(&h, SIGNING, 0x0018, None);
+
+    let r = commit(&h, signer, &empty_commit_params());
+    assert_eq!(r.code, rc::SUCCESS, "Commit -> {:08x}", r.code);
+    let (_, counter) = commit_response(&r.body);
+
+    let mut p = Writer::new();
+    p.u16(0); // qualifyingData
+    p.u16(0x001A); // ECDAA
+    p.u16(alg::SHA256);
+    p.u16(counter);
+    let auth2 = [PASSWORD.as_slice(), PASSWORD.as_slice()].concat();
+    let r = send(
+        &h,
+        &command(
+            st::SESSIONS,
+            cc::Certify,
+            &[subject, signer],
+            Some(&auth2),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_eq!(r.code, rc::SUCCESS, "Certify with ECDAA -> {:08x}", r.code);
+
+    // Read the attestation back and check what it does not say.
+    let mut rd = Reader::new(&r.body);
+    rd.u32().unwrap(); // parameterSize
+    let n = rd.u16().unwrap() as usize;
+    let attest = rd.take(n).unwrap().to_vec();
+    let mut ar = Reader::new(&attest);
+    assert_eq!(ar.u32().unwrap(), 0xff54_4347, "TPM_GENERATED");
+    ar.u16().unwrap(); // type
+    let signer_len = ar.u16().unwrap() as usize;
+    assert_eq!(signer_len, 0, "the qualifiedSigner names the key that signed");
+    let extra = ar.u16().unwrap() as usize;
+    ar.take(extra).unwrap();
+    // clockInfo is a clock, resetCount, restartCount and safe.
+    ar.u64().unwrap();
+    ar.u32().unwrap();
+    ar.u32().unwrap();
+    ar.u8().unwrap();
+    ar.u64().unwrap(); // firmwareVersion
+    let name_len = ar.u16().unwrap() as usize;
+    ar.take(name_len).unwrap();
+    let qualified_len = ar.u16().unwrap() as usize;
+    assert_eq!(
+        qualified_len, 0,
+        "the qualifiedName of the certified key names its parentage"
+    );
+
+    // The same certification with an ordinary scheme does name the signer.
+    let (plain, _) = primary_with(&h, SIGNING | 0x0001_0000, 0x0018, None);
+    let mut p = Writer::new();
+    p.u16(0);
+    p.u16(0x0010); // scheme NULL, so the key's own is used
+    let r = send(
+        &h,
+        &command(
+            st::SESSIONS,
+            cc::Certify,
+            &[subject, plain],
+            Some(&auth2),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_eq!(r.code, rc::SUCCESS, "Certify with ECDSA -> {:08x}", r.code);
+    let mut rd = Reader::new(&r.body);
+    rd.u32().unwrap();
+    let n = rd.u16().unwrap() as usize;
+    let attest = rd.take(n).unwrap().to_vec();
+    let mut ar = Reader::new(&attest);
+    ar.u32().unwrap();
+    ar.u16().unwrap();
+    assert_ne!(
+        ar.u16().unwrap(),
+        0,
+        "an ordinary attestation should name its signer"
+    );
+}
+
+#[test]
 fn two_phase_needs_an_unrestricted_decryption_key() {
     // Part 3 Table 54 names keyA "handle of an unrestricted ECC decryption
     // key". A signing key or a restricted one used as a key agreement scalar
