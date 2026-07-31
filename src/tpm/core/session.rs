@@ -576,10 +576,23 @@ impl SessionSlots {
         id
     }
 
+    /// True when a session of either type already holds this context
+    /// identifier, which is the low order three octets of its handle.
+    fn context_id_taken(&self, index: u32) -> bool {
+        self.sessions
+            .keys()
+            .chain(self.saved.keys())
+            .any(|h| h & 0x00FF_FFFF == index)
+    }
+
     /// Allocate a handle in the range that matches the session type.
     ///
     /// Part 2 Table 33 gives HMAC sessions the 0x02 range and policy sessions
-    /// the 0x03 range.
+    /// the 0x03 range. Part 1 clause 12.4 makes the low order three octets of
+    /// a session handle unique, so the identifier is taken from one pool
+    /// shared by both ranges. Two sessions that differed only in the upper
+    /// octet could not be told apart by the clause 28.4.1 flush, which names a
+    /// session by those three octets alone.
     pub fn allocate_handle(&self, session_type: u8) -> TpmResult<u32> {
         let base = if session_type == se::HMAC {
             hc::HMAC_SESSION_FIRST
@@ -587,9 +600,8 @@ impl SessionSlots {
             hc::POLICY_SESSION_FIRST
         };
         for i in 0..config::MAX_ACTIVE_SESSIONS as u32 {
-            let handle = base + i;
-            if !self.sessions.contains_key(&handle) && !self.saved.contains_key(&handle) {
-                return Ok(handle);
+            if !self.context_id_taken(i) {
+                return Ok(base + i);
             }
         }
         Err(TpmRc(rc::SESSION_HANDLES))
@@ -1046,6 +1058,27 @@ mod tests {
         slots.remove(h).unwrap();
         assert!(!slots.contains(h));
         assert_eq!(slots.remove(h).unwrap_err(), TpmRc(rc::HANDLE));
+    }
+
+    #[test]
+    fn a_context_identifier_is_used_by_only_one_session() {
+        // Part 1 clause 12.4 makes the low order three octets of a session
+        // handle unique. An HMAC session and a policy session that shared them
+        // could not be told apart by the clause 28.4.1 flush, which names a
+        // session by those octets and ignores the upper one.
+        let mut slots = SessionSlots::new();
+        let hmac = slots.allocate_handle(se::HMAC).unwrap();
+        slots.insert(session_with(hmac, se::HMAC)).unwrap();
+        let policy = slots.allocate_handle(se::POLICY).unwrap();
+        slots.insert(session_with(policy, se::POLICY)).unwrap();
+        assert_eq!(hmac, hc::HMAC_SESSION_FIRST);
+        assert_ne!(hmac & 0x00FF_FFFF, policy & 0x00FF_FFFF);
+
+        // Flushing one by an aliased handle leaves the other alone.
+        let alias = 0x2000_0000 | (policy & 0x00FF_FFFF);
+        assert_eq!(slots.flush(alias).unwrap(), policy);
+        assert!(slots.contains(hmac));
+        assert!(!slots.contains(policy));
     }
 
     #[test]
