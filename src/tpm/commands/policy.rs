@@ -330,7 +330,7 @@ fn authorization_timeout(
 /// Part 3 clause 23.2.2 refuses a second assertion that names a different
 /// command, so a later signed authorization cannot replace the restriction an
 /// earlier one set.
-fn set_cp_hash(s: &mut Session, cp_hash_a: &[u8]) -> TpmResult<()> {
+fn check_cp_hash(s: &Session, cp_hash_a: &[u8]) -> TpmResult<()> {
     if cp_hash_a.is_empty() {
         return Ok(());
     }
@@ -343,8 +343,14 @@ fn set_cp_hash(s: &mut Session, cp_hash_a: &[u8]) -> TpmResult<()> {
     if cp_hash_a.len() != hash::digest_size(s.auth_hash)? {
         return Err(TpmRc(rc::SIZE).with_parameter(2));
     }
-    s.policy.cp_hash = Some(cp_hash_a.to_vec());
     Ok(())
+}
+
+/// Apply the command restriction, once [`check_cp_hash`] has accepted it.
+fn set_cp_hash(s: &mut Session, cp_hash_a: &[u8]) {
+    if !cp_hash_a.is_empty() {
+        s.policy.cp_hash = Some(cp_hash_a.to_vec());
+    }
 }
 
 /// Record an expiry on a policy session.
@@ -487,9 +493,12 @@ pub fn policy_signed(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         !nonce_tpm.is_empty(),
     )?;
 
+    // Part 3 clause 5.6 leaves the TPM unchanged when a command fails, so the
+    // restriction is checked before the policy digest moves.
     let s = policy_session(state, policy_session_handle)?;
+    check_cp_hash(s, cp_hash_a.as_slice())?;
     policy_authorization_update(s, cc::PolicySigned, &auth_name, policy_ref.as_slice())?;
-    set_cp_hash(s, cp_hash_a.as_slice())?;
+    set_cp_hash(s, cp_hash_a.as_slice());
     if expiration < 0 {
         record_expiration(s, &timeout);
     }
@@ -546,9 +555,12 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         !nonce_tpm.is_empty(),
     )?;
 
+    // Part 3 clause 5.6 leaves the TPM unchanged when a command fails, so the
+    // restriction is checked before the policy digest moves.
     let s = policy_session(state, policy_session_handle)?;
+    check_cp_hash(s, cp_hash_a.as_slice())?;
     policy_authorization_update(s, cc::PolicySecret, &auth_name, policy_ref.as_slice())?;
-    set_cp_hash(s, cp_hash_a.as_slice())?;
+    set_cp_hash(s, cp_hash_a.as_slice());
     if expiration < 0 {
         record_expiration(s, &timeout);
     }
@@ -611,8 +623,9 @@ pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         cc::PolicySecret
     };
     let s = policy_session(state, policy_session_handle)?;
+    check_cp_hash(s, cp_hash_a.as_slice())?;
     policy_authorization_update(s, command_code, auth_name.as_slice(), policy_ref.as_slice())?;
-    set_cp_hash(s, cp_hash_a.as_slice())?;
+    set_cp_hash(s, cp_hash_a.as_slice());
     record_expiration(s, _timeout.as_slice());
     respond(|_| Ok(()))
 }
@@ -1265,27 +1278,26 @@ mod tests {
         let mut s = empty_policy_session();
 
         // An empty cpHashA leaves the session unrestricted.
-        set_cp_hash(&mut s, &[]).unwrap();
+        check_cp_hash(&s, &[]).unwrap();
+        set_cp_hash(&mut s, &[]);
         assert!(s.policy.cp_hash.is_none());
 
-        set_cp_hash(&mut s, &[1u8; 32]).unwrap();
+        check_cp_hash(&s, &[1u8; 32]).unwrap();
+        set_cp_hash(&mut s, &[1u8; 32]);
         assert_eq!(s.policy.cp_hash.as_deref(), Some(&[1u8; 32][..]));
 
         // Part 3 clause 23.2.2 refuses a second assertion that names a
-        // different command.
-        assert_eq!(
-            set_cp_hash(&mut s, &[2u8; 32]).unwrap_err(),
-            TpmRc(rc::CPHASH)
-        );
+        // different command, and the check runs before anything changes.
+        assert_eq!(check_cp_hash(&s, &[2u8; 32]).unwrap_err(), TpmRc(rc::CPHASH));
         assert_eq!(s.policy.cp_hash.as_deref(), Some(&[1u8; 32][..]));
 
         // Repeating the same one is allowed.
-        set_cp_hash(&mut s, &[1u8; 32]).unwrap();
+        check_cp_hash(&s, &[1u8; 32]).unwrap();
 
         // A value that is not the size of the policy digest is refused.
-        let mut fresh = empty_policy_session();
+        let fresh = empty_policy_session();
         assert_eq!(
-            set_cp_hash(&mut fresh, &[3u8; 20]).unwrap_err(),
+            check_cp_hash(&fresh, &[3u8; 20]).unwrap_err(),
             TpmRc(rc::SIZE).with_parameter(2)
         );
     }

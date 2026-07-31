@@ -142,22 +142,27 @@ pub fn signs_a_message(object: &Object) -> bool {
 
 /// Check that an object may perform a signing command.
 ///
-/// Part 3 clause 17.5.1 answers TPM_RC_KEY unless keyHandle is a signing key,
-/// and Table 115 gives message signing to HMAC alone, so a keyed hash object
-/// with any other scheme cannot sign either.
+/// Part 3 clause 20.5.1 answers TPM_RC_KEY unless the sign attribute is SET,
+/// and TPM_RC_ATTRIBUTES when x509sign is, because such a key signs only X.509
+/// certificates. Table 115 gives message signing to HMAC alone, so a keyed
+/// hash object with any other scheme is not a signing key at all. The errors
+/// carry no handle number; the caller adds the one its table gives.
 pub fn check_signing_key(object: &Object) -> TpmResult<()> {
     if !object
         .public
         .object_attributes
         .has(ObjectAttributes::SIGN_ENCRYPT)
     {
-        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
+        return Err(TpmRc(rc::KEY));
+    }
+    if object.public.object_attributes.has(ObjectAttributes::X509_SIGN) {
+        return Err(TpmRc(rc::ATTRIBUTES));
     }
     if object.public.object_type == alg::KEYEDHASH && !signs_a_message(object) {
-        return Err(TpmRc(rc::KEY).with_handle(1));
+        return Err(TpmRc(rc::KEY));
     }
     if object.sensitive.is_none() {
-        return Err(TpmRc(rc::KEY).with_handle(1));
+        return Err(TpmRc(rc::KEY));
     }
     Ok(())
 }
@@ -231,14 +236,26 @@ pub fn check_signature_scheme(object: &Object, signature: &TpmtSignature) -> Tpm
         return Ok(());
     }
     if scheme.scheme != signature.sig_alg {
-        return Err(TpmRc(rc::SCHEME).with_parameter(2));
+        return Err(TpmRc(rc::SCHEME));
     }
     match (scheme.hash_alg(), signature.hash_alg()) {
-        (Some(expected), Some(used)) if expected != used => {
-            Err(TpmRc(rc::SCHEME).with_parameter(2))
-        }
+        (Some(expected), Some(used)) if expected != used => Err(TpmRc(rc::SCHEME)),
         _ => Ok(()),
     }
+}
+
+/// Check that a digest is the size the signature hash produces.
+///
+/// Part 3 clause 20.4.1 refuses a digest that does not match, so a short one
+/// cannot be padded or truncated into a signature the TPM will vouch for.
+pub fn check_digest_size(digest: &[u8], signature: &TpmtSignature) -> TpmResult<()> {
+    let Some(hash_alg) = signature.hash_alg() else {
+        return Ok(());
+    };
+    if digest.len() != hash::digest_size(hash_alg)? {
+        return Err(TpmRc(rc::SIZE));
+    }
+    Ok(())
 }
 
 /// The HMAC of a signature verification ticket.
@@ -569,7 +586,7 @@ pub fn verify_digest_public(
 
 /// Verify `signature` over `digest` with the public part of `object`.
 fn verify_digest(object: &Object, digest: &[u8], signature: &TpmtSignature) -> TpmResult<()> {
-    check_signature_scheme(object, signature)?;
+    check_signature_scheme(object, signature).map_err(|e| e.with_parameter(2))?;
     match (&object.public.unique, &signature.signature) {
         (PublicId::Rsa(modulus), SignatureValue::Rsa(sig)) => {
             let PublicParms::Rsa { exponent, .. } = object.public.parameters else {
@@ -654,13 +671,8 @@ pub fn sign(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
         .clone();
-    if !object
-        .public
-        .object_attributes
-        .has(ObjectAttributes::SIGN_ENCRYPT)
-    {
-        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
-    }
+    // Part 3 clause 20.5.1 needs a signing key that is not reserved for X.509.
+    check_signing_key(&object).map_err(|e| e.with_handle(1))?;
     let scheme = signing_scheme(&object, &in_scheme)?;
     // Part 3 clause 20.5.1 requires the ticket for a restricted key, and
     // checks one that is supplied even when the key does not require it.
@@ -1144,6 +1156,76 @@ pub fn keyed_hash_data(object: &Object) -> TpmResult<Tpm2bSensitiveData> {
 mod tests {
     use super::*;
     use crate::tpm::structures::schemes::SchemeHash;
+
+    /// A keyed hash object with the given scheme and attributes.
+    fn keyed_hash(scheme: Scheme, attributes: u32) -> Object {
+        use crate::tpm::structures::keys::{PublicId, TpmtPublic, TpmtSensitive};
+        let public = TpmtPublic {
+            object_type: alg::KEYEDHASH,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(attributes),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::KeyedHash { scheme },
+            unique: PublicId::KeyedHash(Tpm2bDigest::empty()),
+        };
+        let sensitive = TpmtSensitive {
+            sensitive_type: alg::KEYEDHASH,
+            auth_value: Tpm2bDigest::empty(),
+            seed_value: Tpm2bDigest::empty(),
+            sensitive: crate::tpm::structures::keys::SensitiveComposite::Bits(
+                Tpm2bSensitiveData::new(vec![7u8; 32]).unwrap(),
+            ),
+        };
+        Object::new(public, Some(sensitive), rh::NULL, &[], false).unwrap()
+    }
+
+    #[test]
+    fn only_an_hmac_keyed_hash_key_is_a_signing_key() {
+        let hmac = Scheme::hash(alg::HMAC, alg::SHA256);
+        let xor = Scheme::hash(alg::XOR, alg::SHA256);
+        let sign = ObjectAttributes::SIGN_ENCRYPT;
+
+        assert!(signs_a_message(&keyed_hash(hmac, sign)));
+        check_signing_key(&keyed_hash(hmac, sign)).unwrap();
+
+        // Part 3 Table 115 gives message signing to HMAC alone, so an XOR
+        // obfuscation key is not a signing key even with the sign attribute.
+        let xor_key = keyed_hash(xor, sign);
+        assert!(!signs_a_message(&xor_key));
+        assert_eq!(check_signing_key(&xor_key).unwrap_err(), TpmRc(rc::KEY));
+
+        // Part 3 clause 20.5.1 needs the sign attribute.
+        assert_eq!(
+            check_signing_key(&keyed_hash(hmac, 0)).unwrap_err(),
+            TpmRc(rc::KEY)
+        );
+
+        // A key reserved for X.509 certificates signs nothing else.
+        assert_eq!(
+            check_signing_key(&keyed_hash(hmac, sign | ObjectAttributes::X509_SIGN))
+                .unwrap_err(),
+            TpmRc(rc::ATTRIBUTES)
+        );
+    }
+
+    #[test]
+    fn a_digest_has_to_be_the_size_of_the_signature_hash() {
+        let signature = TpmtSignature {
+            sig_alg: alg::ECDSA,
+            signature: SignatureValue::Ecc(SignatureEcc {
+                hash: alg::SHA256,
+                signature_r: Tpm2bEccParameter::new(vec![1u8; 32]).unwrap(),
+                signature_s: Tpm2bEccParameter::new(vec![2u8; 32]).unwrap(),
+            }),
+        };
+        check_digest_size(&[0u8; 32], &signature).unwrap();
+        // Part 3 clause 20.4.1 refuses a digest that is not the right size, so
+        // a short one cannot be truncated into a signature the TPM vouches for.
+        assert_eq!(
+            check_digest_size(&[0u8; 20], &signature).unwrap_err(),
+            TpmRc(rc::SIZE)
+        );
+    }
 
     #[test]
     fn the_object_scheme_wins_when_it_has_one() {
