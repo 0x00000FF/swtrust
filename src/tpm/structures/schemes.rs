@@ -40,6 +40,15 @@ impl Unmarshal for SchemeHash {
     }
 }
 
+/// True when a signing scheme is anonymous.
+///
+/// Part 2 clause 11.2.1.4 gives TPMI_ALG_ANONYMOUS_SIGNING as the schemes that
+/// hide the identity of the signer, which is ECDAA. Part 3 clause 19.2.1
+/// requires TPM2_Commit to be given a key with one of them.
+pub fn is_anonymous(scheme: u16) -> bool {
+    matches!(scheme, crate::tpm::constants::alg::ECDAA)
+}
+
 /// TPMS_SCHEME_ECDAA, Part 2 Table 174.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SchemeEcdaa {

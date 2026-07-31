@@ -34,6 +34,26 @@ pub const MAX_LOADED_OBJECTS: u16 = 32;
 pub const MAX_LOADED_SESSIONS: u16 = 32;
 /// Maximum number of sessions the TPM tracks, loaded or saved.
 pub const MAX_ACTIVE_SESSIONS: u16 = 64;
+
+/// Split ECC operations that may be outstanding at once.
+///
+/// Part 1 clause 44.2.2 tracks outstanding commits in a bit array whose length
+/// is a power of two, and TPM2_GetCapability reports this as
+/// TPM_PT_SPLIT_MAX.
+pub const MAX_COMMIT_SEQUENCES: u16 = 128;
+
+/// Size of the commit nonce, in octets.
+///
+/// Clause 44.2.3 asks for twice the security strength of any ECDAA key the TPM
+/// supports. The largest curve here is NIST P-521, whose strength is 256 bits,
+/// so the nonce is 512 bits.
+pub const COMMIT_NONCE_BYTES: usize = 64;
+
+/// The hash used to derive a commit value that has no key behind it.
+///
+/// TPM2_EC_Ephemeral names no key, so Equation 60 has no nameAlg to take from
+/// one. The strongest hash this TPM implements is used instead.
+pub const COMMIT_EPHEMERAL_HASH_ALG: u16 = crate::tpm::constants::alg::SHA384;
 /// Maximum number of sessions in the authorization area of one command.
 pub const MAX_SESSION_NUM: usize = 3;
 /// Maximum number of handles in the handle area of one command.

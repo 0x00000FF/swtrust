@@ -1,6 +1,7 @@
 //! The one shot and sequence signing commands added in version 185, and the
 //! split ECC operations of Part 3 clause 19.
 
+use crate::tpm::config;
 use crate::tpm::constants::{alg, rc, rh, st};
 use crate::tpm::core::object::{Object, Sequence, SequenceKind, Slot};
 use crate::tpm::core::state::TpmState;
@@ -507,67 +508,109 @@ pub fn commit(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let Some(sensitive) = &object.sensitive else {
         return Err(TpmRc(rc::HANDLE).with_handle(1));
     };
-    let PublicParms::Ecc { curve_id, .. } = object.public.parameters else {
+    let PublicParms::Ecc { curve_id, scheme, .. } = object.public.parameters else {
         return Err(TpmRc(rc::TYPE));
     };
+    // Part 3 clause 19.2.1 requires the scheme of the key to be anonymous.
+    if !crate::tpm::structures::schemes::is_anonymous(scheme.scheme) {
+        return Err(TpmRc(rc::SCHEME).with_handle(1));
+    }
     let curve = ecc::Curve::new(curve_id)?;
     let private = crate::tpm::crypto::bn::BigNum::from_bytes(sensitive.sensitive.as_slice())?;
+    let ctx = crate::tpm::crypto::bn::BnCtx::new()?;
 
-    // s2 and y2 together name a second point; both must be given or neither.
+    // Part 1 clause 44.2.3 step 1: s2 and y2 are given together or not at all.
     if s2.is_empty() != y2.is_empty() {
         return Err(TpmRc(rc::SIZE).with_parameter(2));
     }
 
-    let k = if p1.point.is_empty() {
-        EccPoint::default()
+    // Steps 3 and 4: the second base point comes from the digest of s2 as its
+    // x coordinate, reduced by the field modulus, with y2 as its y.
+    let second = if s2.is_empty() {
+        None
     } else {
-        let point = ecc::Point::from_coordinates(
-            &curve,
-            p1.point.x.as_slice(),
-            p1.point.y.as_slice(),
-        )
-        .map_err(|e| e.with_parameter(1))?;
-        let product = point.multiply(&curve, &private)?;
-        let (x, y) = product.coordinates(&curve)?;
-        EccPoint {
-            x: Tpm2bEccParameter::new(x)?,
-            y: Tpm2bEccParameter::new(y)?,
-        }
+        let (p, _, _) = curve.parameters()?;
+        let digest = hash::digest(object.public.name_alg, s2.as_slice())?;
+        let x2 = crate::tpm::crypto::bn::BigNum::from_bytes(&digest)?
+            .modulo(&p, &ctx)?
+            .to_bytes_padded(curve.coordinate_size())?;
+        let point = ecc::Point::from_coordinates(&curve, &x2, y2.as_slice())
+            .map_err(|_| TpmRc(rc::ECC_POINT).with_parameter(2))?;
+        Some(point)
     };
 
-    // Generated through ecc::generate rather than assembled here, so the
-    // pair-wise consistency test of FIPS 140-3 Table 40 covers this pair too.
-    let ephemeral = ecc::generate(curve.curve_id(), &mut state.rng)?;
-    let e = EccPoint {
-        x: Tpm2bEccParameter::new(ephemeral.public_x.clone())?,
-        y: Tpm2bEccParameter::new(ephemeral.public_y.clone())?,
+    // Step 5: a P1 that is given has to be on the curve as well.
+    let first = if p1.point.is_empty() {
+        None
+    } else {
+        Some(
+            ecc::Point::from_coordinates(&curve, p1.point.x.as_slice(), p1.point.y.as_slice())
+                .map_err(|_| TpmRc(rc::ECC_POINT).with_parameter(1))?,
+        )
     };
-    // With no second point supplied, L is the point at infinity.
-    let l = EccPoint::default();
+
+    // Steps 7 and 8: the commit value, reduced by the order of the curve.
+    let order = curve.order()?;
+    let bits = ((order.bits() + 7) / 8 * 8) as u32;
+    let (r_bytes, counter) = state
+        .commits
+        .commit(object.public.name_alg, &object.name, bits)?;
+    let r_value = crate::tpm::crypto::bn::BigNum::from_bytes(&r_bytes)?.modulo(&order, &ctx)?;
+
+    let as_point = |p: ecc::Point| -> TpmResult<EccPoint> {
+        // Step 12: none of the three may be the point at infinity.
+        if p.is_at_infinity(&curve) {
+            return Err(TpmRc(rc::NO_RESULT));
+        }
+        let (x, y) = p.coordinates(&curve)?;
+        Ok(EccPoint {
+            x: Tpm2bEccParameter::new(x)?,
+            y: Tpm2bEccParameter::new(y)?,
+        })
+    };
+
+    // Steps 6, 9, 10 and 11.
+    let mut k = EccPoint::default();
+    let mut l = EccPoint::default();
+    let mut e = EccPoint::default();
+    if let Some(base) = &second {
+        k = as_point(base.multiply(&curve, &private)?)?;
+        l = as_point(base.multiply(&curve, &r_value)?)?;
+    }
+    if let Some(point) = &first {
+        e = as_point(point.multiply(&curve, &r_value)?)?;
+    } else if second.is_none() {
+        e = as_point(ecc::multiply_generator(&curve, &r_value)?)?;
+    }
 
     respond(move |w| {
         Tpm2bEccPoint { point: k }.marshal(w);
         Tpm2bEccPoint { point: l }.marshal(w);
         Tpm2bEccPoint { point: e }.marshal(w);
-        w.u16(0);
+        w.u16(counter);
         Ok(())
     })
 }
 
 /// TPM2_ZGen_2Phase, Part 3 clause 14.8.
-pub fn zgen_2phase(state: &TpmState, request: &Request) -> TpmResult<Response> {
+pub fn zgen_2phase(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
     let in_qs_b = Tpm2bEccPoint::unmarshal(&mut r)?;
     let in_qe_b = Tpm2bEccPoint::unmarshal(&mut r)?;
     let in_scheme = r.u16()?;
-    let _counter = r.u16()?;
+    let counter = r.u16()?;
     r.expect_end()?;
 
-    if !matches!(in_scheme, alg::ECDH | alg::ECMQV | alg::SM2) {
+    if !matches!(in_scheme, alg::ECDH | alg::ECMQV) {
         return Err(TpmRc(rc::SCHEME).with_parameter(3));
     }
-    let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
+    let object = object_of(state, key_handle)
+        .map_err(|e| e.with_handle(1))?
+        .clone();
+    if object.public.object_type != alg::ECC {
+        return Err(TpmRc(rc::TYPE).with_handle(1));
+    }
     let Some(sensitive) = &object.sensitive else {
         return Err(TpmRc(rc::HANDLE).with_handle(1));
     };
@@ -575,42 +618,98 @@ pub fn zgen_2phase(state: &TpmState, request: &Request) -> TpmResult<Response> {
         return Err(TpmRc(rc::TYPE).with_handle(1));
     };
     let curve = ecc::Curve::new(curve_id)?;
-    let private = crate::tpm::crypto::bn::BigNum::from_bytes(sensitive.sensitive.as_slice())?;
+    let ctx = crate::tpm::crypto::bn::BnCtx::new()?;
+    let order = curve.order()?;
+    let d_s = crate::tpm::crypto::bn::BigNum::from_bytes(sensitive.sensitive.as_slice())?;
 
-    // The static half uses the static peer point, the ephemeral half the
-    // ephemeral one.
-    let (sx, sy) = ecc::ecdh(
+    // Part 1 clause 44.8.4.3 step 4: both peer points are on the curve. This
+    // runs before the commit is spent, so a bad point does not consume one.
+    let q_s_b = ecc::Point::from_coordinates(
         &curve,
-        &private,
         in_qs_b.point.x.as_slice(),
         in_qs_b.point.y.as_slice(),
     )
     .map_err(|e| e.with_parameter(1))?;
-    let (ex, ey) = ecc::ecdh(
+    let q_e_b = ecc::Point::from_coordinates(
         &curve,
-        &private,
         in_qe_b.point.x.as_slice(),
         in_qe_b.point.y.as_slice(),
     )
     .map_err(|e| e.with_parameter(2))?;
 
+    // Clause 44.2.5: the ephemeral private key is the commit value the counter
+    // names. TPM2_EC_Ephemeral made it, so the derivation uses the same empty
+    // Name it did, and using it here spends it.
+    let bits = ((order.bits() + 7) / 8 * 8) as u32;
+    let r_bytes = state
+        .commits
+        .use_counter(config::COMMIT_EPHEMERAL_HASH_ALG, &[], counter, bits)
+        .map_err(|_| TpmRc(rc::VALUE).with_parameter(4))?;
+    let d_e = crate::tpm::crypto::bn::BigNum::from_bytes(&r_bytes)?.modulo(&order, &ctx)?;
+    if d_e.is_zero() {
+        return Err(TpmRc(rc::NO_RESULT));
+    }
+
+    // A point at infinity is reported as a point with empty coordinates, which
+    // is what the notes in clause 44.8.4 ask for.
+    let as_point = |p: ecc::Point| -> TpmResult<EccPoint> {
+        if p.is_at_infinity(&curve) {
+            return Ok(EccPoint::default());
+        }
+        let (x, y) = p.coordinates(&curve)?;
+        Ok(EccPoint {
+            x: Tpm2bEccParameter::new(x)?,
+            y: Tpm2bEccParameter::new(y)?,
+        })
+    };
+
+    let (z1, z2) = if in_scheme == alg::ECDH {
+        // Clause 44.8.4.2, the Full Unified Model: the static key gives the
+        // first result and the ephemeral key the second.
+        (
+            as_point(q_s_b.multiply(&curve, &d_s)?)?,
+            as_point(q_e_b.multiply(&curve, &d_e)?)?,
+        )
+    } else {
+        // Clause 44.8.4.3, Full MQV.
+        let q_e_a = ecc::multiply_generator(&curve, &d_e)?;
+        let t_a = d_e
+            .add(&d_s.mul(&avf(&curve, &q_e_a, &ctx)?, &ctx)?)?
+            .modulo(&order, &ctx)?;
+        // Qe,B + [avf(Qe,B)]Qs,B
+        let base = q_e_b.add(&curve, &q_s_b.multiply(&curve, &avf(&curve, &q_e_b, &ctx)?)?)?;
+        // The cofactor of every curve this TPM implements is one, so [h * tA]
+        // is [tA].
+        (as_point(base.multiply(&curve, &t_a)?)?, EccPoint::default())
+    };
+
     respond(move |w| {
-        Tpm2bEccPoint {
-            point: EccPoint {
-                x: Tpm2bEccParameter::new(sx)?,
-                y: Tpm2bEccParameter::new(sy)?,
-            },
-        }
-        .marshal(w);
-        Tpm2bEccPoint {
-            point: EccPoint {
-                x: Tpm2bEccParameter::new(ex)?,
-                y: Tpm2bEccParameter::new(ey)?,
-            },
-        }
-        .marshal(w);
+        Tpm2bEccPoint { point: z1 }.marshal(w);
+        Tpm2bEccPoint { point: z2 }.marshal(w);
         Ok(())
     })
+}
+
+/// The associated value function of Part 1 clause 44.8.4.3.
+///
+/// ```text
+/// f  := ceil(ceil(log2(n)) / 2)
+/// x' := 2^f + (x mod 2^f)
+/// ```
+fn avf(
+    curve: &ecc::Curve,
+    point: &ecc::Point,
+    ctx: &crate::tpm::crypto::bn::BnCtx,
+) -> TpmResult<crate::tpm::crypto::bn::BigNum> {
+    use crate::tpm::crypto::bn::BigNum;
+    let order = curve.order()?;
+    let f = (order.bits() + 1) / 2;
+    let (x, _) = point.coordinates(curve)?;
+    let x = BigNum::from_bytes(&x)?;
+    // 2^f, as a number with only bit f set.
+    let mut power = BigNum::new()?;
+    power.set_bit(f)?;
+    Ok(x.modulo(&power, ctx)?.add(&power)?)
 }
 
 /// TPM2_Encapsulate, Part 3 clause 14.11.

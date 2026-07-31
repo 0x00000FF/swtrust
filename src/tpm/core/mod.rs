@@ -1,5 +1,6 @@
 //! The TPM state machine described in Part 1.
 
+pub mod commit;
 pub mod hierarchy;
 pub mod names;
 pub mod nv;

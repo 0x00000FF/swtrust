@@ -537,28 +537,56 @@ pub fn ecschnorr_verify(
 /// takes the commitment scalar `k` and the digest and returns `(r, s)` where
 /// `s = k + r * d mod n`. `r` is supplied by the caller as the hash of the
 /// commitment and the message.
+/// Sign with ECDAA, Part 1 clause 44.3.3.3.
+///
+/// The commit value `r` comes from an earlier TPM2_Commit, which is what makes
+/// this a split operation. The algorithm is a modified Schnorr signature:
+///
+/// ```text
+/// 1. set k to a random value such that 0 < k < n
+/// 2. compute T := H(k || P) mod n
+/// 3. compute s := (r + T*ds) mod n
+/// 4. if s = 0, output failure
+/// ```
+///
+/// The signature is the pair (k, s), and the clause puts k in the R parameter
+/// of the signature structure.
 pub fn ecdaa_sign(
     curve: &Curve,
     private: &BigNum,
-    commit_scalar: &BigNum,
-    r_value: &[u8],
+    commit_r: &[u8],
+    hash_alg: u16,
+    digest: &[u8],
+    rng: &mut dyn Rng,
 ) -> TpmResult<EccSignature> {
     let ctx = BnCtx::new()?;
     let order = curve.order()?;
     let size = curve.coordinate_size();
-    let r = BigNum::from_bytes(r_value)?.modulo(&order, &ctx)?;
+    let r = BigNum::from_bytes(commit_r)?.modulo(&order, &ctx)?;
     if r.is_zero() {
         return Err(TpmRc(rc::VALUE));
     }
-    let rd = r.mul(private, &ctx)?.modulo(&order, &ctx)?;
-    let s = commit_scalar.add(&rd)?.modulo(&order, &ctx)?;
-    if s.is_zero() {
-        return Err(TpmRc(rc::NO_RESULT));
+
+    for _ in 0..1000 {
+        // Step 1.
+        let k = private_key_from_rng(curve, rng)?;
+        let k_bytes = k.to_bytes_padded(size)?;
+        // Step 2. P is the digest the caller asked to have signed.
+        let t = BigNum::from_bytes(&super::hash::digest_parts(hash_alg, &[&k_bytes, digest])?)?
+            .modulo(&order, &ctx)?;
+        // Step 3.
+        let td = t.mul(private, &ctx)?.modulo(&order, &ctx)?;
+        let s = r.add(&td)?.modulo(&order, &ctx)?;
+        // Step 4.
+        if s.is_zero() {
+            continue;
+        }
+        return Ok(EccSignature {
+            r: k_bytes,
+            s: s.to_bytes_padded(size)?,
+        });
     }
-    Ok(EccSignature {
-        r: r.to_bytes_padded(size)?,
-        s: s.to_bytes_padded(size)?,
-    })
+    Err(TpmRc(rc::NO_RESULT))
 }
 
 #[cfg(test)]
@@ -805,29 +833,66 @@ mod tests {
     }
 
     #[test]
-    fn ecdaa_produces_s_from_the_commitment() {
-        let mut r = rng();
-        let key = generate(curve::NIST_P256, &mut r).unwrap();
+    fn ecdaa_follows_the_modified_schnorr_of_clause_44_3_3_3() {
+        // s := (r + T*ds) mod n, where T := H(k || P) mod n and the signature
+        // is the pair (k, s).
+        let mut rng_a = rng();
+        let key = generate(curve::NIST_P256, &mut rng_a).unwrap();
         let ctx = BnCtx::new().unwrap();
         let order = key.curve.order().unwrap();
-        let k = private_key_from_rng(&key.curve, &mut r).unwrap();
-        let r_value = vec![0x11u8; 32];
-        let sig = ecdaa_sign(&key.curve, &key.private, &k, &r_value).unwrap();
+        let commit_r = vec![0x11u8; 32];
+        let digest = [0x5au8; 32];
 
-        // s must satisfy s = k + r * d mod n.
-        let r_bn = BigNum::from_bytes(&sig.r).unwrap();
-        let rd = r_bn.mul(&key.private, &ctx).unwrap().modulo(&order, &ctx).unwrap();
-        let expected = k.add(&rd).unwrap().modulo(&order, &ctx).unwrap();
+        let sig = ecdaa_sign(
+            &key.curve,
+            &key.private,
+            &commit_r,
+            alg::SHA256,
+            &digest,
+            &mut rng_a,
+        )
+        .unwrap();
+
+        // The R half of the signature is k, so T can be recomputed from it.
+        let t = BigNum::from_bytes(
+            &crate::tpm::crypto::hash::digest_parts(alg::SHA256, &[&sig.r[..], &digest[..]])
+                .unwrap(),
+        )
+        .unwrap()
+        .modulo(&order, &ctx)
+        .unwrap();
+        let r = BigNum::from_bytes(&commit_r).unwrap().modulo(&order, &ctx).unwrap();
+        let td = t.mul(&key.private, &ctx).unwrap().modulo(&order, &ctx).unwrap();
+        let expected = r.add(&td).unwrap().modulo(&order, &ctx).unwrap();
         assert_eq!(sig.s, expected.to_bytes_padded(32).unwrap());
+        assert_eq!(sig.r.len(), 32);
     }
 
     #[test]
-    fn ecdaa_rejects_a_zero_r() {
+    fn ecdaa_uses_the_commit_value_it_was_given() {
+        // A different commit value has to give a different signature, or the
+        // split operation would not be bound to its commit.
+        let mut rng_a = rng();
+        let key = generate(curve::NIST_P256, &mut rng_a).unwrap();
+        let digest = [0x5au8; 32];
+        let mut one = rng();
+        let mut two = rng();
+        let a = ecdaa_sign(&key.curve, &key.private, &[0x11u8; 32], alg::SHA256, &digest, &mut one)
+            .unwrap();
+        let b = ecdaa_sign(&key.curve, &key.private, &[0x22u8; 32], alg::SHA256, &digest, &mut two)
+            .unwrap();
+        // The same generator gives the same k, so only the commit differs.
+        assert_eq!(a.r, b.r);
+        assert_ne!(a.s, b.s);
+    }
+
+    #[test]
+    fn ecdaa_rejects_a_zero_commit_value() {
         let mut r = rng();
         let key = generate(curve::NIST_P256, &mut r).unwrap();
-        let k = private_key_from_rng(&key.curve, &mut r).unwrap();
         assert_eq!(
-            ecdaa_sign(&key.curve, &key.private, &k, &[0u8; 32]).unwrap_err(),
+            ecdaa_sign(&key.curve, &key.private, &[0u8; 32], alg::SHA256, &[0u8; 32], &mut r)
+                .unwrap_err(),
             TpmRc(rc::VALUE)
         );
     }

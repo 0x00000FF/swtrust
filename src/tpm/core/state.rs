@@ -202,6 +202,9 @@ pub struct TpmState {
     /// place of the digest so a failure says which test it was.
     pub test_failure: Option<String>,
     pub rng: Drbg,
+    /// Outstanding split ECC operations, Part 1 clause 44.2. The nonce behind
+    /// them is chosen at each TPM Reset, so a commit lives no longer than that.
+    pub commits: crate::tpm::core::commit::Commits,
     /// Data collected between _TPM_Hash_Start and _TPM_Hash_End.
     pub hcrtm_buffer: Option<Vec<u8>>,
     /// Set by the running command to keep itself out of the command audit.
@@ -262,6 +265,7 @@ impl TpmState {
             nv_available: true,
             failure_mode: false,
             self_test_done: true,
+            commits: crate::tpm::core::commit::Commits::new(),
             test_digest: Vec::new(),
             test_failure: None,
             rng,
@@ -302,6 +306,12 @@ impl TpmState {
             self.audit.digest.clear();
         }
         self.audit.exclusive_session = rh::UNASSIGNED;
+        // Part 1 clause 44.2.2: a new commit nonce and a counter of zero at
+        // each TPM Reset. Every outstanding split operation goes with it,
+        // because the value it stood for cannot be derived from a new nonce.
+        // A TPM Restart is a Reset for this purpose too, since the nonce is
+        // never written to the state file.
+        self.commits.reset(&mut self.rng)?;
         self.begin_operation(!disorderly);
         Ok(())
     }

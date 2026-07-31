@@ -16,7 +16,7 @@ use crate::tpm::structures::base::{
 };
 use crate::tpm::structures::keys::{PublicId, PublicParms};
 use crate::tpm::structures::lists::TpmlDigestValues;
-use crate::tpm::structures::schemes::{EccPoint, Scheme, Tpm2bEccPoint};
+use crate::tpm::structures::schemes::{EccPoint, Scheme, SchemeDetail, Tpm2bEccPoint};
 use crate::tpm::structures::signature::{
     SignatureEcc, SignatureRsa, SignatureValue, Ticket, TpmtSignature, VerifiedTicket,
 };
@@ -559,6 +559,29 @@ pub fn sign_digest(
                 alg::ECDSA => ecc::ecdsa_sign(&curve, &private, digest, &mut state.rng)?,
                 alg::ECSCHNORR => {
                     ecc::ecschnorr_sign(&curve, &private, hash_alg, digest, &mut state.rng)?
+                }
+                // Part 1 clause 44.3.3.1 lets an ECDAA key be used in any
+                // command that produces a signature. The commit value comes
+                // from an earlier TPM2_Commit, named by the counter the scheme
+                // carries, and using it here spends it.
+                alg::ECDAA => {
+                    let SchemeDetail::Ecdaa(detail) = scheme.detail else {
+                        return Err(TpmRc(rc::SCHEME).with_parameter(2));
+                    };
+                    let order = curve.order()?;
+                    let bits = ((order.bits() + 7) / 8 * 8) as u32;
+                    let commit_r = state
+                        .commits
+                        .use_counter(object.public.name_alg, &object.name, detail.count, bits)
+                        .map_err(|_| TpmRc(rc::VALUE).with_parameter(2))?;
+                    ecc::ecdaa_sign(
+                        &curve,
+                        &private,
+                        &commit_r,
+                        hash_alg,
+                        digest,
+                        &mut state.rng,
+                    )?
                 }
                 _ => return Err(TpmRc(rc::SCHEME).with_parameter(2)),
             };
@@ -1137,27 +1160,37 @@ pub fn ec_ephemeral(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let mut r = request.reader();
     let curve_id = r.u16()?;
     r.expect_end()?;
-    // A curve this TPM does not offer is the caller's mistake, but a failed
-    // pair-wise consistency test is not: reporting it as TPM_RC_CURVE would
-    // hide a self test failure that has to reach failure mode.
-    let key = ecc::generate(curve_id, &mut state.rng).map_err(|e| {
-        if e.value() == rc::FAILURE {
-            e
-        } else {
-            TpmRc(rc::CURVE).with_parameter(1)
-        }
-    })?;
-    // The commit counter identifies the ephemeral value for a later
-    // TPM2_Commit; this TPM does not retain commitments, so it is always zero.
+    let curve = ecc::Curve::new(curve_id).map_err(|_| TpmRc(rc::CURVE).with_parameter(1))?;
+
+    // Part 1 clause 44.2.4: the ephemeral key is the commit value, and the
+    // public half is [r]G. There is no key handle here, so the derivation of
+    // Equation 60 uses an empty Name. That also keeps a counter meant for a
+    // two-phase exchange from producing the value a TPM2_Commit would.
+    let order = curve.order()?;
+    let bits = ((order.bits() + 7) / 8 * 8) as u32;
+    let (r_bytes, counter) = state
+        .commits
+        .commit(config::COMMIT_EPHEMERAL_HASH_ALG, &[], bits)?;
+    let ctx = crate::tpm::crypto::bn::BnCtx::new()?;
+    let private = crate::tpm::crypto::bn::BigNum::from_bytes(&r_bytes)?.modulo(&order, &ctx)?;
+    if private.is_zero() {
+        return Err(TpmRc(rc::NO_RESULT));
+    }
+    let point = ecc::multiply_generator(&curve, &private)?;
+    if point.is_at_infinity(&curve) {
+        return Err(TpmRc(rc::NO_RESULT));
+    }
+    let (x, y) = point.coordinates(&curve)?;
+
     respond(move |w| {
         Tpm2bEccPoint {
             point: EccPoint {
-                x: Tpm2bEccParameter::new(key.public_x)?,
-                y: Tpm2bEccParameter::new(key.public_y)?,
+                x: Tpm2bEccParameter::new(x)?,
+                y: Tpm2bEccParameter::new(y)?,
             },
         }
         .marshal(w);
-        w.u16(0);
+        w.u16(counter);
         Ok(())
     })
 }

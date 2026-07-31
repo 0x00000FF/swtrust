@@ -286,8 +286,9 @@ fn commit_generates_a_point_that_passed_its_pairwise_test() {
     t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000);
     t.u16(0);
     t.u16(0x0010); // symmetric NULL
-    t.u16(0x001C); // TPM_ALG_ECDAA, which TPM2_Commit needs
+    t.u16(0x001A); // TPM_ALG_ECDAA, the anonymous scheme TPM2_Commit needs
     t.u16(alg::SHA256);
+    t.u16(0); // TPMS_SCHEME_ECDAA carries a count as well as a hash
     t.u16(0x0003); // NIST P-256
     t.u16(0x0010);
     t.u16(0);
