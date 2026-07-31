@@ -131,17 +131,16 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
 
     // The four hierarchies, the lockout authority and the platform NV control.
     //
-    // Part 1 clause 19.8.2 exempts platformAuth from dictionary attack
-    // protection, because the platform is trusted to rate limit itself. The
-    // storage and endorsement hierarchies are protected, and the NULL hierarchy
-    // has no authorization value to guess.
+    // Part 1 clause 16.8.1 leaves every permanent entity other than
+    // TPM_RH_LOCKOUT out of dictionary attack protection, because their
+    // authorization values are expected to be high entropy or well known.
     if crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(handle) {
         let h = state.hierarchies.get(handle)?;
         return Ok(Entity {
             name,
             auth: h.auth.clone(),
             policy: policy_of(&h.policy),
-            uses_lockout: matches!(handle, rh::OWNER | rh::ENDORSEMENT),
+            uses_lockout: false,
             user_with_auth: true,
         });
     }
@@ -380,30 +379,41 @@ pub fn encrypt_parameters(
     Ok(())
 }
 
-/// The nonceTPM of the decrypt and encrypt sessions, when they are not the
-/// session whose HMAC is being computed.
+/// The nonceTPM of the decrypt and encrypt sessions.
 ///
-/// Part 1 clause 19.6.3.4 folds these into the HMAC of the first authorization
+/// Part 1 clause 16.6.3.4 folds these into the HMAC of the first session only,
 /// so an attacker cannot strip an encryption session and receive plaintext.
+/// The decrypt nonce goes in even when that session is the first one itself,
+/// and the encrypt nonce is left out when one session does both, so the same
+/// value is never added twice.
 pub fn auxiliary_nonces(
     state: &TpmState,
     request: &Request,
     for_index: usize,
 ) -> (Vec<u8>, Vec<u8>) {
-    let nonce_of = |attribute: u8| -> Vec<u8> {
+    if for_index != 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let position = |attribute: u8| {
         request
             .sessions
             .iter()
-            .enumerate()
-            .find(|(i, s)| *i != for_index && s.attributes.has(attribute))
-            .and_then(|(_, s)| state.sessions.get(s.handle).ok())
+            .position(|s| s.attributes.has(attribute))
+    };
+    let nonce_at = |index: Option<usize>| -> Vec<u8> {
+        index
+            .and_then(|i| state.sessions.get(request.sessions[i].handle).ok())
             .map(|s| s.nonce_tpm.clone())
             .unwrap_or_default()
     };
-    (
-        nonce_of(SessionAttributes::DECRYPT),
-        nonce_of(SessionAttributes::ENCRYPT),
-    )
+    let decrypt_index = position(SessionAttributes::DECRYPT);
+    let encrypt_index = position(SessionAttributes::ENCRYPT);
+    let encrypt = if encrypt_index.is_some() && encrypt_index != decrypt_index {
+        nonce_at(encrypt_index)
+    } else {
+        Vec::new()
+    };
+    (nonce_at(decrypt_index), encrypt)
 }
 
 /// The body of the sized parameter at position `index`, counting from zero.
@@ -511,15 +521,16 @@ pub fn check_authorization(
 ) -> TpmResult<()> {
     let input = &request.sessions[index];
     let position = index + 1;
+    let protected = da_protected(state, request, index, entity);
 
-    check_lockout(state, request, index, entity)?;
+    check_lockout(state, request, index, entity, protected)?;
 
     // A password session carries the authorization value in the clear.
     if input.handle == rh::RS_PW {
         if !entity.user_with_auth {
             return Err(TpmRc(rc::AUTH_TYPE).with_session(position));
         }
-        return compare_auth(state, &input.hmac, &entity.auth, entity.uses_lockout)
+        return compare_auth(state, &input.hmac, &entity.auth, protected)
             .map_err(|e| e.with_session(position));
     }
 
@@ -534,7 +545,7 @@ pub fn check_authorization(
     }
 
     if s.is_policy() {
-        check_policy(state, request, index, entity, cp_hash, &s)?;
+        check_policy(state, request, index, entity, cp_hash, &s, protected)?;
     } else {
         if !entity.user_with_auth {
             return Err(TpmRc(rc::AUTH_TYPE).with_session(position));
@@ -552,14 +563,40 @@ pub fn check_authorization(
             input.attributes,
         )?;
         if !constant_time_eq(&expected, &input.hmac) {
-            return record_failure(state, entity.uses_lockout)
+            return record_failure(state, protected)
                 .and(Err(TpmRc(rc::AUTH_FAIL).with_session(position)));
         }
-        if entity.uses_lockout {
+        if protected {
             clear_failures(state);
         }
     }
     Ok(())
+}
+
+/// True when a failed authorization here has to count against the lockout.
+///
+/// Part 1 clause 16.8.7 counts a failure when either the entity being
+/// authorized or the entity the session is bound to is protected. Without the
+/// second half, an attacker could guess the value of a protected entity by
+/// binding a session to it and using that session against an exempt one.
+fn da_protected(
+    state: &TpmState,
+    request: &Request,
+    index: usize,
+    entity: &Entity,
+) -> bool {
+    if entity.uses_lockout {
+        return true;
+    }
+    let input = &request.sessions[index];
+    if input.handle == rh::RS_PW {
+        return false;
+    }
+    state
+        .sessions
+        .get(input.handle)
+        .map(|s| s.bind_uses_lockout)
+        .unwrap_or(false)
 }
 
 /// Refuse an authorization that Lockout mode blocks.
@@ -574,8 +611,9 @@ fn check_lockout(
     request: &Request,
     index: usize,
     entity: &Entity,
+    protected: bool,
 ) -> TpmResult<()> {
-    if !state.lockout.in_lockout {
+    if !state.lockout.in_lockout || !protected {
         return Ok(());
     }
     // TPM2_DictionaryAttackLockReset is how a caller leaves Lockout mode, so
@@ -590,18 +628,19 @@ fn check_lockout(
         match state.sessions.get(input.handle) {
             Ok(s) => {
                 // Part 1 clause 16.8.7 keeps the protection of the bound
-                // entity on every use of the session, whatever it authorizes.
-                if s.bind_uses_lockout {
-                    return Err(TpmRc(rc::LOCKOUT));
-                }
-                !s.is_policy() || s.policy.auth_value_needed || s.policy.password_needed
+                // entity on every use of the session, whatever it authorizes,
+                // because the session key already carries that value.
+                s.bind_uses_lockout
+                    || !s.is_policy()
+                    || s.policy.auth_value_needed
+                    || s.policy.password_needed
             }
             // The session is unknown, so treat it as one that would use the
             // value and let the authorization itself report the handle.
             Err(_) => true,
         }
     };
-    if uses_auth_value && entity.uses_lockout {
+    if uses_auth_value {
         return Err(TpmRc(rc::LOCKOUT));
     }
     Ok(())
@@ -695,6 +734,7 @@ fn check_policy(
     entity: &Entity,
     cp_hash: &[u8],
     s: &Session,
+    protected: bool,
 ) -> TpmResult<()> {
     let position = index + 1;
     let input = &request.sessions[index];
@@ -790,7 +830,7 @@ fn check_policy(
     // TPM2_PolicyAuthValue and TPM2_PolicyPassword both require the caller to
     // prove the authorization value as well as the policy.
     if s.policy.password_needed {
-        return compare_auth(state, &input.hmac, &entity.auth, entity.uses_lockout)
+        return compare_auth(state, &input.hmac, &entity.auth, protected)
             .map_err(|e| e.with_session(position));
     }
     // A bound or salted policy session holds a session key, and Part 1 clause
@@ -818,10 +858,10 @@ fn check_policy(
             input.attributes,
         )?;
         if !constant_time_eq(&expected, &input.hmac) {
-            record_failure(state, entity.uses_lockout)?;
+            record_failure(state, protected)?;
             return Err(TpmRc(rc::AUTH_FAIL).with_session(position));
         }
-        if entity.uses_lockout {
+        if protected {
             clear_failures(state);
         }
     }
@@ -1325,23 +1365,44 @@ mod tests {
         assert_eq!(parse(&state, &buf, 0).unwrap_err(), TpmRc(rc::AUTHSIZE));
     }
 
+    /// A command authorized by lockoutAuth, which Part 1 clause 16.8.1 makes
+    /// the one permanent entity the dictionary attack counter protects.
+    fn lockout_command(password: &[u8]) -> Vec<u8> {
+        command(
+            st::SESSIONS,
+            cc::DictionaryAttackParameters,
+            &[rh::LOCKOUT],
+            &password_auth(password),
+            &[0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
+    }
+
     #[test]
     fn a_password_authorization_is_compared_against_the_entity() {
         let mut state = TpmState::manufacture().unwrap();
-        state.hierarchies.owner.auth = b"secret".to_vec();
-        let auth = password_auth(b"secret");
-        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+        state.lockout_auth = b"secret".to_vec();
+        let buf = lockout_command(b"secret");
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::OWNER).unwrap();
+        let e = entity(&state, rh::LOCKOUT).unwrap();
         assert!(check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).is_ok());
 
-        let auth = password_auth(b"wrong");
-        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+        let buf = lockout_command(b"wrong");
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::OWNER).unwrap();
+        let e = entity(&state, rh::LOCKOUT).unwrap();
         let err = check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap_err();
         assert_eq!(err.0 & 0x03F, rc::AUTH_FAIL & 0x03F);
         assert_eq!(state.lockout.failed_tries, 1);
+    }
+
+    #[test]
+    fn a_permanent_entity_other_than_lockout_is_not_protected() {
+        // Part 1 clause 16.8.1 leaves every permanent entity except
+        // TPM_RH_LOCKOUT out of dictionary attack protection.
+        let state = TpmState::manufacture().unwrap();
+        for handle in [rh::OWNER, rh::ENDORSEMENT, rh::PLATFORM, rh::NULL] {
+            assert!(!entity(&state, handle).unwrap().uses_lockout, "{handle:#x}");
+        }
+        assert!(entity(&state, rh::LOCKOUT).unwrap().uses_lockout);
     }
 
     #[test]
@@ -1500,23 +1561,21 @@ mod tests {
     #[test]
     fn repeated_failures_enter_lockout() {
         let mut state = TpmState::manufacture().unwrap();
-        state.hierarchies.owner.auth = b"secret".to_vec();
+        state.lockout_auth = b"secret".to_vec();
         state.lockout.max_tries = 3;
-        let auth = password_auth(b"wrong");
-        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+        let buf = lockout_command(b"wrong");
         for _ in 0..3 {
             let req = parse(&state, &buf, 0).unwrap();
-            let e = entity(&state, rh::OWNER).unwrap();
+            let e = entity(&state, rh::LOCKOUT).unwrap();
             let _ = check_authorization(&mut state, &req, 0, &e, &[0u8; 32]);
         }
         assert!(state.lockout.in_lockout);
 
         // Part 1 clause 16.8.3 refuses the protected value while the TPM is
         // in Lockout mode, even when the caller has it right.
-        let auth = password_auth(b"secret");
-        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+        let buf = lockout_command(b"secret");
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::OWNER).unwrap();
+        let e = entity(&state, rh::LOCKOUT).unwrap();
         assert_eq!(
             check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap_err(),
             TpmRc(rc::LOCKOUT)
@@ -1525,7 +1584,7 @@ mod tests {
         // Once out of Lockout mode a success clears the counter.
         state.lockout.in_lockout = false;
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::OWNER).unwrap();
+        let e = entity(&state, rh::LOCKOUT).unwrap();
         check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
         assert_eq!(state.lockout.failed_tries, 0);
     }
@@ -1533,7 +1592,11 @@ mod tests {
     #[test]
     fn lockout_stops_a_policy_that_calls_for_the_auth_value() {
         let mut state = TpmState::manufacture().unwrap();
-        state.hierarchies.owner.auth = b"secret".to_vec();
+        state.lockout_auth = b"secret".to_vec();
+        state.lockout_policy = crate::tpm::structures::base::TpmtHa {
+            hash_alg: alg::SHA256,
+            digest: vec![0u8; 32],
+        };
         state.lockout.in_lockout = true;
 
         let handle = state.sessions.allocate_handle(se::POLICY).unwrap();
@@ -1558,16 +1621,19 @@ mod tests {
             hmac: Tpm2bAuth::empty(),
         }
         .to_bytes();
-        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+        let buf = command(
+            st::SESSIONS,
+            cc::DictionaryAttackParameters,
+            &[rh::LOCKOUT],
+            &auth,
+            &[0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
 
         // A policy that never calls for the authValue uses no protected value,
-        // so Lockout mode does not reach it. It fails on the policy instead.
+        // so Lockout mode does not reach it. The satisfied policy authorizes.
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::OWNER).unwrap();
-        assert_ne!(
-            check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap_err(),
-            TpmRc(rc::LOCKOUT)
-        );
+        let e = entity(&state, rh::LOCKOUT).unwrap();
+        check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
 
         // A policy that called TPM2_PolicyAuthValue does use it.
         state
@@ -1577,7 +1643,7 @@ mod tests {
             .policy
             .auth_value_needed = true;
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::OWNER).unwrap();
+        let e = entity(&state, rh::LOCKOUT).unwrap();
         assert_eq!(
             check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap_err(),
             TpmRc(rc::LOCKOUT)
@@ -1629,13 +1695,12 @@ mod tests {
         // Guessing against a protected entity, then succeeding against an
         // exempt one, must not clear the dictionary attack counter.
         let mut state = TpmState::manufacture().unwrap();
-        state.hierarchies.owner.auth = b"secret".to_vec();
+        state.lockout_auth = b"secret".to_vec();
         state.hierarchies.platform.auth = b"known".to_vec();
 
-        let auth = password_auth(b"wrong");
-        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+        let buf = lockout_command(b"wrong");
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::OWNER).unwrap();
+        let e = entity(&state, rh::LOCKOUT).unwrap();
         let _ = check_authorization(&mut state, &req, 0, &e, &[0u8; 32]);
         assert_eq!(state.lockout.failed_tries, 1);
 
@@ -1652,12 +1717,50 @@ mod tests {
         );
 
         // A success against the protected entity does clear it.
-        let auth = password_auth(b"secret");
-        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+        let buf = lockout_command(b"secret");
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::OWNER).unwrap();
+        let e = entity(&state, rh::LOCKOUT).unwrap();
         check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
         assert_eq!(state.lockout.failed_tries, 0);
+    }
+
+    #[test]
+    fn a_bound_session_carries_the_protection_of_its_bind_entity() {
+        // Part 1 clause 16.8.7: guessing the value of a protected entity by
+        // binding to it and using the session against an exempt one has to
+        // count against the lockout.
+        let mut state = TpmState::manufacture().unwrap();
+        state.hierarchies.platform.auth = b"known".to_vec();
+
+        let handle = state.sessions.allocate_handle(se::HMAC).unwrap();
+        let mut s = Session::new(
+            handle,
+            se::HMAC,
+            alg::SHA256,
+            vec![0u8; 32],
+            vec![0u8; 32],
+            vec![9u8; 32],
+            hc::TRANSIENT_FIRST,
+            b"bound".to_vec(),
+            crate::tpm::structures::schemes::SymDef::null(),
+        )
+        .unwrap();
+        s.bind_uses_lockout = true;
+        state.sessions.insert(s).unwrap();
+
+        let auth = AuthCommand {
+            session_handle: handle,
+            nonce: Tpm2bNonce::new(vec![0u8; 32]).unwrap(),
+            session_attributes: SessionAttributes(SessionAttributes::CONTINUE_SESSION),
+            hmac: Tpm2bAuth::new(vec![0u8; 32]).unwrap(),
+        }
+        .to_bytes();
+        let buf = command(st::SESSIONS, cc::Clear, &[rh::PLATFORM], &auth, &[]);
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = entity(&state, rh::PLATFORM).unwrap();
+        assert!(!e.uses_lockout);
+        assert!(check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).is_err());
+        assert_eq!(state.lockout.failed_tries, 1);
     }
 
     #[test]
