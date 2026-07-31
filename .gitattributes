@@ -1,0 +1,7 @@
+# The sources are written with newline endings, and two tests read the sources
+# themselves: the parameter end check in src/tpm/commands/parameter_check.rs and
+# the key generation check in src/tpm/fips.rs. A checkout that converted them
+# would leave those tests reading text that does not match what was written, so
+# the ending is fixed here rather than left to a per-machine setting.
+* text=auto eol=lf
+*.pdf binary
