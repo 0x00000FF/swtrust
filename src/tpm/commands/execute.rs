@@ -477,6 +477,88 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_authorization_still_counts_against_the_lockout() {
+        // Part 3 clause 5.6 leaves the TPM unchanged when a command fails,
+        // except for the dictionary attack counter. The command action runs
+        // against a copy, so this checks that the counter is not rolled back
+        // with it.
+        let mut state = TpmState::manufacture().unwrap();
+        run(&mut state, 0, &startup(su::CLEAR));
+        state.lockout_auth = b"secret".to_vec();
+
+        let mut auth = Writer::new();
+        auth.u32(rh::RS_PW);
+        auth.u16(0);
+        auth.u8(0x01);
+        auth.u16(5);
+        auth.bytes(b"wrong");
+        let auth = auth.finish().unwrap();
+
+        let mut body = Writer::new();
+        body.u32(rh::LOCKOUT);
+        body.u32(auth.len() as u32);
+        body.bytes(&auth);
+        let body = body.finish().unwrap();
+
+        let mut w = Writer::new();
+        w.u16(st::SESSIONS);
+        w.u32((HEADER_SIZE + body.len()) as u32);
+        w.u32(cc::DictionaryAttackLockReset);
+        w.bytes(&body);
+        let buf = w.finish().unwrap();
+
+        assert_eq!(state.lockout.failed_tries, 0);
+        let r = run(&mut state, 0, &buf);
+        assert_eq!(response_code(&r) & 0x03f, rc::AUTH_FAIL & 0x03f);
+        assert_eq!(
+            state.lockout.failed_tries, 1,
+            "the failure count was rolled back with the command"
+        );
+    }
+
+    #[test]
+    fn a_failed_command_leaves_the_state_alone() {
+        // Everything other than the failure count is unchanged, which is the
+        // rest of what Part 3 clause 5.6 asks for.
+        let mut state = TpmState::manufacture().unwrap();
+        run(&mut state, 0, &startup(su::CLEAR));
+        let before = state.pcr.read(alg::SHA256, 0).unwrap().to_vec();
+        let counter = state.pcr.update_counter();
+
+        // TPM2_PCR_Extend with a digest that is too short for the bank fails
+        // after the command has begun reading its parameters.
+        let mut auth = Writer::new();
+        auth.u32(rh::RS_PW);
+        auth.u16(0);
+        auth.u8(0x01);
+        auth.u16(0);
+        let auth = auth.finish().unwrap();
+
+        let mut params = Writer::new();
+        params.u32(1);
+        params.u16(alg::SHA256);
+        params.bytes(&[0x11u8; 20]);
+        let params = params.finish().unwrap();
+
+        let mut body = Writer::new();
+        body.u32(crate::tpm::constants::hc::PCR_FIRST);
+        body.u32(auth.len() as u32);
+        body.bytes(&auth);
+        body.bytes(&params);
+        let body = body.finish().unwrap();
+
+        let mut w = Writer::new();
+        w.u16(st::SESSIONS);
+        w.u32((HEADER_SIZE + body.len()) as u32);
+        w.u32(cc::PCR_Extend);
+        w.bytes(&body);
+        let r = run(&mut state, 0, &w.finish().unwrap());
+        assert_ne!(response_code(&r), rc::SUCCESS);
+        assert_eq!(state.pcr.read(alg::SHA256, 0).unwrap(), before);
+        assert_eq!(state.pcr.update_counter(), counter);
+    }
+
+    #[test]
     fn a_command_needing_physical_presence_is_gated() {
         let mut state = TpmState::manufacture().unwrap();
         run(&mut state, 0, &startup(su::CLEAR));
