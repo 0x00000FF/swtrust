@@ -117,7 +117,27 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
 
     state.command_audit_suppressed = false;
 
-    let response = super::run_command(state, &request)?;
+    // Part 2 clause 6.6 defines TPM_RC_FAILURE as commands not being accepted
+    // because of a TPM failure, and Part 1 Figure 7 makes that the answer of a
+    // TPM in failure mode. A command that answers it has therefore found
+    // something the TPM cannot carry on from: a failed pair-wise consistency
+    // test on a key it just generated, an exhausted generator, or a library
+    // call that should not fail. The TPM enters failure mode so no further
+    // cryptographic output is produced, which is what clause 10.1.1.1 of the
+    // FIPS 140-3 guidance requires of any self test failure.
+    let response = match super::run_command(state, &request) {
+        Ok(response) => response,
+        Err(e) => {
+            if e.value() == rc::FAILURE {
+                state.failure_mode = true;
+                state.self_test_done = false;
+                if state.test_failure.is_none() {
+                    state.test_failure = Some("conditional self test".to_string());
+                }
+            }
+            return Err(e);
+        }
+    };
 
     // Every command calls Reader::expect_end once it has read its parameters,
     // so surplus octets are refused before anything changes. This catches a
@@ -325,6 +345,36 @@ mod tests {
         run(&mut state, 0, &startup(su::CLEAR));
         let r = run(&mut state, 0, &startup(su::CLEAR));
         assert_eq!(response_code(&r), rc::INITIALIZE);
+    }
+
+    #[test]
+    fn a_command_answering_tpm_rc_failure_enters_failure_mode() {
+        // Part 2 clause 6.6 defines TPM_RC_FAILURE as commands not being
+        // accepted because of a TPM failure, so a command that answers it has
+        // found something the TPM cannot carry on from. Clause 10.1.1.1 of the
+        // FIPS 140-3 guidance requires that to stop further cryptographic
+        // output, which is what a conditional self test failure relies on.
+        let mut state = TpmState::manufacture().unwrap();
+        run(&mut state, 0, &startup(su::CLEAR));
+        assert!(!state.failure_mode);
+
+        // An exhausted generator is a failure the caller can reach.
+        state.rng.set_reseed_counter(u64::MAX);
+        let r = run(&mut state, 0, &get_random(8));
+        assert_eq!(response_code(&r), rc::FAILURE);
+        assert!(state.failure_mode, "failure mode was not entered");
+        assert!(!state.self_test_done);
+        assert!(state.test_failure.is_some());
+
+        // Nothing cryptographic runs afterwards, and reporting still does.
+        let r = run(&mut state, 0, &get_random(8));
+        assert_eq!(response_code(&r), rc::FAILURE);
+        let mut w = Writer::new();
+        w.u16(st::NO_SESSIONS);
+        w.u32(10);
+        w.u32(cc::GetTestResult);
+        let r = run(&mut state, 0, &w.finish().unwrap());
+        assert_eq!(response_code(&r), rc::SUCCESS);
     }
 
     #[test]
