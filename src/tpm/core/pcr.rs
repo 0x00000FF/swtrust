@@ -381,14 +381,18 @@ impl PcrBanks {
                 return Err(TpmRc(rc::SIZE));
             }
         }
+        // Part 3 clause 22.1 counts an extend once for each bank that changes,
+        // unlike a reset, which is counted once however many banks it clears.
+        let mut changed: u32 = 0;
         for (alg, digest) in digests {
             if !self.has_bank(*alg) {
                 continue;
             }
             self.extend_digest(*alg, index, digest)?;
+            changed += 1;
         }
         if !no_increment(index) {
-            self.update_counter = self.update_counter.wrapping_add(1);
+            self.update_counter = self.update_counter.wrapping_add(changed);
         }
         Ok(())
     }
@@ -532,6 +536,42 @@ mod tests {
         // PCR 16 does not advance the counter.
         b.extend(16, 0, &[(alg::SHA256, vec![1u8; 32])]).unwrap();
         assert_eq!(b.update_counter(), 1);
+    }
+
+    #[test]
+    fn an_extend_counts_once_for_each_bank_it_changes() {
+        // Part 3 clause 22.1: "If a command causes PCR in multiple banks to
+        // change, the PCR Update Counter must be incremented once for each
+        // bank." A reset is the other way round, and is counted once.
+        let mut b = banks();
+        assert_eq!(b.update_counter(), 0);
+        b.extend(
+            0,
+            0,
+            &[(alg::SHA1, vec![1u8; 20]), (alg::SHA256, vec![1u8; 32])],
+        )
+        .unwrap();
+        assert_eq!(b.update_counter(), 2, "two banks changed, so two counts");
+
+        // A bank that is not allocated changes nothing and counts nothing.
+        b.extend(
+            0,
+            0,
+            &[(alg::SHA256, vec![2u8; 32]), (alg::SHA384, vec![2u8; 48])],
+        )
+        .unwrap();
+        assert_eq!(b.update_counter(), 3, "only the allocated bank counted");
+
+        // Clearing the same register in every bank counts once. PCR 20 resets
+        // from locality two and is not one of the registers that never count.
+        let before = b.update_counter();
+        b.reset(20, 2).unwrap();
+        assert_eq!(b.update_counter(), before + 1, "a reset counts once");
+
+        // PCR 23 resets but never counts, per TPM_PT_PCR_NO_INCREMENT.
+        let before = b.update_counter();
+        b.reset(23, 0).unwrap();
+        assert_eq!(b.update_counter(), before);
     }
 
     #[test]
