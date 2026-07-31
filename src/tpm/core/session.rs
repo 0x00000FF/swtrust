@@ -55,10 +55,13 @@ pub struct PolicyState {
 }
 
 /// The audit state of a session.
+///
+/// Exclusivity is not held here. Part 1 clause 17.2 gives the TPM a single
+/// exclusive audit session, which [`crate::tpm::core::state::AuditState`]
+/// records.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditState {
     pub is_audit: bool,
-    pub is_exclusive: bool,
     pub digest: Vec<u8>,
 }
 

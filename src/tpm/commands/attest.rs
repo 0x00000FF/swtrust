@@ -280,7 +280,9 @@ pub fn get_session_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
         return Err(TpmRc(rc::TYPE).with_handle(3));
     }
     let attested = Attested::SessionAudit {
-        exclusive_session: session.audit.is_exclusive,
+        // Part 1 clause 17.2 keeps the exclusive status on the TPM, not on the
+        // session, so it is read from there.
+        exclusive_session: state.audit.exclusive_session == session_handle,
         session_digest: Tpm2bDigest::from_slice(&session.audit.digest)?,
     };
     let (info, signature) =
