@@ -627,12 +627,14 @@ impl SessionSlots {
     /// saved, and ignores the upper octet of the handle, so a caller may name
     /// a session by its index alone. A handle that references neither is
     /// TPM_RC_HANDLE.
-    pub fn flush(&mut self, handle: u32) -> TpmResult<()> {
+    /// Returns the handle that was actually removed, which an aliased request
+    /// resolves to something other than what the caller wrote.
+    pub fn flush(&mut self, handle: u32) -> TpmResult<u32> {
         for candidate in self.flush_candidates(handle) {
             let loaded = self.sessions.remove(&candidate).is_some();
             let saved = self.saved.remove(&candidate).is_some();
             if loaded || saved {
-                return Ok(());
+                return Ok(candidate);
             }
         }
         Err(TpmRc(rc::HANDLE))
@@ -964,7 +966,7 @@ mod tests {
         assert_eq!(slots.len(), 0, "the session is saved, not loaded");
         assert_eq!(slots.active(), 1);
 
-        slots.flush(handle).unwrap();
+        assert_eq!(slots.flush(handle).unwrap(), handle);
         assert_eq!(slots.active(), 0, "the saved context is gone");
 
         // A handle that names neither a loaded nor a saved session is refused.
@@ -980,7 +982,9 @@ mod tests {
         // The clause 28.4.1 example: 0x20000000 flushes 0x03000000.
         let aliased = 0x2000_0000 | (handle & 0x00FF_FFFF);
         assert!(is_flushable_session(aliased));
-        slots.flush(aliased).unwrap();
+        // The flush reports the handle it resolved to, so the caller can act
+        // on the session that actually went away.
+        assert_eq!(slots.flush(aliased).unwrap(), handle);
         assert_eq!(slots.active(), 0);
     }
 

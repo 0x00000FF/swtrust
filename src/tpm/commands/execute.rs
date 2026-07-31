@@ -473,6 +473,35 @@ mod tests {
     }
 
     #[test]
+    fn flushing_an_audit_session_by_alias_clears_its_exclusivity() {
+        // Part 1 clause 17.2 gives up exclusivity when the session that held
+        // it is flushed, and Part 3 clause 28.4.1 lets that flush name the
+        // session with any upper octet.
+        let mut state = TpmState::manufacture().unwrap();
+        run(&mut state, 0, &startup(su::CLEAR));
+        let handle = load_hmac_session(&mut state);
+        let attributes = SessionAttributes::CONTINUE_SESSION | SessionAttributes::AUDIT;
+        run(&mut state, 0, &get_random_audited(handle, attributes));
+        assert_eq!(state.audit.exclusive_session, handle);
+
+        let aliased = 0x2000_0000 | (handle & 0x00FF_FFFF);
+        let mut p = Writer::new();
+        p.u32(aliased);
+        let mut w = Writer::new();
+        let body = p.finish().unwrap();
+        w.u16(st::NO_SESSIONS);
+        w.u32((HEADER_SIZE + body.len()) as u32);
+        w.u32(cc::FlushContext);
+        w.bytes(&body);
+        let r = run(&mut state, 0, &w.finish().unwrap());
+        assert_eq!(response_code(&r), rc::SUCCESS, "FlushContext -> {:08x}", response_code(&r));
+        assert_eq!(
+            state.audit.exclusive_session, rh::UNASSIGNED,
+            "the flushed session still holds exclusivity"
+        );
+    }
+
+    #[test]
     fn a_failed_authorization_still_counts_against_the_lockout() {
         // Part 3 clause 5.6 leaves the TPM unchanged when a command fails,
         // except for the dictionary attack counter. The command action runs
