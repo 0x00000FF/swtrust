@@ -36,15 +36,53 @@ fn object_of(state: &TpmState, handle: u32) -> TpmResult<&Object> {
 
 /// Reject a signature context for a scheme that has none.
 ///
-/// Part 2 Table 220 gives a context only to ECDAA, SM2 and ML-DSA. None of
-/// those are implemented here, so a caller that supplies one is asking for
-/// something the TPM cannot do.
+/// Part 2 Table 220 gives a context only to ECDAA, SM2 and ML-DSA. Of those
+/// only ECDAA is implemented here, and this is for the commands that take no
+/// counter, so a caller that supplies one is asking for something the TPM
+/// cannot do.
 fn check_no_context(context: &Tpm2bSignatureCtx, parameter: usize) -> TpmResult<()> {
     if context.is_empty() {
         Ok(())
     } else {
         Err(TpmRc(rc::VALUE).with_parameter(parameter))
     }
+}
+
+/// The commit counter a signature context carries, if the key needs one.
+///
+/// Part 3 clause 17.5.1 says that if the scheme of the key uses a counter,
+/// "then context shall contain the counter value from TPM2_Commit() to use for
+/// the signature". Part 2 Table 220 makes that counter a UINT16 for ECDAA, and
+/// gives no context to any other scheme this TPM implements.
+fn context_counter(
+    object: &Object,
+    context: &Tpm2bSignatureCtx,
+    parameter: usize,
+) -> TpmResult<Option<u16>> {
+    let uses_counter = object
+        .public
+        .scheme()
+        .map(|s| s.scheme == alg::ECDAA)
+        .unwrap_or(false);
+    if !uses_counter {
+        check_no_context(context, parameter)?;
+        return Ok(None);
+    }
+    let bytes = context.as_slice();
+    if bytes.len() != 2 {
+        return Err(TpmRc(rc::SIZE).with_parameter(parameter));
+    }
+    Ok(Some(u16::from_be_bytes([bytes[0], bytes[1]])))
+}
+
+/// The scheme to sign with, carrying the counter the context supplied.
+fn scheme_with_counter(object: &Object, counter: Option<u16>) -> TpmResult<Scheme> {
+    let mut scheme = signing_scheme(object, &Scheme::null())?;
+    if let Some(count) = counter {
+        let hash_alg = scheme.hash_alg().ok_or(TpmRc(rc::SCHEME))?;
+        scheme = Scheme::ecdaa(hash_alg, count);
+    }
+    Ok(scheme)
 }
 
 /// TPM2_SignDigest, Part 3 clause 20.7.
@@ -59,7 +97,6 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
     let digest = Tpm2bDigest::unmarshal(&mut r)?;
     let validation = Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK])?;
     r.expect_end()?;
-    check_no_context(&context, 1)?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
@@ -70,7 +107,8 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
     if object.public.object_type == alg::KEYEDHASH {
         return Err(TpmRc(rc::SCHEME).with_handle(1));
     }
-    let scheme = signing_scheme(&object, &Scheme::null())?;
+    let counter = context_counter(&object, &context, 1)?;
+    let scheme = scheme_with_counter(&object, counter)?;
     let restricted = object
         .public
         .object_attributes
@@ -156,13 +194,13 @@ pub fn sign_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
     let auth = Tpm2bDigest::unmarshal(&mut r)?;
     let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
     r.expect_end()?;
-    check_no_context(&context, 2)?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
         .clone();
     // Part 3 clause 20.6.1 needs a signing key here.
     check_signing_key(&object).map_err(|e| e.with_handle(1))?;
+    let counter = context_counter(&object, &context, 2)?;
     // The sequence hashes with the algorithm of the key's signing scheme,
     // because that is the algorithm the signature will use.
     let scheme = signing_scheme(&object, &Scheme::null())?;
@@ -175,6 +213,7 @@ pub fn sign_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
     // it, which is what TPM_RC_SIGN_CONTEXT_KEY is for.
     let mut buffer = key_handle.to_be_bytes().to_vec();
     buffer.extend_from_slice(&hash_alg.to_be_bytes());
+    buffer.extend_from_slice(&counter_bytes(counter));
     let handle = state.objects.insert(Slot::Sequence(Box::new(Sequence {
         kind: SequenceKind::Hash { hash_alg },
         auth: auth.as_slice().to_vec(),
@@ -191,8 +230,8 @@ fn starts_with_generated_value(message: &[u8]) -> bool {
 }
 
 /// The key handle and hash a signing sequence was started with.
-fn sequence_binding(sequence: &Sequence) -> TpmResult<(u32, u16, &[u8])> {
-    if sequence.buffer.len() < 6 {
+fn sequence_binding(sequence: &Sequence) -> TpmResult<(u32, u16, Option<u16>, &[u8])> {
+    if sequence.buffer.len() < 9 {
         return Err(TpmRc(rc::SEQUENCE));
     }
     let handle = u32::from_be_bytes([
@@ -202,7 +241,25 @@ fn sequence_binding(sequence: &Sequence) -> TpmResult<(u32, u16, &[u8])> {
         sequence.buffer[3],
     ]);
     let hash_alg = u16::from_be_bytes([sequence.buffer[4], sequence.buffer[5]]);
-    Ok((handle, hash_alg, &sequence.buffer[6..]))
+    // The counter of Part 3 clause 17.5.1 is supplied at the start of the
+    // sequence and needed at its end, so it travels with the binding.
+    let counter = if sequence.buffer[6] != 0 {
+        Some(u16::from_be_bytes([sequence.buffer[7], sequence.buffer[8]]))
+    } else {
+        None
+    };
+    Ok((handle, hash_alg, counter, &sequence.buffer[9..]))
+}
+
+/// The three octets a sequence records for an optional counter.
+fn counter_bytes(counter: Option<u16>) -> [u8; 3] {
+    match counter {
+        Some(c) => {
+            let b = c.to_be_bytes();
+            [1, b[0], b[1]]
+        }
+        None => [0, 0, 0],
+    }
 }
 
 /// TPM2_SignSequenceComplete, Part 3 clause 20.6.
@@ -222,7 +279,7 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
         .map_err(|e| e.with_handle(1))?
         .as_sequence()?
         .clone();
-    let (bound_handle, hash_alg, message) = sequence_binding(&sequence)?;
+    let (bound_handle, hash_alg, counter, message) = sequence_binding(&sequence)?;
     if bound_handle != key_handle {
         return Err(TpmRc(rc::SIGN_CONTEXT_KEY).with_handle(2));
     }
@@ -248,7 +305,9 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
     if restricted && starts_with_generated_value(&data) {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
-    let scheme = signing_scheme(&object, &Scheme::null())?;
+    // The counter the sequence carried names the TPM2_Commit this signature
+    // completes, per Part 3 clause 17.5.1.
+    let scheme = scheme_with_counter(&object, counter)?;
     // Part 3 Table 115: an HMAC key signs the message itself, everything else
     // signs the digest of the message.
     let signature = sign_message(state, &object, &scheme, &data)?;
@@ -283,6 +342,9 @@ pub fn verify_sequence_start(state: &mut TpmState, request: &Request) -> TpmResu
 
     let mut buffer = key_handle.to_be_bytes().to_vec();
     buffer.extend_from_slice(&hash_alg.to_be_bytes());
+    // Part 1 clause 44.3.3.1 says the TPM may not verify an ECDAA signature,
+    // so a verification sequence never carries a counter.
+    buffer.extend_from_slice(&counter_bytes(None));
     let handle = state.objects.insert(Slot::Sequence(Box::new(Sequence {
         kind: SequenceKind::Hash { hash_alg },
         auth: auth.as_slice().to_vec(),
@@ -308,11 +370,14 @@ pub fn verify_sequence_complete(state: &mut TpmState, request: &Request) -> TpmR
         .map_err(|e| e.with_handle(1))?
         .as_sequence()?
         .clone();
-    let (bound_handle, hash_alg, message) = sequence_binding(&sequence)?;
+    let (bound_handle, hash_alg, counter, message) = sequence_binding(&sequence)?;
     if bound_handle != key_handle {
         return Err(TpmRc(rc::SIGN_CONTEXT_KEY).with_handle(2));
     }
     let _ = hash_alg;
+    // A verification sequence never records one, because the TPM does not
+    // verify the one scheme that uses a counter.
+    debug_assert!(counter.is_none());
     let message = message.to_vec();
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(2))?;
@@ -893,14 +958,39 @@ mod tests {
             buffer: {
                 let mut b = 0x8000_0000u32.to_be_bytes().to_vec();
                 b.extend_from_slice(&alg::SHA256.to_be_bytes());
+                b.extend_from_slice(&counter_bytes(None));
                 b.extend_from_slice(b"message");
                 b
             },
         };
-        let (handle, hash_alg, message) = sequence_binding(&sequence).unwrap();
+        let (handle, hash_alg, counter, message) = sequence_binding(&sequence).unwrap();
         assert_eq!(handle, 0x8000_0000);
         assert_eq!(hash_alg, alg::SHA256);
+        assert_eq!(counter, None);
         assert_eq!(message, b"message");
+    }
+
+    #[test]
+    fn a_signing_sequence_records_a_commit_counter() {
+        // Part 3 clause 17.5.1 gives the counter at the start of the sequence
+        // and needs it at the end, so the sequence has to carry it.
+        let sequence = Sequence {
+            kind: SequenceKind::Hash {
+                hash_alg: alg::SHA256,
+            },
+            auth: Vec::new(),
+            buffer: {
+                let mut b = 0x8000_0001u32.to_be_bytes().to_vec();
+                b.extend_from_slice(&alg::SHA256.to_be_bytes());
+                b.extend_from_slice(&counter_bytes(Some(0x1234)));
+                b.extend_from_slice(b"data");
+                b
+            },
+        };
+        let (handle, _, counter, message) = sequence_binding(&sequence).unwrap();
+        assert_eq!(handle, 0x8000_0001);
+        assert_eq!(counter, Some(0x1234));
+        assert_eq!(message, b"data");
     }
 
     #[test]

@@ -485,6 +485,103 @@ fn full_mqv_returns_one_point_computed_from_both_keys() {
 }
 
 #[test]
+fn the_version_185_signing_commands_take_the_commit_counter() {
+    // Part 3 clause 17.5.1: "If the scheme of keyHandle uses a counter value
+    // (e.g., TPM_ALG_ECDAA), then context shall contain the counter value from
+    // TPM2_Commit() to use for the signature." Part 2 Table 220 makes that a
+    // UINT16 for ECDAA.
+    let h = harness("v185");
+    let (handle, _) = primary(&h, 0x001A, Some(0));
+
+    let take_counter = || {
+        let r = commit(&h, handle, &empty_commit_params());
+        assert_eq!(r.code, rc::SUCCESS, "Commit -> {:08x}", r.code);
+        commit_response(&r.body).1
+    };
+
+    // TPM2_SignDigest with the counter in its context.
+    let sign_digest = |counter: Option<u16>| {
+        let mut p = Writer::new();
+        match counter {
+            Some(c) => {
+                p.u16(2);
+                p.u16(c);
+            }
+            None => p.u16(0),
+        }
+        p.u16(32);
+        p.bytes(&[0x11u8; 32]);
+        p.u16(st::HASHCHECK);
+        p.u32(rh::NULL);
+        p.u16(0);
+        send(
+            &h,
+            &command(
+                st::SESSIONS,
+                cc::SignDigest,
+                &[handle],
+                Some(&PASSWORD),
+                &p.finish().unwrap(),
+            ),
+        )
+    };
+
+    let counter = take_counter();
+    let r = sign_digest(Some(counter));
+    assert_eq!(r.code, rc::SUCCESS, "SignDigest with a counter -> {:08x}", r.code);
+
+    // The commit is spent, so the same counter cannot be used again.
+    assert_ne!(sign_digest(Some(counter)).code, rc::SUCCESS);
+
+    // An ECDAA key with no counter at all has nothing to complete.
+    assert_ne!(sign_digest(None).code, rc::SUCCESS, "a missing counter was accepted");
+
+    // TPM2_SignSequenceStart takes it too, and the sequence carries it to the
+    // completion.
+    let counter = take_counter();
+    let mut p = Writer::new();
+    p.u16(0); // auth
+    p.u16(2); // context
+    p.u16(counter);
+    let r = send(
+        &h,
+        &command(
+            st::NO_SESSIONS,
+            cc::SignSequenceStart,
+            &[handle],
+            None,
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_eq!(r.code, rc::SUCCESS, "SignSequenceStart -> {:08x}", r.code);
+    let sequence = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    let mut p = Writer::new();
+    p.u16(5);
+    p.bytes(b"hello");
+    let auth2 = [PASSWORD.as_slice(), PASSWORD.as_slice()].concat();
+    let r = send(
+        &h,
+        &command(
+            st::SESSIONS,
+            cc::SignSequenceComplete,
+            &[sequence, handle],
+            Some(&auth2),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "SignSequenceComplete with a carried counter -> {:08x}",
+        r.code
+    );
+    let mut rd = Reader::new(&r.body);
+    rd.u32().unwrap();
+    assert_eq!(rd.u16().unwrap(), 0x001A, "the signature is an ECDAA one");
+}
+
+#[test]
 fn two_phase_needs_an_unrestricted_decryption_key() {
     // Part 3 Table 54 names keyA "handle of an unrestricted ECC decryption
     // key". A signing key or a restricted one used as a key agreement scalar

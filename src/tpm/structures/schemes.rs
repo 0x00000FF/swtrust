@@ -252,6 +252,14 @@ impl Scheme {
     }
 
     /// A scheme with a single hash parameter.
+    /// A scheme that carries a hash and the commit counter ECDAA needs.
+    pub fn ecdaa(hash_alg: u16, count: u16) -> Scheme {
+        Scheme {
+            scheme: crate::tpm::constants::alg::ECDAA,
+            detail: SchemeDetail::Ecdaa(SchemeEcdaa { hash_alg, count }),
+        }
+    }
+
     pub fn hash(scheme: u16, hash_alg: u16) -> Scheme {
         Scheme {
             scheme,

@@ -490,6 +490,15 @@ pub fn signing_scheme(object: &Object, supplied: &Scheme) -> TpmResult<Scheme> {
         if !supplied.is_null() && supplied.scheme != object_scheme.scheme {
             return Err(TpmRc(rc::SCHEME).with_parameter(2));
         }
+        // The commit counter is not part of the key. It says which
+        // TPM2_Commit this signature completes, so it comes from the caller
+        // even when the rest of the scheme comes from the object.
+        if object_scheme.scheme == alg::ECDAA {
+            if let SchemeDetail::Ecdaa(detail) = supplied.detail {
+                let hash_alg = object_scheme.hash_alg().ok_or(TpmRc(rc::SCHEME))?;
+                return Ok(Scheme::ecdaa(hash_alg, detail.count));
+            }
+        }
         Ok(object_scheme)
     }
 }
