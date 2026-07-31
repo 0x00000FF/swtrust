@@ -30,6 +30,11 @@ mod tests {
 
     /// The bodies of the public command functions in one module.
     fn command_bodies(source: &str) -> Vec<(String, String)> {
+        // A checkout may give the sources either line ending, so the scan runs
+        // over text normalised to one. Without this the body end marker is
+        // never found and every body reads to the end of the file.
+        let owned = source.replace("\r\n", "\n");
+        let source = owned.as_str();
         // Everything before the first test section is the command code. No
         // command may follow it, or the scan would not see that command.
         let source = match source.find("#[cfg(test)]") {
@@ -88,6 +93,29 @@ pub fn "),
             }
         }
         None
+    }
+
+    #[test]
+    fn the_scan_reads_either_line_ending() {
+        let unix = concat!(
+            "\npub fn one(state: &mut TpmState, request: &Request) -> TpmResult<Response> {\n",
+            "    let mut r = request.reader();\n",
+            "    r.expect_end()?;\n",
+            "}\n",
+            "\npub fn two() -> u32 {\n",
+            "    0\n",
+            "}\n",
+        );
+        let dos = unix.replace('\n', "\r\n");
+        let from_unix = command_bodies(unix);
+        let from_dos = command_bodies(&dos);
+        assert_eq!(from_unix.len(), 2);
+        assert_eq!(from_dos.len(), from_unix.len());
+        assert_eq!(from_dos[0].0, "one");
+        // A body has to stop at its own closing brace. Running on into the
+        // next function is what a missed body end looks like, and it makes the
+        // reads of that function look like reads after the check.
+        assert!(!from_dos[0].1.contains("pub fn two"));
     }
 
     #[test]
