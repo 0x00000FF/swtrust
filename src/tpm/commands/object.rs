@@ -131,7 +131,6 @@ fn create_sensitive(
                 &key.public_x,
                 &key.public_y,
                 attrs.has(ObjectAttributes::SIGN_ENCRYPT),
-                rng,
             )?;
             (
                 SensitiveComposite::Ecc(Tpm2bEccParameter::new(

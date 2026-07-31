@@ -412,13 +412,18 @@ pub fn pairwise_rsa(key: &rsa::RsaPrivate, sign: bool, decrypt: bool) -> TpmResu
 /// A signing key signs and verifies. A key agreement key has its public point
 /// recomputed from the private scalar and compared, which is the check 140-3
 /// asks for when the key is not used to sign.
+/// The test draws its own per message secret rather than taking the caller's
+/// generator, because the caller's may be the deterministic one that Part 1
+/// clause 27.2 requires TPM2_CreatePrimary to reproduce. ECDSA signing retries
+/// until it draws a usable scalar, so the number of octets it consumes depends
+/// on the values it sees; taking them from the primary seed generator would
+/// make what comes after depend on that, which must not happen.
 pub fn pairwise_ecc(
     curve_id: u16,
     private: &[u8],
     public_x: &[u8],
     public_y: &[u8],
     sign: bool,
-    rng: &mut dyn rand::Rng,
 ) -> TpmResult<()> {
     let group = ecc::Curve::new(curve_id)?;
     let d = crate::tpm::crypto::bn::BigNum::from_bytes(private)?;
@@ -433,7 +438,11 @@ pub fn pairwise_ecc(
 
     if sign {
         let digest = hash::digest(alg::SHA256, b"pair-wise consistency test")?;
-        let signature = ecc::ecdsa_sign(&group, &d, &digest, rng)?;
+        // Seeded from the key under test, so the test is repeatable and takes
+        // nothing from the generator the caller is using.
+        let seed = hmac::hmac(alg::SHA256, private, b"pair-wise consistency test")?;
+        let mut own = rand::Drbg::new(&[seed.as_slice(), seed.as_slice()].concat(), b"pct")?;
+        let signature = ecc::ecdsa_sign(&group, &d, &digest, &mut own)?;
         ecc::ecdsa_verify(&group, public_x, public_y, &digest, &signature)
             .map_err(|_| TpmRc(rc::FAILURE))?;
     }
@@ -676,17 +685,16 @@ mod tests {
 
     #[test]
     fn an_ecc_key_passes_its_pairwise_test() {
-        let mut rng = rand::Drbg::new(&[0x11u8; 48], b"test").unwrap();
         let private = hex::decode(ECDSA_PRIVATE).unwrap();
         let x = hex::decode(ECDSA_PUBLIC_X).unwrap();
         let y = hex::decode(ECDSA_PUBLIC_Y).unwrap();
-        assert!(pairwise_ecc(curve::NIST_P256, &private, &x, &y, true, &mut rng).is_ok());
-        assert!(pairwise_ecc(curve::NIST_P256, &private, &x, &y, false, &mut rng).is_ok());
+        assert!(pairwise_ecc(curve::NIST_P256, &private, &x, &y, true).is_ok());
+        assert!(pairwise_ecc(curve::NIST_P256, &private, &x, &y, false).is_ok());
 
         // A public point that does not belong to the private scalar fails.
         let mut wrong = x.clone();
         wrong[0] ^= 0x01;
-        assert!(pairwise_ecc(curve::NIST_P256, &private, &wrong, &y, false, &mut rng).is_err());
+        assert!(pairwise_ecc(curve::NIST_P256, &private, &wrong, &y, false).is_err());
     }
 
     #[test]
@@ -695,15 +703,20 @@ mod tests {
         // pinned one.
         let mut rng = rand::Drbg::new(&[0x22u8; 48], b"test").unwrap();
         let key = ecc::generate(curve::NIST_P256, &mut rng).unwrap();
+        // The test must not touch the caller's generator, so what it draws is
+        // its own. Drawing from rng here would prove nothing either way.
+        let before = rng.bytes(8).unwrap();
         assert!(pairwise_ecc(
             curve::NIST_P256,
             &key.private.to_bytes().unwrap(),
             &key.public_x,
             &key.public_y,
-            true,
-            &mut rng
+            true
         )
         .is_ok());
+        // The generator moved on only because of the draw above, not because
+        // the pair-wise test took anything from it.
+        assert_ne!(before, rng.bytes(8).unwrap());
     }
 
     #[test]
