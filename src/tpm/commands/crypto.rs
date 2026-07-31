@@ -1178,7 +1178,7 @@ pub fn ec_ephemeral(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let bits = ((order.bits() + 7) / 8 * 8) as u32;
     let (r_bytes, counter) = state
         .commits
-        .commit(config::COMMIT_EPHEMERAL_HASH_ALG, &[], bits)?;
+        .next(config::COMMIT_EPHEMERAL_HASH_ALG, &[], bits)?;
     let ctx = crate::tpm::crypto::bn::BnCtx::new()?;
     let private = crate::tpm::crypto::bn::BigNum::from_bytes(&r_bytes)?.modulo(&order, &ctx)?;
     if private.is_zero() {
@@ -1189,6 +1189,9 @@ pub fn ec_ephemeral(state: &mut TpmState, request: &Request) -> TpmResult<Respon
         return Err(TpmRc(rc::NO_RESULT));
     }
     let (x, y) = point.coordinates(&curve)?;
+    // Recorded only once the point is known good, the same order clause
+    // 44.2.3 uses for TPM2_Commit.
+    state.commits.take(counter);
 
     respond(move |w| {
         Tpm2bEccPoint {

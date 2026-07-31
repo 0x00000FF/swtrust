@@ -306,12 +306,13 @@ impl TpmState {
             self.audit.digest.clear();
         }
         self.audit.exclusive_session = rh::UNASSIGNED;
-        // Part 1 clause 44.2.2: a new commit nonce and a counter of zero at
-        // each TPM Reset. Every outstanding split operation goes with it,
-        // because the value it stood for cannot be derived from a new nonce.
-        // A TPM Restart is a Reset for this purpose too, since the nonce is
-        // never written to the state file.
-        self.commits.reset(&mut self.rng)?;
+        // Part 1 Table 41 puts the commit values in the state reset data, which
+        // clause 34.4.4 restores on a Startup of any type and initializes only
+        // on a TPM Reset. A TPM Restart therefore keeps them, so an
+        // outstanding split operation survives an orderly shutdown.
+        if !restart {
+            self.commits.reset(&mut self.rng)?;
+        }
         self.begin_operation(!disorderly);
         Ok(())
     }
@@ -328,14 +329,13 @@ impl TpmState {
         self.pcr.on_resume();
         self.clock.restart_count = self.clock.restart_count.wrapping_add(1);
         self.clock.time = 0;
-        // The commit nonce is never written to the state file, so a resumed
-        // TPM has none to carry forward and takes a new one. A split operation
-        // therefore does not survive a power cycle, and the caller commits
-        // again. Part 1 clause 44.2.2 requires the value to be unknown outside
-        // the TPM and used once, both of which dropping it keeps; what it
-        // costs is a commit made before the shutdown, which is why the nonce
-        // is replaced here rather than left empty.
-        self.commits.reset(&mut self.rng)?;
+        // The commit values came back with the state file, so a resume keeps
+        // them. Only a TPM Reset initializes them, per clause 34.4.4. A state
+        // file written before they were recorded has none, and a TPM with no
+        // nonce can do nothing at all, so that case takes a fresh one.
+        if !self.commits.is_ready() {
+            self.commits.reset(&mut self.rng)?;
+        }
         self.begin_operation(true);
         Ok(())
     }
@@ -477,6 +477,14 @@ impl TpmState {
             }
         }
 
+        // Part 1 Table 41 puts the commit nonce, counter and array in the
+        // state reset data, which clause 34.4.4 saves on any Shutdown(STATE)
+        // and restores on the next Startup of any type.
+        let (random, count, used) = self.commits.parts();
+        w.sized16(random);
+        w.u64(count);
+        w.sized16(used);
+
         w.finish()
     }
 
@@ -574,6 +582,18 @@ impl TpmState {
             let object = Object::new(public, sensitive, hierarchy, &parent_qn, tpm_generated)?;
             state.persistent.insert(handle, object);
         }
+
+        let commit_random = read_sized(&mut r)?;
+        let commit_count = r.u64()?;
+        let commit_used = read_sized(&mut r)?;
+        if commit_random.len() > config::COMMIT_NONCE_BYTES
+            || commit_used.len() > config::MAX_COMMIT_SEQUENCES as usize / 8
+        {
+            return Err(TpmRc(rc::BAD_CONTEXT));
+        }
+        state
+            .commits
+            .restore(commit_random, commit_count, commit_used);
 
         if !r.is_empty() {
             return Err(TpmRc(rc::BAD_CONTEXT));

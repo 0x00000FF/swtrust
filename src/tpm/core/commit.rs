@@ -35,7 +35,12 @@ pub struct Commits {
     /// The nonce of Equation 60, new at each TPM Reset.
     random: Vec<u8>,
     /// The counter of Equation 60, zero at each TPM Reset.
-    count: u16,
+    ///
+    /// Clause 44.2.5 reconstructs a counter wider than the sixteen bits the
+    /// caller is given, so the whole width is kept and derived from. A counter
+    /// of sixteen bits would repeat its Equation 60 inputs every 65536
+    /// commits, which is exactly what the reconstruction exists to avoid.
+    count: u64,
     /// One bit per counter that has been handed out and not yet used.
     used: Vec<u8>,
 }
@@ -69,16 +74,16 @@ impl Commits {
     }
 
     /// The array index a counter uses, which is its low order bits.
-    fn index(counter: u16) -> usize {
+    fn index(counter: u64) -> usize {
         (counter as usize) & (config::MAX_COMMIT_SEQUENCES as usize - 1)
     }
 
-    fn is_set(&self, counter: u16) -> bool {
+    fn is_set(&self, counter: u64) -> bool {
         let i = Commits::index(counter);
         self.used.get(i / 8).map(|b| b & (1 << (i % 8)) != 0) == Some(true)
     }
 
-    fn set(&mut self, counter: u16, on: bool) {
+    fn set(&mut self, counter: u64, on: bool) {
         let i = Commits::index(counter);
         if let Some(b) = self.used.get_mut(i / 8) {
             if on {
@@ -90,7 +95,7 @@ impl Commits {
     }
 
     /// Equation 60. `bits` is the bit count of the curve order.
-    fn derive(&self, name_alg: u16, name: &[u8], counter: u16, bits: u32) -> TpmResult<Vec<u8>> {
+    fn derive(&self, name_alg: u16, name: &[u8], counter: u64, bits: u32) -> TpmResult<Vec<u8>> {
         if !self.is_ready() {
             return Err(TpmRc(rc::NO_RESULT));
         }
@@ -106,28 +111,55 @@ impl Commits {
         )
     }
 
-    /// Take the next counter and the value that goes with it.
+    /// The value the next commit would use, and the counter naming it.
     ///
-    /// The counter is marked outstanding, so [`Commits::use_counter`] will
-    /// accept it once.
-    pub fn commit(&mut self, name_alg: u16, name: &[u8], bits: u32) -> TpmResult<(Vec<u8>, u16)> {
+    /// Nothing is recorded. Part 1 clause 44.2.3 assigns the counter in step
+    /// 13 and advances it in step 14, after step 12 has had its chance to
+    /// fail, so a caller derives here and calls [`Commits::take`] only once
+    /// everything else has succeeded.
+    pub fn next(&self, name_alg: u16, name: &[u8], bits: u32) -> TpmResult<(Vec<u8>, u16)> {
         if !self.is_ready() {
             return Err(TpmRc(rc::NO_RESULT));
         }
-        // A counter whose slot is still outstanding would overwrite a commit
-        // the caller has not finished with, so the array being full is
-        // reported rather than silently wrapping over it.
-        if self.outstanding() >= config::MAX_COMMIT_SEQUENCES as usize {
-            return Err(TpmRc(rc::MEMORY));
-        }
-        while self.is_set(self.count) {
-            self.count = self.count.wrapping_add(1);
-        }
-        let counter = self.count;
-        let r = self.derive(name_alg, name, counter, bits)?;
-        self.set(counter, true);
+        // Counters are issued in order, so the slot a new one takes is held
+        // only by the counter exactly one turn of the array behind it. That
+        // one has already fallen outside the window of clause 44.2.5 and can
+        // no longer be used, so taking its slot loses nothing. Clause 44.2.3
+        // has no answer for a full array, and with the window check there is
+        // no such thing.
+        let r = self.derive(name_alg, name, self.count, bits)?;
+        Ok((r, self.count as u16))
+    }
+
+    /// Record the counter [`Commits::next`] reported, which is steps 13 and 14.
+    pub fn take(&mut self, counter: u16) {
+        debug_assert_eq!(counter, self.count as u16);
+        self.set(self.count, true);
         self.count = self.count.wrapping_add(1);
-        Ok((r, counter))
+    }
+
+    /// The full width counter a sixteen bit one names, per clause 44.2.5.
+    ///
+    /// ```text
+    /// 1. set t := low-order 16 bits of commitCount
+    /// 2. verify that t - 2^N < counter < t else return TPM_RC_RANGE
+    /// ```
+    ///
+    /// A counter outside that window is one the array no longer speaks for.
+    /// Without the check a counter from an earlier turn of the array would
+    /// pass, because its slot may have been set again by a newer commit, and
+    /// the value it derived would be one that had already been used. Two ECDAA
+    /// signatures over the same commit value give away the private key, so
+    /// this check is what keeps a commit to a single use.
+    fn full_counter(&self, counter: u16) -> TpmResult<u64> {
+        let t = self.count as u16;
+        let age = t.wrapping_sub(counter);
+        if age == 0 || age as u32 >= config::MAX_COMMIT_SEQUENCES as u32 {
+            return Err(TpmRc(rc::RANGE));
+        }
+        // Steps 5 to 7 rebuild the wider counter, which is the current one
+        // less however far back the caller reached.
+        Ok(self.count - age as u64)
     }
 
     /// Recover the value for a counter and spend it.
@@ -141,26 +173,24 @@ impl Commits {
         counter: u16,
         bits: u32,
     ) -> TpmResult<Vec<u8>> {
-        if !self.is_set(counter) {
+        let full = self.full_counter(counter)?;
+        // Step 4.
+        if !self.is_set(full) {
             return Err(TpmRc(rc::VALUE));
         }
-        let r = self.derive(name_alg, name, counter, bits)?;
-        self.set(counter, false);
+        let r = self.derive(name_alg, name, full, bits)?;
+        // Step 9.
+        self.set(full, false);
         Ok(r)
     }
 
     /// Recover the value for a counter without spending it.
-    pub fn peek(
-        &self,
-        name_alg: u16,
-        name: &[u8],
-        counter: u16,
-        bits: u32,
-    ) -> TpmResult<Vec<u8>> {
-        if !self.is_set(counter) {
+    pub fn peek(&self, name_alg: u16, name: &[u8], counter: u16, bits: u32) -> TpmResult<Vec<u8>> {
+        let full = self.full_counter(counter)?;
+        if !self.is_set(full) {
             return Err(TpmRc(rc::VALUE));
         }
-        self.derive(name_alg, name, counter, bits)
+        self.derive(name_alg, name, full, bits)
     }
 
     /// How many commits are waiting to be used.
@@ -169,12 +199,12 @@ impl Commits {
     }
 
     /// The nonce and counter, so the state file can carry them.
-    pub fn parts(&self) -> (&[u8], u16, &[u8]) {
+    pub fn parts(&self) -> (&[u8], u64, &[u8]) {
         (&self.random, self.count, &self.used)
     }
 
     /// Put back what [`Commits::parts`] reported.
-    pub fn restore(&mut self, random: Vec<u8>, count: u16, used: Vec<u8>) {
+    pub fn restore(&mut self, random: Vec<u8>, count: u64, used: Vec<u8>) {
         self.random = random;
         self.count = count;
         self.used = used;
@@ -194,16 +224,23 @@ mod tests {
         c
     }
 
+    /// Derive and record in one step, which is what a command does once its
+    /// own work has succeeded.
+    fn issue(c: &mut Commits, name: &[u8]) -> (Vec<u8>, u16) {
+        let (r, counter) = c.next(alg::SHA256, name, 256).unwrap();
+        c.take(counter);
+        (r, counter)
+    }
+
     #[test]
     fn a_commit_gives_a_value_that_can_be_recovered_once() {
         let mut c = commits();
         let name = b"a name";
-        let (r, counter) = c.commit(alg::SHA256, name, 256).unwrap();
+        let (r, counter) = issue(&mut c, name);
         assert_eq!(r.len(), 32);
         assert_eq!(counter, 0);
         assert_eq!(c.outstanding(), 1);
 
-        // The same counter gives the same value back.
         let again = c.use_counter(alg::SHA256, name, counter, 256).unwrap();
         assert_eq!(again, r);
         assert_eq!(c.outstanding(), 0);
@@ -219,11 +256,10 @@ mod tests {
     fn each_commit_gives_a_different_value() {
         let mut c = commits();
         let name = b"a name";
-        let (r0, c0) = c.commit(alg::SHA256, name, 256).unwrap();
-        let (r1, c1) = c.commit(alg::SHA256, name, 256).unwrap();
+        let (r0, c0) = issue(&mut c, name);
+        let (r1, c1) = issue(&mut c, name);
         assert_ne!(c0, c1);
         assert_ne!(r0, r1);
-        // A different key Name gives a different value for the same counter.
         let other = c.peek(alg::SHA256, b"another name", c0, 256).unwrap();
         assert_ne!(other, r0);
     }
@@ -231,60 +267,141 @@ mod tests {
     #[test]
     fn a_counter_that_was_never_committed_is_refused() {
         let mut c = commits();
+        issue(&mut c, b"n");
+        // Inside the window but never handed out.
         assert_eq!(
-            c.use_counter(alg::SHA256, b"n", 7, 256).unwrap_err(),
-            TpmRc(rc::VALUE)
+            c.use_counter(alg::SHA256, b"n", 1, 256).unwrap_err(),
+            TpmRc(rc::RANGE)
         );
-        assert_eq!(c.peek(alg::SHA256, b"n", 7, 256).unwrap_err(), TpmRc(rc::VALUE));
+    }
+
+    #[test]
+    fn a_counter_from_an_earlier_turn_of_the_array_is_refused() {
+        // The heart of clause 44.2.5 step 2. Counter 0 is used, the counter
+        // walks all the way round, and counter 128 lands on the same slot.
+        // Replaying counter 0 must not recover the value counter 0 had, or
+        // two signatures would share a commit value and give away the key.
+        let mut c = commits();
+        let name = b"a name";
+        let (r0, zero) = issue(&mut c, name);
+        assert_eq!(zero, 0);
+        c.use_counter(alg::SHA256, name, zero, 256).unwrap();
+
+        // Walk the counter round until it comes back to slot zero.
+        for _ in 0..config::MAX_COMMIT_SEQUENCES - 1 {
+            let (_, n) = issue(&mut c, name);
+            c.use_counter(alg::SHA256, name, n, 256).unwrap();
+        }
+        // Counter 128 shares slot 0 with counter 0.
+        let (r128, one_two_eight) = issue(&mut c, name);
+        assert_eq!(one_two_eight, config::MAX_COMMIT_SEQUENCES);
+        assert_ne!(r128, r0);
+
+        // Replaying counter 0 is outside the window and is refused, even
+        // though its slot is set by the newer commit.
+        assert_eq!(
+            c.use_counter(alg::SHA256, name, 0, 256).unwrap_err(),
+            TpmRc(rc::RANGE),
+            "a stale counter reached a live slot"
+        );
+        // The newer commit is untouched by the attempt.
+        assert_eq!(c.outstanding(), 1);
+        assert_eq!(
+            c.use_counter(alg::SHA256, name, one_two_eight, 256).unwrap(),
+            r128
+        );
+    }
+
+    #[test]
+    fn the_window_is_the_counters_just_behind_the_current_one() {
+        let mut c = commits();
+        for _ in 0..10 {
+            issue(&mut c, b"n");
+        }
+        // The current counter has not been handed out.
+        assert_eq!(
+            c.use_counter(alg::SHA256, b"n", 10, 256).unwrap_err(),
+            TpmRc(rc::RANGE)
+        );
+        // One beyond it is not either.
+        assert_eq!(
+            c.use_counter(alg::SHA256, b"n", 11, 256).unwrap_err(),
+            TpmRc(rc::RANGE)
+        );
+        // The ones behind it are in the window and were handed out.
+        assert!(c.use_counter(alg::SHA256, b"n", 9, 256).is_ok());
+        assert!(c.use_counter(alg::SHA256, b"n", 0, 256).is_ok());
     }
 
     #[test]
     fn a_reset_drops_every_outstanding_commit() {
         let mut rng = Drbg::new(&[0x11u8; 48], b"t").unwrap();
         let mut c = commits();
-        let (r, counter) = c.commit(alg::SHA256, b"n", 256).unwrap();
+        let (r, counter) = issue(&mut c, b"n");
         assert_eq!(c.outstanding(), 1);
         c.reset(&mut rng).unwrap();
         assert_eq!(c.outstanding(), 0);
-        // The value cannot be recovered, because the nonce it came from is
-        // gone. That is what makes a commit survive no longer than the reset.
         assert!(c.use_counter(alg::SHA256, b"n", counter, 256).is_err());
-        let (again, _) = c.commit(alg::SHA256, b"n", 256).unwrap();
+        let (again, _) = issue(&mut c, b"n");
         assert_ne!(again, r);
     }
 
     #[test]
-    fn the_array_fills_and_says_so() {
+    fn the_oldest_slot_gives_way_rather_than_jamming() {
+        // A full array is not an error. The slot a new counter needs belongs
+        // to the counter one turn behind, which the window has already put
+        // out of reach, so committing always works and the oldest is what
+        // gives way.
         let mut c = commits();
         for _ in 0..config::MAX_COMMIT_SEQUENCES {
-            c.commit(alg::SHA256, b"n", 256).unwrap();
+            issue(&mut c, b"n");
         }
         assert_eq!(c.outstanding(), config::MAX_COMMIT_SEQUENCES as usize);
+        // Counter 0 is exactly one turn behind and is no longer usable.
         assert_eq!(
-            c.commit(alg::SHA256, b"n", 256).unwrap_err(),
-            TpmRc(rc::MEMORY)
+            c.use_counter(alg::SHA256, b"n", 0, 256).unwrap_err(),
+            TpmRc(rc::RANGE)
         );
-        // Spending one makes room again.
-        c.use_counter(alg::SHA256, b"n", 0, 256).unwrap();
-        assert!(c.commit(alg::SHA256, b"n", 256).is_ok());
+        // Committing still works, and takes the slot counter 0 held.
+        let (_, next) = issue(&mut c, b"n");
+        assert_eq!(next, config::MAX_COMMIT_SEQUENCES);
+        // The one just behind the new counter is still good.
+        assert!(c.use_counter(alg::SHA256, b"n", next, 256).is_ok());
     }
 
     #[test]
-    fn a_counter_wraps_onto_a_free_slot_rather_than_a_used_one() {
+    fn nothing_is_recorded_until_it_is_taken() {
+        // Part 1 clause 44.2.3 assigns the counter in step 13, after step 12
+        // has had its chance to fail. A command that gave up between the two
+        // must leave no trace.
         let mut c = commits();
-        // Take one, leave it outstanding, then walk the counter all the way
-        // round. The slot that is still in use must not be handed out again.
-        let (_, kept) = c.commit(alg::SHA256, b"n", 256).unwrap();
-        for _ in 0..config::MAX_COMMIT_SEQUENCES - 1 {
-            let (_, got) = c.commit(alg::SHA256, b"n", 256).unwrap();
-            assert_ne!(got, kept, "a slot still in use was handed out");
-        }
+        let (r, counter) = c.next(alg::SHA256, b"n", 256).unwrap();
+        assert_eq!(c.outstanding(), 0, "next must not record anything");
+        // Asking again gives the same answer, because nothing moved.
+        let (again, same) = c.next(alg::SHA256, b"n", 256).unwrap();
+        assert_eq!((r, counter), (again, same));
+        c.take(counter);
+        assert_eq!(c.outstanding(), 1);
     }
 
     #[test]
     fn a_generator_that_has_not_been_reset_produces_nothing() {
-        let mut c = Commits::new();
+        let c = Commits::new();
         assert!(!c.is_ready());
-        assert!(c.commit(alg::SHA256, b"n", 256).is_err());
+        assert!(c.next(alg::SHA256, b"n", 256).is_err());
+    }
+
+    #[test]
+    fn the_state_survives_a_round_trip() {
+        let mut c = commits();
+        let (r, counter) = issue(&mut c, b"n");
+        let (random, count, used) = c.parts();
+        let (random, count, used) = (random.to_vec(), count, used.to_vec());
+
+        let mut back = Commits::new();
+        back.restore(random, count, used);
+        assert!(back.is_ready());
+        assert_eq!(back.outstanding(), 1);
+        assert_eq!(back.use_counter(alg::SHA256, b"n", counter, 256).unwrap(), r);
     }
 }

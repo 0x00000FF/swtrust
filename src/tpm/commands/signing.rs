@@ -554,7 +554,7 @@ pub fn commit(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let bits = ((order.bits() + 7) / 8 * 8) as u32;
     let (r_bytes, counter) = state
         .commits
-        .commit(object.public.name_alg, &object.name, bits)?;
+        .next(object.public.name_alg, &object.name, bits)?;
     let r_value = crate::tpm::crypto::bn::BigNum::from_bytes(&r_bytes)?.modulo(&order, &ctx)?;
 
     let as_point = |p: ecc::Point| -> TpmResult<EccPoint> {
@@ -582,6 +582,10 @@ pub fn commit(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     } else if second.is_none() {
         e = as_point(ecc::multiply_generator(&curve, &r_value)?)?;
     }
+
+    // Steps 13 and 14. Nothing above this point has recorded the counter, so
+    // a command that failed at step 12 leaves the array and the count alone.
+    state.commits.take(counter);
 
     respond(move |w| {
         Tpm2bEccPoint { point: k }.marshal(w);

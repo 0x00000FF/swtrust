@@ -474,16 +474,16 @@ fn full_mqv_returns_one_point_computed_from_both_keys() {
 }
 
 #[test]
-fn a_commit_still_works_after_a_resume() {
-    // The commit nonce is not written to the state file, so a resumed TPM has
-    // to take a new one. Without that it would have none at all and every
-    // TPM2_Commit would fail for the life of the process.
+fn a_commit_survives_a_resume_and_a_restart_but_not_a_reset() {
+    // Part 1 Table 41 puts the commit values in the state reset data, and
+    // clause 34.4.4 saves that on any Shutdown(STATE) and restores it on the
+    // next Startup of any type, initializing it only on a TPM Reset.
     let h = harness("resume");
     let (handle, _) = primary(&h, 0x001A, Some(0));
 
     let r = commit(&h, handle, &empty_commit_params());
     assert_eq!(r.code, rc::SUCCESS);
-    let (_, before) = commit_response(&r.body);
+    let (_, counter) = commit_response(&r.body);
 
     // Shutdown(STATE) then Startup(STATE) is a TPM Resume.
     let r = send(&h, &command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
@@ -491,13 +491,48 @@ fn a_commit_still_works_after_a_resume() {
     let r = send(&h, &command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
     assert_eq!(r.code, rc::SUCCESS, "Startup(STATE) -> {:08x}", r.code);
 
-    // A key has to be reloaded after the resume, and committing works again.
+    // The key is gone with the resume, but it is a primary, so it comes back
+    // the same and with the same Name the commit was derived under.
+    let (handle, _) = primary(&h, 0x001A, Some(0));
+
+    // The commit made before the shutdown is still good.
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&[0x5au8; 32]);
+    p.u16(0x001A);
+    p.u16(alg::SHA256);
+    p.u16(counter);
+    p.u16(st::HASHCHECK);
+    p.u32(rh::NULL);
+    p.u16(0);
+    let r = send(
+        &h,
+        &command(
+            st::SESSIONS,
+            cc::Sign,
+            &[handle],
+            Some(&PASSWORD),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a commit did not survive a resume -> {:08x}",
+        r.code
+    );
+
+    // A TPM Reset is Shutdown(CLEAR) then Startup(CLEAR), and that does
+    // initialize them, so a new commit starts the counter again.
+    let r = send(&h, &command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = send(&h, &command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS, "Startup(CLEAR) -> {:08x}", r.code);
     let (handle, _) = primary(&h, 0x001A, Some(0));
     let r = commit(&h, handle, &empty_commit_params());
-    assert_eq!(r.code, rc::SUCCESS, "Commit after a resume -> {:08x}", r.code);
+    assert_eq!(r.code, rc::SUCCESS);
     let (_, after) = commit_response(&r.body);
-    assert_eq!(after, 0, "the counter starts again");
-    let _ = before;
+    assert_eq!(after, 0, "a TPM Reset starts the counter again");
 }
 
 #[test]
