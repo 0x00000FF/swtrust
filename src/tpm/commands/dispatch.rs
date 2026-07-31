@@ -266,6 +266,11 @@ pub fn parse(state: &TpmState, buf: &[u8], locality: u8) -> TpmResult<Request> {
 
     let mut sessions = Vec::new();
     if header.tag == st::SESSIONS {
+        // Part 3 clause 5.5 refuses a session area for the four commands whose
+        // tag is required to be TPM_ST_NO_SESSIONS.
+        if requires_no_sessions(header.code) {
+            return Err(TpmRc(rc::AUTH_CONTEXT));
+        }
         let auth_size = r.u32()? as usize;
         if auth_size < 9 {
             return Err(TpmRc(rc::AUTHSIZE));
@@ -940,7 +945,7 @@ pub fn update_audit(
     // command, and takes it away when any other auditable command runs. A
     // command that is allowed no session at all is not auditable and so
     // leaves the exclusive session alone.
-    if !takes_no_sessions(request.code) {
+    if !requires_no_sessions(request.code) {
         state.audit.exclusive_session = match audit_index {
             Some(index) => request.sessions[index].handle,
             None => rh::UNASSIGNED,
@@ -961,12 +966,15 @@ pub fn update_audit(
     Ok(())
 }
 
-/// True for the commands Part 1 clause 17.2 lists as carrying no session, and
-/// therefore as leaving the current exclusive audit session alone.
-fn takes_no_sessions(code: u32) -> bool {
+/// True for the four commands whose tag Part 3 requires to be
+/// TPM_ST_NO_SESSIONS.
+///
+/// They can carry no audit session, so Part 1 clause 17.2 also leaves the
+/// current exclusive audit session alone when one of them runs.
+pub fn requires_no_sessions(code: u32) -> bool {
     matches!(
         code,
-        cc::ContextSave | cc::ContextLoad | cc::FlushContext | cc::Startup | cc::ReadClock
+        cc::ContextSave | cc::ContextLoad | cc::FlushContext | cc::Startup
     )
 }
 
@@ -1293,6 +1301,24 @@ mod tests {
         let req = parse(&state, &buf, 0).unwrap();
         let e = entity(&state, rh::OWNER).unwrap();
         assert!(check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn a_session_area_is_refused_where_the_tag_must_be_no_sessions() {
+        let state = TpmState::manufacture().unwrap();
+        let auth = password_auth(b"");
+        for code in [
+            cc::Startup,
+            cc::ContextSave,
+            cc::ContextLoad,
+            cc::FlushContext,
+        ] {
+            let buf = command(st::SESSIONS, code, &[], &auth, &[]);
+            assert_eq!(parse(&state, &buf, 0).unwrap_err(), TpmRc(rc::AUTH_CONTEXT));
+        }
+        // TPM2_ReadClock does take an audit session, so it is not refused.
+        let buf = command(st::SESSIONS, cc::ReadClock, &[], &auth, &[]);
+        assert!(parse(&state, &buf, 0).is_ok());
     }
 
     #[test]
