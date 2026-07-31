@@ -11,6 +11,7 @@ pub mod core;
 pub mod crypto;
 pub mod device;
 pub mod error;
+pub mod fips;
 pub mod marshal;
 pub mod persist;
 pub mod structures;

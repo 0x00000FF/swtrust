@@ -195,6 +195,12 @@ pub struct TpmState {
     pub nv_available: bool,
     pub failure_mode: bool,
     pub self_test_done: bool,
+    /// Digest of the running image from the pre-operational integrity test,
+    /// reported by TPM2_GetTestResult.
+    pub test_digest: Vec<u8>,
+    /// The self test that failed, if one did. TPM2_GetTestResult reports it in
+    /// place of the digest so a failure says which test it was.
+    pub test_failure: Option<String>,
     pub rng: Drbg,
     /// Data collected between _TPM_Hash_Start and _TPM_Hash_End.
     pub hcrtm_buffer: Option<Vec<u8>>,
@@ -256,6 +262,8 @@ impl TpmState {
             nv_available: true,
             failure_mode: false,
             self_test_done: true,
+            test_digest: Vec::new(),
+            test_failure: None,
             rng,
             hcrtm_buffer: None,
             command_audit_suppressed: false,

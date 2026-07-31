@@ -8,6 +8,7 @@ use crate::tpm::core::pcr;
 use crate::tpm::core::state::TpmState;
 use crate::tpm::crypto::{ecc, hash, rand::Rng, sym};
 use crate::tpm::error::{TpmRc, TpmResult};
+use crate::tpm::fips;
 use crate::tpm::marshal::{Marshal, Unmarshal};
 use crate::tpm::structures::attributes::{CommandAttributes, PermanentAttributes};
 use crate::tpm::structures::base::{PcrSelect, Tpm2bDigest};
@@ -67,18 +68,59 @@ pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
 }
 
 /// TPM2_SelfTest, Part 3 clause 10.2.
+///
+/// fullTest of YES repeats every test whether or not it has already been run,
+/// which is the periodic self test both FIPS 140-2 and FIPS 140-3 ask for. NO
+/// tests only what has not been tested yet, and since a power on runs the
+/// whole set that leaves nothing to do.
+///
+/// A failed test puts the TPM in failure mode, as Part 1 clause 12.3 and
+/// clause 10.3.1 of the FIPS 140-3 guidance both require, so no further
+/// cryptographic output is produced.
 pub fn self_test(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let _full_test = r.u8()?;
+    let full_test = r.u8()?;
     r.expect_end()?;
-    state.self_test_done = true;
+    if full_test == 0 && state.self_test_done {
+        return respond(|_| Ok(()));
+    }
+    run_self_tests(state)?;
     respond(|_| Ok(()))
+}
+
+/// Run every known answer test and record the outcome.
+///
+/// A failure sets failure mode and answers TPM_RC_FAILURE. The digest of the
+/// running image is kept so TPM2_GetTestResult can report it.
+pub fn run_self_tests(state: &mut TpmState) -> TpmResult<()> {
+    match fips::known_answer_tests(&mut state.rng) {
+        Ok(()) => {}
+        Err(fips::Failure(which)) => {
+            state.failure_mode = true;
+            state.self_test_done = false;
+            state.test_failure = Some(which.to_string());
+            return Err(TpmRc(rc::FAILURE));
+        }
+    }
+    match fips::integrity() {
+        Ok(digest) => state.test_digest = digest,
+        Err(fips::Failure(which)) => {
+            state.failure_mode = true;
+            state.self_test_done = false;
+            state.test_failure = Some(which.to_string());
+            return Err(TpmRc(rc::FAILURE));
+        }
+    }
+    state.self_test_done = true;
+    state.test_failure = None;
+    Ok(())
 }
 
 /// TPM2_IncrementalSelfTest, Part 3 clause 10.3.
 ///
-/// Every algorithm this TPM implements is tested at power on, so nothing is
-/// ever left to do and the returned list is always empty.
+/// The answer is the subset of `toTest` that has not been tested yet. A power
+/// on runs the whole set, so the list is empty unless a test has been asked
+/// for an algorithm this TPM does not cover.
 pub fn incremental_self_test(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let to_test = TpmlAlg::unmarshal(&mut r)?;
@@ -88,18 +130,35 @@ pub fn incremental_self_test(state: &mut TpmState, request: &Request) -> TpmResu
             return Err(TpmRc(rc::VALUE).with_parameter(1));
         }
     }
-    state.self_test_done = true;
-    respond(|w| {
-        TpmlAlg::empty().marshal(w);
+    if !state.self_test_done {
+        run_self_tests(state)?;
+    }
+    // Anything asked for that no known answer test covers is still untested,
+    // and saying so is more honest than reporting an empty list.
+    let remaining: Vec<u16> = to_test
+        .items
+        .iter()
+        .copied()
+        .filter(|a| !fips::TESTED_ALGORITHMS.contains(a))
+        .collect();
+    respond(move |w| {
+        TpmlAlg::new(remaining)?.marshal(w);
         Ok(())
     })
 }
 
 /// TPM2_GetTestResult, Part 3 clause 10.4.
+///
+/// outData carries the digest of the running image that the pre-operational
+/// integrity test produced, or the name of the test that failed.
 pub fn get_test_result(state: &TpmState, _request: &Request) -> TpmResult<Response> {
     let failure = state.failure_mode;
+    let data = match &state.test_failure {
+        Some(which) => which.as_bytes().to_vec(),
+        None => state.test_digest.clone(),
+    };
     respond(move |w| {
-        Tpm2bDigest::empty().marshal(w);
+        Tpm2bDigest::new(data)?.marshal(w);
         w.u32(if failure { rc::FAILURE } else { rc::SUCCESS });
         Ok(())
     })

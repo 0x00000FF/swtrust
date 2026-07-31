@@ -105,6 +105,13 @@ impl Drbg {
         SystemRandom::new()
             .fill(&mut seed)
             .map_err(|_| TpmRc(rc::FAILURE))?;
+        // The continuous random number generator test FIPS 140-2 asks for.
+        // SP800-90B gives the repetition count and adaptive proportion tests,
+        // which catch a source that has failed to a constant or to something
+        // close to one. Seed material that fails them is not used.
+        crate::tpm::fips::HealthTests::new()
+            .check(&seed)
+            .map_err(|_| TpmRc(rc::FAILURE))?;
         Drbg::new(&seed, b"swtrust")
     }
 
@@ -155,7 +162,7 @@ impl Drbg {
         self.reseed_counter
     }
 
-    /// The Key of the SP800-90A CTR_DRBG working state.
+    /// The Key of the SP800-90A HMAC_DRBG working state.
     ///
     /// This is secret while the TPM is running. It is exposed so the debug
     /// console can report the working state, which is the only way to see
@@ -164,7 +171,7 @@ impl Drbg {
         &self.key
     }
 
-    /// The V of the SP800-90A CTR_DRBG working state.
+    /// The V of the SP800-90A HMAC_DRBG working state.
     pub fn value(&self) -> &[u8] {
         &self.value
     }

@@ -85,6 +85,38 @@ command: it checks no authorization, records no audit, and can put the TPM
 in a state no sequence of commands could reach. It is a debugging aid, and
 it is off unless asked for.
 
+### FIPS self tests
+
+The TCG FIPS 140-2 guidance for TPM 2.0, clause 13, and the FIPS 140-3
+guidance, clause 10, ask for three kinds of test. All three are in
+`src/tpm/fips.rs`.
+
+A pre-operational software integrity test runs at power on, before any
+command is accepted. Known answer tests cover SHA-1, SHA-256, SHA-384, HMAC,
+AES in CFB mode both ways, KDFa, KDFe, the DRBG across instantiate, generate
+and reseed, ECDH, ECDSA and RSA. A pair-wise consistency test runs on every
+key pair the TPM generates, inside TPM2_Create and TPM2_CreatePrimary.
+
+`TPM2_SelfTest(fullTest = YES)` repeats the whole set, which is the periodic
+test both standards ask for. A failure puts the TPM in failure mode, where it
+produces no further cryptographic output, and `TPM2_GetTestResult` names the
+test that failed. The repetition count and adaptive proportion tests of
+SP800-90B are applied to the seed material taken from the platform, which is
+the continuous test FIPS 140-2 asks for.
+
+Every known answer vector was produced by an implementation other than this
+one, and the ones with published values are those values: the digests of
+"abc" from FIPS 180-4, RFC 4231 test case 2 for HMAC, and the first CFB128
+block of NIST SP800-38A section F.3.13.
+
+What a software TPM cannot assert is written down in the module
+documentation rather than glossed over. The integrity test hashes the
+executable it was started from, so it detects a corrupted build but not a
+process whose memory changed after loading, and the expected value cannot be
+held anywhere the host cannot reach. The entropy source belongs to the
+platform, so its rate cannot be established here. Keys live in ordinary
+process memory, so zeroisation and physical security are out of scope.
+
 ## Layout
 
 ```
@@ -94,6 +126,7 @@ src/
   logging.rs             the daily command log
   server/                transports: simulator protocol, TCP, named pipe
   tpm/
+    fips.rs              FIPS 140-2 and 140-3 self tests
     constants.rs         Part 2 constant tables
     config.rs            implementation dependent values
     error.rs             response codes and their qualifiers

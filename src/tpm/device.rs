@@ -207,6 +207,20 @@ impl Device for Tpm {
             state.physical_presence = false;
             state.failure_mode = false;
             state.clock.time = 0;
+
+            // The pre-operational self tests of FIPS 140-3 clause 10.3, which
+            // FIPS 140-2 calls the power-up tests, run here. Power has just
+            // been applied and no command has been accepted, so nothing has
+            // been output yet. A failure leaves the TPM in failure mode, where
+            // Part 1 clause 12.3 allows only the few commands that report it.
+            match crate::tpm::commands::management::run_self_tests(&mut state) {
+                Ok(()) => self.logger.line("self tests passed"),
+                Err(_) => {
+                    let which = state.test_failure.clone().unwrap_or_default();
+                    self.logger
+                        .line(&format!("self test failed: {which}, entering failure mode"));
+                }
+            }
         }
         self.logger.line("_TPM_Init");
     }

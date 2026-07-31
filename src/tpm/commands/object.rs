@@ -101,6 +101,13 @@ fn create_sensitive(
                 return Err(TpmRc(rc::TYPE));
             };
             let key = rsa::generate(rng, key_bits, exponent)?;
+            // FIPS 140-3 Table 40 asks for a pair-wise consistency test on
+            // every generated key pair, before the key is used for anything.
+            crate::tpm::fips::pairwise_rsa(
+                &key,
+                attrs.has(ObjectAttributes::SIGN_ENCRYPT),
+                attrs.has(ObjectAttributes::DECRYPT),
+            )?;
             (
                 SensitiveComposite::Rsa(Tpm2bPrivateKeyRsa::new(key.prime_bytes()?)?),
                 PublicId::Rsa(Tpm2bPublicKeyRsa::new(key.modulus_bytes()?)?),
@@ -115,6 +122,17 @@ fn create_sensitive(
             };
             let key = ecc::generate(curve_id, rng)?;
             let size = key.curve.coordinate_size();
+            // The same pair-wise consistency test for an ECC key. The public
+            // point is recomputed from the private scalar whatever the key is
+            // for, and a signing key also signs and verifies.
+            crate::tpm::fips::pairwise_ecc(
+                curve_id,
+                &key.private.to_bytes_padded(size)?,
+                &key.public_x,
+                &key.public_y,
+                attrs.has(ObjectAttributes::SIGN_ENCRYPT),
+                rng,
+            )?;
             (
                 SensitiveComposite::Ecc(Tpm2bEccParameter::new(
                     key.private.to_bytes_padded(size)?,
