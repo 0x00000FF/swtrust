@@ -117,7 +117,18 @@ pub enum SequenceKind {
 /// A sequence has no length limit in the specification, but a software TPM
 /// cannot grow without bound, so a sequence that exceeds this reports
 /// TPM_RC_MEMORY rather than exhausting the host.
-pub const MAX_SEQUENCE_BYTES: usize = 64 * 1024 * 1024;
+///
+/// TPM2_HashSequenceStart needs no authorization, so a caller can hold
+/// `MAX_LOADED_OBJECTS` sequences at once. The bound is therefore chosen so
+/// that all of them together stay well inside what a host can spare, while
+/// still being far larger than the TPM2B_MAX_BUFFER a single
+/// TPM2_SequenceUpdate carries.
+///
+/// A sequence longer than a saved context can hold cannot be swapped out, and
+/// TPM2_ContextSave answers TPM_RC_SIZE for it. That is a consequence of
+/// buffering the data rather than folding it into a hash state, which is what
+/// makes a sequence context serialisable at all.
+pub const MAX_SEQUENCE_BYTES: usize = 1024 * 1024;
 
 impl Sequence {
     /// Append to the sequence.
