@@ -188,8 +188,24 @@ that hierarchy unloadable.
   and TPM_RC_UPGRADE because the firmware is not field upgradeable.
 - TPM2_Encapsulate and TPM2_Decapsulate work over ECC. The ML-KEM form is
   refused with TPM_RC_TYPE, as ML-KEM is not implemented.
-- TPM2_Commit returns a commitment but keeps no commitment table, so the
-  counter it returns is always zero.
+
+### Split ECC operations
+
+TPM2_Commit, TPM2_EC_Ephemeral, ECDAA signing and TPM2_ZGen_2Phase are the two
+command operations of Part 1 clause 44.2. The first command produces a commit
+value and returns points derived from it with a counter; the second names that
+counter and gets the same value back.
+
+The value is not stored. Clause 44.2.2 derives it by Equation 60 from a nonce,
+a counter and the Name of the key, so what is kept is the nonce, the counter
+and a bit array of outstanding counters. Clause 44.2.5 bounds which counters a
+caller may still name, which is what keeps a value to one use: two ECDAA
+signatures over one commit value would give up the private key. Part 1 Table 41
+puts all three in the state reset data, so they are written on
+Shutdown(STATE), restored by the next Startup, and replaced only by a TPM
+Reset.
+
+TPM_PT_SPLIT_MAX reports how many split operations may be outstanding at once.
 
 ## Platform profile
 
@@ -220,10 +236,24 @@ TPM2_GetCapability(TPM_CAP_ALGS) matches what it actually implements.
 
 ```
 cargo test
+cargo test --release
 ```
+
+Both profiles are worth running. The debug profile has overflow checks on and
+the release profile does not, so an arithmetic mistake shows in only one of
+them.
 
 The unit tests check structures against the Part 2 tables and the cryptography
 against published vectors: FIPS 180-4 and FIPS 202 for the hashes, RFC 2202 and
 RFC 4231 for HMAC, FIPS 197 and SP800-38A for AES, and the standard curve
 parameters for ECC. The integration tests drive the TPM through real command
-buffers over its own interface.
+buffers over its own interface, including the split ECC operations end to end
+and a commit that has to survive being rebuilt from the state file.
+
+Two tests read the sources themselves rather than running them: one requires
+every command to check the end of its parameter area before it changes
+anything, and one requires every ECC key pair to be generated through the one
+function that runs the pair-wise consistency test.
+
+The socket tests take a free port and then bind it, so an unrelated process
+taking that port in between can make them fail. Rerun them if that happens.
