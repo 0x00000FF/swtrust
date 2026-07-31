@@ -248,8 +248,9 @@ pub fn pp_commands(state: &mut TpmState, request: &Request) -> TpmResult<Respons
 /// TPM2_SetAlgorithmSet, Part 3 clause 26.3.
 pub fn set_algorithm_set(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    state.algorithm_set = r.u32()?;
+    let algorithm_set = r.u32()?;
     r.expect_end()?;
+    state.algorithm_set = algorithm_set;
     respond(|_| Ok(()))
 }
 

@@ -260,53 +260,6 @@ fn unmarshal_session(body: &[u8]) -> TpmResult<Session> {
     Ok(session)
 }
 
-#[cfg(test)]
-mod policy_context_tests {
-    use super::*;
-    use crate::tpm::constants::se;
-    use crate::tpm::structures::schemes::SymDef;
-
-    #[test]
-    fn a_saved_session_keeps_every_policy_assertion() {
-        let mut session = Session::new(
-            hc::POLICY_SESSION_FIRST,
-            se::POLICY,
-            alg::SHA256,
-            vec![1u8; 32],
-            vec![2u8; 32],
-            vec![3u8; 32],
-            rh::NULL,
-            Vec::new(),
-            SymDef::null(),
-        )
-        .unwrap();
-        session.start_time = 1234;
-        session.time_epoch = 7;
-        session.policy.digest = vec![9u8; 32];
-        session.policy.command_code = Some(crate::tpm::constants::cc::Unseal);
-        session.policy.cp_hash = Some(vec![4u8; 32]);
-        session.policy.name_hash = Some(vec![5u8; 32]);
-        session.policy.locality = Some(0b0000_0100);
-        session.policy.pcr_update_counter = Some(11);
-        session.policy.auth_value_needed = true;
-        session.policy.password_needed = true;
-        session.policy.nv_written = Some(true);
-        session.policy.template_hash = Some(vec![6u8; 32]);
-        session.policy.parameters_hash = Some(vec![7u8; 32]);
-        session.policy.physical_presence_required = true;
-        session.policy.expiration = Some(5000);
-        session.policy.timeout_nonce = vec![8u8; 16];
-
-        // Part 1 clause 27.2.1 rebuilds the whole session from the context, so
-        // a reloaded one carries every restriction it had.
-        let body = marshal_session(&session).unwrap();
-        let back = unmarshal_session(&body).unwrap();
-        assert_eq!(back.policy, session.policy);
-        assert_eq!(back.start_time, session.start_time);
-        assert_eq!(back.time_epoch, session.time_epoch);
-    }
-}
-
 /// TPM2_ContextSave, Part 3 clause 28.2.
 pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
@@ -361,6 +314,7 @@ pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Respon
 pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let context = Context::unmarshal(&mut r)?;
+    r.expect_end()?;
 
     if context.sequence > state.sessions.context_counter() {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
@@ -396,6 +350,7 @@ pub fn evict_control(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let object_handle = request.handle(1)?;
     let mut r = request.reader();
     let persistent_handle = r.u32()?;
+    r.expect_end()?;
 
     if !(hc::PERSISTENT_FIRST..=hc::PERSISTENT_LAST).contains(&persistent_handle) {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
@@ -576,5 +531,52 @@ mod tests {
         assert!(is_saved_object_handle(saved::TRANSIENT_STCLEAR));
         assert!(!is_saved_object_handle(hc::HMAC_SESSION_FIRST));
         assert_eq!(context_hash(), config::CONTEXT_INTEGRITY_HASH_ALG);
+    }
+}
+
+#[cfg(test)]
+mod policy_context_tests {
+    use super::*;
+    use crate::tpm::constants::se;
+    use crate::tpm::structures::schemes::SymDef;
+
+    #[test]
+    fn a_saved_session_keeps_every_policy_assertion() {
+        let mut session = Session::new(
+            hc::POLICY_SESSION_FIRST,
+            se::POLICY,
+            alg::SHA256,
+            vec![1u8; 32],
+            vec![2u8; 32],
+            vec![3u8; 32],
+            rh::NULL,
+            Vec::new(),
+            SymDef::null(),
+        )
+        .unwrap();
+        session.start_time = 1234;
+        session.time_epoch = 7;
+        session.policy.digest = vec![9u8; 32];
+        session.policy.command_code = Some(crate::tpm::constants::cc::Unseal);
+        session.policy.cp_hash = Some(vec![4u8; 32]);
+        session.policy.name_hash = Some(vec![5u8; 32]);
+        session.policy.locality = Some(0b0000_0100);
+        session.policy.pcr_update_counter = Some(11);
+        session.policy.auth_value_needed = true;
+        session.policy.password_needed = true;
+        session.policy.nv_written = Some(true);
+        session.policy.template_hash = Some(vec![6u8; 32]);
+        session.policy.parameters_hash = Some(vec![7u8; 32]);
+        session.policy.physical_presence_required = true;
+        session.policy.expiration = Some(5000);
+        session.policy.timeout_nonce = vec![8u8; 16];
+
+        // Part 1 clause 27.2.1 rebuilds the whole session from the context, so
+        // a reloaded one carries every restriction it had.
+        let body = marshal_session(&session).unwrap();
+        let back = unmarshal_session(&body).unwrap();
+        assert_eq!(back.policy, session.policy);
+        assert_eq!(back.start_time, session.start_time);
+        assert_eq!(back.time_epoch, session.time_epoch);
     }
 }

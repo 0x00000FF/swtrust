@@ -30,9 +30,17 @@ mod tests {
 
     /// The bodies of the public command functions in one module.
     fn command_bodies(source: &str) -> Vec<(String, String)> {
-        // Everything before the test module is the command code.
+        // Everything before the first test section is the command code. No
+        // command may follow it, or the scan would not see that command.
         let source = match source.find("#[cfg(test)]") {
-            Some(i) => &source[..i],
+            Some(i) => {
+                assert!(
+                    !source[i..].contains("
+pub fn "),
+                    "a command follows a test section, so the scan would miss it"
+                );
+                &source[..i]
+            }
             None => source,
         };
         let mut out = Vec::new();
@@ -46,6 +54,40 @@ mod tests {
             rest = &after[body_end.saturating_sub(1)..];
         }
         out
+    }
+
+    /// True when the text reads from the parameter reader named `r`.
+    ///
+    /// A read is either a method on `r` or a call that borrows it, and the
+    /// name has to be `r` itself rather than one that merely starts with it.
+    fn reads_from_r(text: &str) -> bool {
+        for form in [
+            "&mut r)", "&mut r,", "&mut r ", "r.u8()", "r.i8()", "r.u16()",
+            "r.u32()", "r.u64()", "r.take(", "r.take_rest(", "r.sub(",
+        ] {
+            for (i, _) in text.match_indices(form) {
+                // A method call has to be on `r`, not on a longer name.
+                let before = text[..i].chars().next_back().unwrap_or(' ');
+                if !before.is_alphanumeric() && before != '_' && before != '.' {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The first assignment into the TPM state, if the text has one.
+    fn writes_state(text: &str) -> Option<&str> {
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with("//") {
+                continue;
+            }
+            if t.starts_with("state.") && t.contains(" = ") {
+                return Some("the state");
+            }
+        }
+        None
     }
 
     #[test]
@@ -62,13 +104,14 @@ mod tests {
                         // No parameter may be read after the check, or the
                         // check would pass while octets are still unread.
                         let after = &body[at + "r.expect_end()?;".len()..];
-                        // "&mut r" has to be the reader itself, not a name
-                        // that merely starts with it such as "&mut rng".
-                        let reads_again = after.contains("&mut r)")
-                            || after.contains("&mut r,")
-                            || after.contains("&mut r ");
-                        if reads_again {
+                        if reads_from_r(after) {
                             problems.push(format!("{file}::{name} checks too early"));
+                        }
+                        // Nothing may change the state before the check, or a
+                        // malformed command leaves that change behind.
+                        let before = &body[..at];
+                        if let Some(what) = writes_state(before) {
+                            problems.push(format!("{file}::{name} changes {what} first"));
                         }
                     }
                 }
