@@ -16,7 +16,9 @@ use crate::tpm::structures::keys::{PublicId, PublicParms};
 use crate::tpm::structures::schemes::{EccPoint, Scheme, Tpm2bEccPoint};
 use crate::tpm::structures::signature::{Ticket, TpmtSignature, VerifiedTicket};
 
-use super::crypto::{sign_digest, signing_scheme, verify_digest_public, verify_hash_ticket};
+use super::crypto::{
+    sign_digest, signing_scheme, verified_ticket_hmac, verify_digest_public, verify_hash_ticket,
+};
 use super::dispatch::{Request, Response};
 use super::execute::{respond, respond_with_handle};
 
@@ -112,15 +114,12 @@ pub fn verify_digest_signature(state: &TpmState, request: &Request) -> TpmResult
         let proof = state.hierarchy_proof(hierarchy)?.to_vec();
         // The metadata of a digest verification ticket is the hash that made
         // the digest, so it is part of the HMAC.
-        let hmac = crate::tpm::crypto::hmac::hmac_parts(
-            crate::tpm::config::CONTEXT_INTEGRITY_HASH_ALG,
+        let hmac = verified_ticket_hmac(
             &proof,
-            &[
-                &st::DIGEST_VERIFIED.to_be_bytes(),
-                digest.as_slice(),
-                &object.name,
-                &hash_alg.to_be_bytes(),
-            ],
+            st::DIGEST_VERIFIED,
+            digest.as_slice(),
+            &object.name,
+            Some(hash_alg),
         )?;
         VerifiedTicket {
             tag: st::DIGEST_VERIFIED,
@@ -293,10 +292,12 @@ pub fn verify_sequence_complete(state: &mut TpmState, request: &Request) -> TpmR
         }
     } else {
         let proof = state.hierarchy_proof(hierarchy)?.to_vec();
-        let hmac = crate::tpm::crypto::hmac::hmac_parts(
-            crate::tpm::config::CONTEXT_INTEGRITY_HASH_ALG,
+        let hmac = verified_ticket_hmac(
             &proof,
-            &[&st::MESSAGE_VERIFIED.to_be_bytes(), &digest, &object.name],
+            st::MESSAGE_VERIFIED,
+            &digest,
+            &object.name,
+            None,
         )?;
         VerifiedTicket {
             tag: st::MESSAGE_VERIFIED,

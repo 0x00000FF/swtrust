@@ -12,7 +12,7 @@ use crate::tpm::structures::base::{
 };
 use crate::tpm::structures::lists::{TpmlDigest, TpmlPcrSelection};
 use crate::tpm::structures::schemes::SymDef;
-use crate::tpm::structures::signature::Ticket;
+use crate::tpm::structures::signature::{Ticket, VerifiedTicket};
 
 use super::dispatch::{Request, Response};
 use super::execute::{respond, respond_with_handle};
@@ -215,6 +215,7 @@ fn policy_authorization_update(
 ///  timeEpoch || resetCount)`. The epoch and reset count are part of the
 /// transcript so a ticket cannot outlive the clock it was issued against.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn authorization_ticket_hmac(
     state: &TpmState,
     hierarchy: u32,
@@ -223,20 +224,28 @@ fn authorization_ticket_hmac(
     policy_ref: &[u8],
     auth_name: &[u8],
     timeout: &[u8],
+    with_nonce: bool,
 ) -> TpmResult<Vec<u8>> {
     let proof = state.hierarchy_proof(hierarchy)?.to_vec();
+    let expires = timeout.iter().any(|b| *b != 0);
+    let tag_bytes = tag.to_be_bytes();
+    let epoch = state.clock.reset_count.to_be_bytes();
+    let reset = state.clock.total_reset_count.to_be_bytes();
+    let mut parts: Vec<&[u8]> =
+        vec![&tag_bytes, cp_hash_a, policy_ref, auth_name, timeout];
+    // Part 3 clause 23.2.5 leaves the timeEpoch out when the ticket does not
+    // expire, and the reset count out when it does not expire or when the
+    // authorization already covered nonceTPM.
+    if expires {
+        parts.push(&epoch);
+        if !with_nonce {
+            parts.push(&reset);
+        }
+    }
     crate::tpm::crypto::hmac::hmac_parts(
         crate::tpm::config::CONTEXT_INTEGRITY_HASH_ALG,
         &proof,
-        &[
-            &tag.to_be_bytes(),
-            cp_hash_a,
-            policy_ref,
-            auth_name,
-            timeout,
-            &state.clock.total_reset_count.to_be_bytes(),
-            &state.clock.reset_count.to_be_bytes(),
-        ],
+        &parts,
     )
 }
 
@@ -257,8 +266,61 @@ fn ticket_hierarchy(state: &TpmState, auth_handle: u32) -> u32 {
     if let Some(o) = state.persistent.get(&auth_handle) {
         return o.hierarchy;
     }
-    // An NV Index or a permanent handle belongs to the storage hierarchy.
+    if crate::tpm::core::nv::NvStore::is_nv_handle(auth_handle) {
+        // An Index the platform created belongs to the platform hierarchy, so
+        // a change of platform seed invalidates a ticket that used it.
+        if let Ok(index) = state.nv.get(auth_handle) {
+            return if index
+                .public
+                .attributes
+                .has(crate::tpm::structures::attributes::NvAttributes::PLATFORMCREATE)
+            {
+                rh::PLATFORM
+            } else {
+                rh::OWNER
+            };
+        }
+    }
+    // TPM_RH_LOCKOUT and the other permanent handles sit with the platform
+    // values in the permanent state.
+    if auth_handle == rh::LOCKOUT || auth_handle == rh::PLATFORM_NV {
+        return rh::PLATFORM;
+    }
     rh::OWNER
+}
+
+/// The bit of a timeout that records that it also expires on a TPM Reset.
+///
+/// A timeout is a count of milliseconds, so the top bit is never part of a
+/// real value and carries this flag from TPM2_PolicySigned to
+/// TPM2_PolicyTicket instead.
+const EXPIRES_ON_RESET: u64 = 1 << 63;
+
+/// The timeout an authorization returns.
+///
+/// A non-negative expiration means the authorization does not expire, which
+/// Part 3 clause 23.2.4 answers with an empty buffer.
+fn authorization_timeout(state: &TpmState, expiration: i32, without_nonce: bool) -> Vec<u8> {
+    if expiration >= 0 {
+        return Vec::new();
+    }
+    let mut expires = state
+        .clock
+        .time
+        .saturating_add((-(expiration as i64)) as u64 * 1000);
+    if without_nonce {
+        expires |= EXPIRES_ON_RESET;
+    }
+    expires.to_be_bytes().to_vec()
+}
+
+/// The expiry time in a timeout, without the reset flag.
+fn timeout_value(timeout: &[u8]) -> Option<u64> {
+    if timeout.len() != 8 {
+        return None;
+    }
+    let raw = u64::from_be_bytes(timeout.try_into().ok()?);
+    Some(raw & !EXPIRES_ON_RESET)
 }
 
 /// Build the ticket a policy authorization returns.
@@ -278,6 +340,7 @@ fn build_authorization_ticket(
     policy_ref: &[u8],
     auth_name: &[u8],
     is_trial: bool,
+    with_nonce: bool,
 ) -> TpmResult<Ticket> {
     if expiration >= 0 || is_trial {
         return Ok(Ticket::null(tag));
@@ -290,6 +353,7 @@ fn build_authorization_ticket(
         policy_ref,
         auth_name,
         timeout,
+        with_nonce,
     )?;
     Ok(Ticket {
         tag,
@@ -349,13 +413,9 @@ pub fn policy_signed(state: &mut TpmState, request: &Request) -> TpmResult<Respo
             .map_err(|_| TpmRc(rc::POLICY_FAIL))?;
     }
 
-    // The timeout is the absolute time the authorization expires.
-    let timeout = if expiration < 0 {
-        let expires = state.clock.time.saturating_add((-(expiration as i64)) as u64 * 1000);
-        expires.to_be_bytes().to_vec()
-    } else {
-        Vec::new()
-    };
+    // The timeout is the absolute time the authorization expires, with the
+    // top bit recording that it also expires on a TPM Reset.
+    let timeout = authorization_timeout(state, expiration, nonce_tpm.is_empty());
     let hierarchy = ticket_hierarchy(state, auth_object);
     let ticket = build_authorization_ticket(
         state,
@@ -367,6 +427,7 @@ pub fn policy_signed(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         policy_ref.as_slice(),
         &auth_name,
         is_trial,
+        !nonce_tpm.is_empty(),
     )?;
 
     let s = policy_session(state, policy_session_handle)?;
@@ -375,9 +436,7 @@ pub fn policy_signed(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         s.policy.cp_hash = Some(cp_hash_a.as_slice().to_vec());
     }
     if expiration < 0 {
-        s.policy.expiration = Some(u64::from_be_bytes(
-            timeout.clone().try_into().unwrap_or([0u8; 8]),
-        ));
+        s.policy.expiration = timeout_value(&timeout);
     }
 
     respond(move |w| {
@@ -409,12 +468,7 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
 
-    let timeout = if expiration < 0 {
-        let expires = state.clock.time.saturating_add((-(expiration as i64)) as u64 * 1000);
-        expires.to_be_bytes().to_vec()
-    } else {
-        Vec::new()
-    };
+    let timeout = authorization_timeout(state, expiration, nonce_tpm.is_empty());
     let hierarchy = ticket_hierarchy(state, auth_handle);
     let ticket = build_authorization_ticket(
         state,
@@ -426,6 +480,7 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         policy_ref.as_slice(),
         &auth_name,
         is_trial,
+        !nonce_tpm.is_empty(),
     )?;
 
     let s = policy_session(state, policy_session_handle)?;
@@ -434,9 +489,7 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         s.policy.cp_hash = Some(cp_hash_a.as_slice().to_vec());
     }
     if expiration < 0 {
-        s.policy.expiration = Some(u64::from_be_bytes(
-            timeout.clone().try_into().unwrap_or([0u8; 8]),
-        ));
+        s.policy.expiration = timeout_value(&timeout);
     }
 
     respond(move |w| {
@@ -460,6 +513,14 @@ pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     if ticket.digest.is_empty() {
         return Err(TpmRc(rc::TICKET).with_parameter(5));
     }
+    // The authorization that produced the ticket recorded in the top bit of
+    // the timeout whether it also expires on a TPM Reset, which decides which
+    // counters went into the ticket.
+    let expires_on_reset = _timeout
+        .as_slice()
+        .first()
+        .map(|b| b & 0x80 != 0)
+        .unwrap_or(false);
     // The ticket must be one this TPM produced for exactly these values.
     let expected = authorization_ticket_hmac(
         state,
@@ -469,14 +530,14 @@ pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         policy_ref.as_slice(),
         auth_name.as_slice(),
         _timeout.as_slice(),
+        !expires_on_reset,
     )
     .map_err(|_| TpmRc(rc::TICKET).with_parameter(5))?;
     if !crate::tpm::core::protect::constant_time_eq(&expected, ticket.digest.as_slice()) {
         return Err(TpmRc(rc::TICKET).with_parameter(5));
     }
     // An expired ticket no longer authorizes anything.
-    if _timeout.len() == 8 {
-        let expires = u64::from_be_bytes(_timeout.as_slice().try_into().unwrap());
+    if let Some(expires) = timeout_value(_timeout.as_slice()) {
         if state.clock.time > expires {
             return Err(TpmRc(rc::EXPIRED).with_parameter(1));
         }
@@ -811,7 +872,9 @@ pub fn policy_authorize(state: &mut TpmState, request: &Request) -> TpmResult<Re
     let approved_policy = Tpm2bDigest::unmarshal(&mut r)?;
     let policy_ref = Tpm2bNonce::unmarshal(&mut r)?;
     let key_sign = Tpm2bName::unmarshal(&mut r)?;
-    let check_ticket = Ticket::unmarshal_tagged(&mut r, &[st::VERIFIED])?;
+    // Version 185 has three commands that produce a TPMT_TK_VERIFIED, each
+    // with its own tag, and Part 3 clause 23.16.1 takes any of them.
+    let check_ticket = VerifiedTicket::unmarshal(&mut r)?;
 
     // Part 3 clause 23.16.1 requires keySign to be a well formed Name: a hash
     // algorithm this TPM implements followed by a digest of its size.
@@ -825,7 +888,6 @@ pub fn policy_authorize(state: &mut TpmState, request: &Request) -> TpmResult<Re
         return Err(TpmRc(rc::SIZE).with_parameter(3));
     }
 
-    let auth_hash = policy_session(state, handle)?.auth_hash;
     let is_trial = policy_session(state, handle)?.is_trial();
     if !is_trial {
         // The running digest must already equal the policy that was approved.
@@ -836,31 +898,30 @@ pub fn policy_authorize(state: &mut TpmState, request: &Request) -> TpmResult<Re
         }
         // Part 3 clause 23.16.1 reports every way the ticket can fail to
         // authorize the approved policy as TPM_RC_POLICY.
-        if check_ticket.digest.is_empty() {
+        if check_ticket.hmac.is_empty() {
             return Err(TpmRc(rc::POLICY));
         }
-        // The ticket must be one this TPM produced when it verified the
-        // signature over the approved policy, Part 3 clause 23.16.2.
+        // Part 3 clause 23.16.2 hashes what was signed with the Name algorithm
+        // of keySign, because the scheme of the signing key is not available
+        // here.
         let approved_hash = hash::digest_parts(
-            auth_hash,
+            name_alg,
             &[approved_policy.as_slice(), policy_ref.as_slice()],
         )?;
         let proof = state
             .hierarchy_proof(check_ticket.hierarchy)
             .map_err(|_| TpmRc(rc::POLICY))?
             .to_vec();
-        let expected = crate::tpm::crypto::hmac::hmac_parts(
-            crate::tpm::config::CONTEXT_INTEGRITY_HASH_ALG,
+        let expected = super::crypto::verified_ticket_hmac(
             &proof,
-            &[
-                &st::VERIFIED.to_be_bytes(),
-                &approved_hash,
-                key_sign.as_slice(),
-            ],
+            check_ticket.tag,
+            &approved_hash,
+            key_sign.as_slice(),
+            check_ticket.digest_alg,
         )?;
         if !crate::tpm::core::protect::constant_time_eq(
             &expected,
-            check_ticket.digest.as_slice(),
+            check_ticket.hmac.as_slice(),
         ) {
             return Err(TpmRc(rc::POLICY));
         }
@@ -1108,7 +1169,96 @@ pub fn session_type_name(session_type: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tpm::constants::eo;
+    use crate::tpm::constants::{eo, hc};
+
+    #[test]
+    fn a_ticket_leaves_out_the_counters_it_should() {
+        let mut state = TpmState::manufacture().unwrap();
+        state.on_startup_clear().unwrap();
+        state.clock.time = 1000;
+
+        let hmac = |timeout: &[u8], with_nonce: bool| {
+            authorization_ticket_hmac(
+                &state,
+                rh::OWNER,
+                st::AUTH_SIGNED,
+                b"cp",
+                b"ref",
+                b"name",
+                timeout,
+                with_nonce,
+            )
+            .unwrap()
+        };
+
+        // With no timeout neither counter is covered, so the nonce makes no
+        // difference.
+        assert_eq!(hmac(&[], true), hmac(&[], false));
+
+        // With a timeout the reset count goes in only when no nonceTPM was
+        // used, so the two differ.
+        let timeout = 5000u64.to_be_bytes();
+        assert_ne!(hmac(&timeout, true), hmac(&timeout, false));
+    }
+
+    #[test]
+    fn a_ticket_uses_the_hierarchy_of_the_authorizing_entity() {
+        use crate::tpm::structures::attributes::NvAttributes;
+        use crate::tpm::structures::nv::NvPublic;
+
+        let mut state = TpmState::manufacture().unwrap();
+        let mut define = |handle: u32, attributes: u32| {
+            state
+                .nv
+                .define(crate::tpm::core::nv::NvIndex {
+                    public: NvPublic {
+                        nv_index: handle,
+                        name_alg: alg::SHA256,
+                        attributes: NvAttributes(attributes),
+                        auth_policy: Tpm2bDigest::empty(),
+                        data_size: 8,
+                    },
+                    auth: Vec::new(),
+                    data: Vec::new(),
+                    read_locked: false,
+                    write_locked: false,
+                })
+                .unwrap();
+        };
+        define(hc::NV_INDEX_FIRST, NvAttributes::AUTHREAD);
+        define(
+            hc::NV_INDEX_FIRST + 1,
+            NvAttributes::AUTHREAD | NvAttributes::PLATFORMCREATE,
+        );
+
+        assert_eq!(ticket_hierarchy(&state, hc::NV_INDEX_FIRST), rh::OWNER);
+        assert_eq!(
+            ticket_hierarchy(&state, hc::NV_INDEX_FIRST + 1),
+            rh::PLATFORM,
+            "an Index the platform created keys with the platform proof"
+        );
+        assert_eq!(ticket_hierarchy(&state, rh::LOCKOUT), rh::PLATFORM);
+        assert_eq!(ticket_hierarchy(&state, rh::ENDORSEMENT), rh::ENDORSEMENT);
+    }
+
+    #[test]
+    fn a_timeout_carries_the_reset_flag_in_its_top_bit() {
+        let mut state = TpmState::manufacture().unwrap();
+        state.clock.time = 2000;
+
+        // A non-negative expiration does not expire at all.
+        assert!(authorization_timeout(&state, 0, true).is_empty());
+
+        // With a nonceTPM the value is the plain expiry time.
+        let bound = authorization_timeout(&state, -1, false);
+        assert_eq!(timeout_value(&bound), Some(3000));
+        assert_eq!(bound[0] & 0x80, 0);
+
+        // Without one the ticket also expires on a TPM Reset.
+        let unbound = authorization_timeout(&state, -1, true);
+        assert_eq!(timeout_value(&unbound), Some(3000));
+        assert_eq!(unbound[0] & 0x80, 0x80);
+    }
 
     #[test]
     fn comparisons_follow_the_operation() {

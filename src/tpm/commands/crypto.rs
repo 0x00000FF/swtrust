@@ -124,6 +124,27 @@ pub fn verify_hash_ticket(
     Ok(())
 }
 
+/// The HMAC of a signature verification ticket.
+///
+/// Every TPMT_TK_VERIFIED commits to its tag, the digest that was verified and
+/// the Name of the key that verified it. TPM_ST_DIGEST_VERIFIED also carries
+/// the hash that made the digest, which TPM2_PolicyAuthorize needs in order to
+/// recompute the ticket.
+pub fn verified_ticket_hmac(
+    proof: &[u8],
+    tag: u16,
+    digest: &[u8],
+    name: &[u8],
+    digest_alg: Option<u16>,
+) -> TpmResult<Vec<u8>> {
+    let alg_field = digest_alg.unwrap_or(alg::NULL).to_be_bytes();
+    mac::hmac_parts(
+        config::CONTEXT_INTEGRITY_HASH_ALG,
+        proof,
+        &[&tag.to_be_bytes(), digest, name, &alg_field],
+    )
+}
+
 /// TPM2_HMAC, Part 3 clause 15.5.
 pub fn hmac_command(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
@@ -555,14 +576,12 @@ pub fn verify_signature(state: &TpmState, request: &Request) -> TpmResult<Respon
         VerifiedTicket::null()
     } else {
         let proof = state.hierarchy_proof(hierarchy)?.to_vec();
-        let hmac = mac::hmac_parts(
-            config::CONTEXT_INTEGRITY_HASH_ALG,
+        let hmac = verified_ticket_hmac(
             &proof,
-            &[
-                &st::VERIFIED.to_be_bytes(),
-                digest.as_slice(),
-                &object.name,
-            ],
+            st::VERIFIED,
+            digest.as_slice(),
+            &object.name,
+            None,
         )?;
         VerifiedTicket {
             tag: st::VERIFIED,
