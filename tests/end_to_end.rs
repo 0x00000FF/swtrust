@@ -1954,6 +1954,89 @@ fn trailing_parameter_octets_are_refused_without_changing_anything() {
 }
 
 #[test]
+fn a_credential_round_trips_through_an_ecc_storage_key() {
+    let h = Harness::started("ecccred");
+
+    // The storage template is an ECC key on NIST P-256, which Part 1 clause
+    // 20.3 protects a seed for with one pass Diffie-Hellman.
+    let template = storage_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let key = reader.u32().unwrap();
+
+    // The object the credential is bound to is the key itself, whose Name the
+    // response carried after the public area and creation data.
+    let mut p = Writer::new();
+    p.u16(32); // credential
+    p.bytes(&[0x5au8; 32]);
+    let name = {
+        // TPM2_ReadPublic gives the Name without unpicking the create response.
+        let r = h.send(&command(st::NO_SESSIONS, cc::ReadPublic, &[key], None, &[]));
+        assert_eq!(r.code, rc::SUCCESS, "ReadPublic -> {:08x}", r.code);
+        let mut rd = Reader::new(&r.body);
+        let public_size = rd.u16().unwrap() as usize;
+        rd.take(public_size).unwrap();
+        let name_size = rd.u16().unwrap() as usize;
+        rd.take(name_size).unwrap().to_vec()
+    };
+    p.u16(name.len() as u16);
+    p.bytes(&name);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::MakeCredential,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "MakeCredential -> {:08x}", r.code);
+
+    // The blob and the secret come back, and the same TPM recovers the
+    // credential from them with the private half of the key.
+    let mut rd = Reader::new(&r.body);
+    let blob_size = rd.u16().unwrap() as usize;
+    let blob = rd.take(blob_size).unwrap().to_vec();
+    let secret_size = rd.u16().unwrap() as usize;
+    let secret = rd.take(secret_size).unwrap().to_vec();
+    assert!(secret_size > 32, "an ECC secret carries a point");
+
+    let mut auth = password(b"");
+    auth.extend_from_slice(&password(b""));
+    let mut p = Writer::new();
+    p.u16(blob_size as u16);
+    p.bytes(&blob);
+    p.u16(secret_size as u16);
+    p.bytes(&secret);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::ActivateCredential,
+        &[key, key],
+        Some(&auth),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "ActivateCredential -> {:08x}", r.code);
+
+    let mut rd = Reader::new(&r.body);
+    let _param_size = rd.u32().unwrap();
+    let size = rd.u16().unwrap() as usize;
+    assert_eq!(rd.take(size).unwrap(), &[0x5au8; 32], "credential recovered");
+}
+
+#[test]
 fn the_vendor_test_command_echoes_its_input() {
     let h = Harness::started("vendor");
     let mut p = Writer::new();

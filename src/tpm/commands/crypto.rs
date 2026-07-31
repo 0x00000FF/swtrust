@@ -6,7 +6,7 @@ use crate::tpm::config;
 use crate::tpm::constants::{alg, rc, rh, st};
 use crate::tpm::core::object::{Object, Sequence, SequenceKind, Slot};
 use crate::tpm::core::state::TpmState;
-use crate::tpm::crypto::{ecc, hash, hmac as mac, rand::Rng, rsa, sym};
+use crate::tpm::crypto::{ecc, hash, hmac as mac, rsa, sym};
 use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Unmarshal};
 use crate::tpm::structures::attributes::ObjectAttributes;
@@ -1047,27 +1047,16 @@ pub fn make_credential(state: &mut TpmState, request: &Request) -> TpmResult<Res
         .copied()
         .ok_or(TpmRc(rc::TYPE))?;
 
-    // The seed is carried to the target TPM protected by its public key.
+    // The seed is carried to the target TPM protected by its public key,
+    // which Part 1 clause 24.4 does with OAEP for RSA and the one pass
+    // Diffie-Hellman of clause 20.3 for ECC.
     let name_alg = object.public.name_alg;
-    let seed_size = hash::digest_size(name_alg)?;
-    let seed = state.rng.bytes(seed_size)?;
-    let secret = match (&object.public.unique, object.public.object_type) {
-        (PublicId::Rsa(modulus), alg::RSA) => {
-            let PublicParms::Rsa { exponent, .. } = object.public.parameters else {
-                return Err(TpmRc(rc::TYPE));
-            };
-            let public = rsa::RsaPublic::new(modulus.as_slice(), exponent)?;
-            let block = rsa::oaep_encode(
-                name_alg,
-                public.size(),
-                &seed,
-                b"IDENTITY\0",
-                &mut state.rng,
-            )?;
-            rsa::public_op(&public, &block)?
-        }
-        _ => return Err(TpmRc(rc::TYPE).with_handle(1)),
-    };
+    let (seed, secret) = crate::tpm::core::protect::seed_to_public(
+        &object.public,
+        b"IDENTITY\0",
+        &mut state.rng,
+    )
+    .map_err(|e| e.with_handle(1))?;
 
     let blob = crate::tpm::core::protect::wrap_credential(
         name_alg,
@@ -1116,7 +1105,7 @@ pub fn activate_credential(state: &TpmState, request: &Request) -> TpmResult<Res
         &key.public,
         sensitive,
         secret.as_slice(),
-        b"IDENTITY ",
+        b"IDENTITY\0",
     )
     .map_err(|e| {
         if e.0 == rc::TYPE {
