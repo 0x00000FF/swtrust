@@ -271,8 +271,11 @@ pub fn parse(state: &TpmState, buf: &[u8], locality: u8) -> TpmResult<Request> {
         if requires_no_sessions(header.code) {
             return Err(TpmRc(rc::AUTH_CONTEXT));
         }
+        // Part 3 clause 5.5 sets the smallest session area at one session with
+        // empty nonce and HMAC, and the largest at what the command buffer
+        // still holds. Either way out of range is TPM_RC_AUTHSIZE.
         let auth_size = r.u32()? as usize;
-        if auth_size < 9 {
+        if auth_size < 9 || auth_size > r.remaining() {
             return Err(TpmRc(rc::AUTHSIZE));
         }
         let mut area = r.sub(auth_size)?;
