@@ -1,4 +1,4 @@
-﻿//! Startup, self test, randomness, capabilities and the clock.
+//! Startup, self test, randomness, capabilities and the clock.
 //!
 //! These are the commands of Part 3 clauses 9, 10, 16, 30 and 36.
 

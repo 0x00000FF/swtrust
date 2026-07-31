@@ -1,4 +1,4 @@
-﻿//! The command execution pipeline.
+//! The command execution pipeline.
 //!
 //! [`run`] takes a command buffer and produces a response buffer. It applies
 //! the checks Part 3 clause 5 lists in order, calls the command, then builds

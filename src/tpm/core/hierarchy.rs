@@ -1,4 +1,4 @@
-﻿//! Hierarchies and their seeds, Part 1 clauses 9 and 14.
+//! Hierarchies and their seeds, Part 1 clauses 9 and 14.
 //!
 //! Each hierarchy owns a Primary Seed that every Primary Object under it is
 //! derived from, a proof value that keys tickets and saved contexts, an

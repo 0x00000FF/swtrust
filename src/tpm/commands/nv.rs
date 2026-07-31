@@ -1,4 +1,4 @@
-﻿//! NV storage commands, Part 3 clause 31.
+//! NV storage commands, Part 3 clause 31.
 
 use crate::tpm::config;
 use crate::tpm::constants::{rc, rh};

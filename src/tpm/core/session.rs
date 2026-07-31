@@ -54,6 +54,121 @@ pub struct PolicyState {
     pub timeout_nonce: Vec<u8>,
 }
 
+impl PolicyState {
+    /// Marshal everything a saved context has to carry.
+    ///
+    /// Part 1 clause 27.2.1 requires the context blob to hold what is needed
+    /// to rebuild the whole session, so every assertion the policy has made so
+    /// far travels with it. Without them a saved session could reload with the
+    /// same policy digest but none of the restrictions it recorded.
+    pub fn marshal(&self, w: &mut crate::tpm::marshal::Writer) {
+        let optional_bytes = |w: &mut crate::tpm::marshal::Writer, v: &Option<Vec<u8>>| {
+            match v {
+                Some(b) => {
+                    w.u8(1);
+                    w.sized16(b);
+                }
+                None => w.u8(0),
+            }
+        };
+        w.sized16(&self.digest);
+        match self.command_code {
+            Some(c) => {
+                w.u8(1);
+                w.u32(c);
+            }
+            None => w.u8(0),
+        }
+        optional_bytes(w, &self.cp_hash);
+        optional_bytes(w, &self.name_hash);
+        match self.locality {
+            Some(m) => {
+                w.u8(1);
+                w.u8(m);
+            }
+            None => w.u8(0),
+        }
+        match self.pcr_update_counter {
+            Some(c) => {
+                w.u8(1);
+                w.u32(c);
+            }
+            None => w.u8(0),
+        }
+        w.u8(u8::from(self.auth_value_needed));
+        w.u8(u8::from(self.password_needed));
+        match self.nv_written {
+            Some(v) => {
+                w.u8(1);
+                w.u8(u8::from(v));
+            }
+            None => w.u8(0),
+        }
+        optional_bytes(w, &self.template_hash);
+        optional_bytes(w, &self.parameters_hash);
+        w.u8(u8::from(self.physical_presence_required));
+        match self.expiration {
+            Some(t) => {
+                w.u8(1);
+                w.u64(t);
+            }
+            None => w.u8(0),
+        }
+        w.sized16(&self.timeout_nonce);
+    }
+
+    /// Rebuild the state [`PolicyState::marshal`] wrote.
+    pub fn unmarshal(r: &mut crate::tpm::marshal::Reader<'_>) -> TpmResult<PolicyState> {
+        fn bytes(r: &mut crate::tpm::marshal::Reader<'_>) -> TpmResult<Vec<u8>> {
+            let n = r.u16()? as usize;
+            Ok(r.take(n)?.to_vec())
+        }
+        fn optional_bytes(
+            r: &mut crate::tpm::marshal::Reader<'_>,
+        ) -> TpmResult<Option<Vec<u8>>> {
+            if r.u8()? == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(bytes(r)?))
+            }
+        }
+        let digest = bytes(r)?;
+        let command_code = if r.u8()? == 0 { None } else { Some(r.u32()?) };
+        let cp_hash = optional_bytes(r)?;
+        let name_hash = optional_bytes(r)?;
+        let locality = if r.u8()? == 0 { None } else { Some(r.u8()?) };
+        let pcr_update_counter = if r.u8()? == 0 { None } else { Some(r.u32()?) };
+        let auth_value_needed = r.u8()? != 0;
+        let password_needed = r.u8()? != 0;
+        let nv_written = if r.u8()? == 0 {
+            None
+        } else {
+            Some(r.u8()? != 0)
+        };
+        let template_hash = optional_bytes(r)?;
+        let parameters_hash = optional_bytes(r)?;
+        let physical_presence_required = r.u8()? != 0;
+        let expiration = if r.u8()? == 0 { None } else { Some(r.u64()?) };
+        let timeout_nonce = bytes(r)?;
+        Ok(PolicyState {
+            digest,
+            command_code,
+            cp_hash,
+            name_hash,
+            locality,
+            pcr_update_counter,
+            auth_value_needed,
+            password_needed,
+            nv_written,
+            template_hash,
+            parameters_hash,
+            physical_presence_required,
+            expiration,
+            timeout_nonce,
+        })
+    }
+}
+
 /// The audit state of a session.
 ///
 /// Exclusivity is not held here. Part 1 clause 17.2 gives the TPM a single

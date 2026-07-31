@@ -207,7 +207,9 @@ fn marshal_session(session: &Session) -> TpmResult<Vec<u8>> {
     w.u64(session.start_time);
     w.u64(session.time_epoch);
     session.symmetric.marshal(&mut w);
-    w.sized16(&session.policy.digest);
+    // Part 1 clause 27.2.1 carries the whole policy state, not just the
+    // digest, so a reloaded session keeps every restriction it recorded.
+    session.policy.marshal(&mut w);
     // A saved audit session keeps auditing when it comes back, so its digest
     // travels with it.
     w.u8(u8::from(session.audit.is_audit));
@@ -234,7 +236,7 @@ fn unmarshal_session(body: &[u8]) -> TpmResult<Session> {
     let start_time = r.u64()?;
     let time_epoch = r.u64()?;
     let symmetric = crate::tpm::structures::schemes::SymDef::unmarshal_sym_def(&mut r)?;
-    let digest = read(&mut r)?;
+    let policy = crate::tpm::core::session::PolicyState::unmarshal(&mut r)?;
     let is_audit = r.u8()? != 0;
     let audit_digest = read(&mut r)?;
 
@@ -252,10 +254,57 @@ fn unmarshal_session(body: &[u8]) -> TpmResult<Session> {
     session.bind_uses_lockout = bind_uses_lockout;
     session.start_time = start_time;
     session.time_epoch = time_epoch;
-    session.policy.digest = digest;
+    session.policy = policy;
     session.audit.is_audit = is_audit;
     session.audit.digest = audit_digest;
     Ok(session)
+}
+
+#[cfg(test)]
+mod policy_context_tests {
+    use super::*;
+    use crate::tpm::constants::se;
+    use crate::tpm::structures::schemes::SymDef;
+
+    #[test]
+    fn a_saved_session_keeps_every_policy_assertion() {
+        let mut session = Session::new(
+            hc::POLICY_SESSION_FIRST,
+            se::POLICY,
+            alg::SHA256,
+            vec![1u8; 32],
+            vec![2u8; 32],
+            vec![3u8; 32],
+            rh::NULL,
+            Vec::new(),
+            SymDef::null(),
+        )
+        .unwrap();
+        session.start_time = 1234;
+        session.time_epoch = 7;
+        session.policy.digest = vec![9u8; 32];
+        session.policy.command_code = Some(crate::tpm::constants::cc::Unseal);
+        session.policy.cp_hash = Some(vec![4u8; 32]);
+        session.policy.name_hash = Some(vec![5u8; 32]);
+        session.policy.locality = Some(0b0000_0100);
+        session.policy.pcr_update_counter = Some(11);
+        session.policy.auth_value_needed = true;
+        session.policy.password_needed = true;
+        session.policy.nv_written = Some(true);
+        session.policy.template_hash = Some(vec![6u8; 32]);
+        session.policy.parameters_hash = Some(vec![7u8; 32]);
+        session.policy.physical_presence_required = true;
+        session.policy.expiration = Some(5000);
+        session.policy.timeout_nonce = vec![8u8; 16];
+
+        // Part 1 clause 27.2.1 rebuilds the whole session from the context, so
+        // a reloaded one carries every restriction it had.
+        let body = marshal_session(&session).unwrap();
+        let back = unmarshal_session(&body).unwrap();
+        assert_eq!(back.policy, session.policy);
+        assert_eq!(back.start_time, session.start_time);
+        assert_eq!(back.time_epoch, session.time_epoch);
+    }
 }
 
 /// TPM2_ContextSave, Part 3 clause 28.2.

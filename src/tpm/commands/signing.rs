@@ -17,8 +17,8 @@ use crate::tpm::structures::schemes::{EccPoint, Scheme, Tpm2bEccPoint};
 use crate::tpm::structures::signature::{Ticket, TpmtSignature, VerifiedTicket};
 
 use super::crypto::{
-    sign_digest, sign_message, signing_scheme, signs_a_message, verified_ticket_hmac,
-    verify_digest_public, verify_hash_ticket, verify_message,
+    check_signing_key, sign_digest, sign_message, signing_scheme, signs_a_message,
+    verified_ticket_hmac, verify_digest_public, verify_hash_ticket, verify_message,
 };
 use super::dispatch::{Request, Response};
 use super::execute::{respond, respond_with_handle};
@@ -158,13 +158,8 @@ pub fn sign_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
         .clone();
-    if !object
-        .public
-        .object_attributes
-        .has(ObjectAttributes::SIGN_ENCRYPT)
-    {
-        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
-    }
+    // Part 3 clause 17.5.1 needs a signing key here.
+    check_signing_key(&object)?;
     // The sequence hashes with the algorithm of the key's signing scheme,
     // because that is the algorithm the signature will use.
     let scheme = signing_scheme(&object, &Scheme::null())?;
@@ -183,6 +178,13 @@ pub fn sign_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
         buffer,
     })))?;
     respond_with_handle(handle, |_| Ok(()))
+}
+
+/// True when the message begins with TPM_GENERATED_VALUE.
+fn starts_with_generated_value(message: &[u8]) -> bool {
+    message.len() >= 4
+        && u32::from_be_bytes([message[0], message[1], message[2], message[3]])
+            == crate::tpm::constants::TPM_GENERATED_VALUE
 }
 
 /// The key handle and hash a signing sequence was started with.
@@ -227,15 +229,20 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(2))?
         .clone();
+    check_signing_key(&object).map_err(|e| TpmRc(e.0).with_handle(2))?;
+    let restricted = object
+        .public
+        .object_attributes
+        .has(ObjectAttributes::RESTRICTED);
     // Part 3 clause 20.6 has no validation parameter, so a restricted HMAC
     // key, which signs only digests the TPM made, cannot be used here.
-    if signs_a_message(&object)
-        && object
-            .public
-            .object_attributes
-            .has(ObjectAttributes::RESTRICTED)
-    {
+    if signs_a_message(&object) && restricted {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
+    }
+    // A restricted asymmetric key may not sign anything that could be taken
+    // for an attestation the TPM produced, Part 3 clause 20.6.1.
+    if restricted && starts_with_generated_value(&data) {
+        return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
     let scheme = signing_scheme(&object, &Scheme::null())?;
     // Part 3 Table 115: an HMAC key signs the message itself, everything else

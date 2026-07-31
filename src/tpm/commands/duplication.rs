@@ -1,4 +1,4 @@
-﻿//! Duplication, Part 3 clause 13, and the remaining management commands.
+//! Duplication, Part 3 clause 13, and the remaining management commands.
 
 use crate::tpm::constants::{alg, rc, rh};
 use crate::tpm::core::names;

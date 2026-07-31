@@ -1326,14 +1326,14 @@ fn the_version_185_signing_commands_follow_their_command_tables() {
     let mut reader = Reader::new(&r.body);
     let _param_size = reader.u32().unwrap();
     let rest = reader.take_rest();
-    let signature = &rest[..rest.len() - 5].to_vec();
+    let signature = rest[..rest.len() - 5].to_vec();
 
     // Part 3 Table 120: context, digest, signature.
     let mut p = Writer::new();
     p.u16(0); // context
     p.u16(32);
     p.bytes(&digest);
-    p.bytes(signature);
+    p.bytes(&signature);
     let r = h.send(&command(
         st::NO_SESSIONS,
         cc::VerifyDigestSignature,
@@ -1343,13 +1343,34 @@ fn the_version_185_signing_commands_follow_their_command_tables() {
     ));
     assert_eq!(r.code, rc::SUCCESS, "VerifyDigestSignature -> {:08x}", r.code);
 
+    // Part 3 clause 20.4.1 requires the whole scheme, including its hash, to
+    // be the one the key carries. Re-tagging the signature as SHA-384 is
+    // refused rather than verified.
+    let mut wrong = signature.clone();
+    let hash_offset = 2;
+    wrong[hash_offset] = 0x00;
+    wrong[hash_offset + 1] = 0x0c; // TPM_ALG_SHA384
+    let mut p = Writer::new();
+    p.u16(0);
+    p.u16(32);
+    p.bytes(&digest);
+    p.bytes(&wrong);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::VerifyDigestSignature,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code & 0x03f, rc::SCHEME & 0x03f, "scheme -> {:08x}", r.code);
+
     // A supplied context is refused, because no implemented scheme takes one.
     let mut p = Writer::new();
     p.u16(1);
     p.u8(0);
     p.u16(32);
     p.bytes(&digest);
-    p.bytes(signature);
+    p.bytes(&signature);
     let r = h.send(&command(
         st::NO_SESSIONS,
         cc::VerifyDigestSignature,

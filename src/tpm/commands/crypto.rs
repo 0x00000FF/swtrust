@@ -128,9 +128,38 @@ pub fn verify_hash_ticket(
 ///
 /// Part 3 Table 115 splits the signing commands by whether the algorithm signs
 /// a message or a digest, and HMAC is the one message algorithm this TPM
-/// implements.
+/// implements. A keyed hash object whose scheme is not HMAC is an obfuscation
+/// key rather than a signing key, so it is not one of these.
 pub fn signs_a_message(object: &Object) -> bool {
-    object.public.object_type == alg::KEYEDHASH
+    if object.public.object_type != alg::KEYEDHASH {
+        return false;
+    }
+    matches!(
+        &object.public.parameters,
+        PublicParms::KeyedHash { scheme } if scheme.scheme == alg::HMAC
+    )
+}
+
+/// Check that an object may perform a signing command.
+///
+/// Part 3 clause 17.5.1 answers TPM_RC_KEY unless keyHandle is a signing key,
+/// and Table 115 gives message signing to HMAC alone, so a keyed hash object
+/// with any other scheme cannot sign either.
+pub fn check_signing_key(object: &Object) -> TpmResult<()> {
+    if !object
+        .public
+        .object_attributes
+        .has(ObjectAttributes::SIGN_ENCRYPT)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
+    }
+    if object.public.object_type == alg::KEYEDHASH && !signs_a_message(object) {
+        return Err(TpmRc(rc::KEY).with_handle(1));
+    }
+    if object.sensitive.is_none() {
+        return Err(TpmRc(rc::KEY).with_handle(1));
+    }
+    Ok(())
 }
 
 /// Sign a whole message, Part 3 Table 115.
@@ -189,6 +218,27 @@ pub fn verify_message(
         return Err(TpmRc(rc::SIGNATURE).with_parameter(1));
     }
     Ok(())
+}
+
+/// Check that a signature was made with the scheme the key is restricted to.
+///
+/// Part 3 clause 20.4.1 requires the whole scheme, including its hash, to be
+/// the one keyHandle carries. A key whose scheme is TPM_ALG_NULL is not
+/// restricted to any, so anything it can verify is allowed.
+pub fn check_signature_scheme(object: &Object, signature: &TpmtSignature) -> TpmResult<()> {
+    let scheme = object.public.scheme().copied().unwrap_or_default();
+    if scheme.is_null() {
+        return Ok(());
+    }
+    if scheme.scheme != signature.sig_alg {
+        return Err(TpmRc(rc::SCHEME).with_parameter(2));
+    }
+    match (scheme.hash_alg(), signature.hash_alg()) {
+        (Some(expected), Some(used)) if expected != used => {
+            Err(TpmRc(rc::SCHEME).with_parameter(2))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The HMAC of a signature verification ticket.
@@ -519,6 +569,7 @@ pub fn verify_digest_public(
 
 /// Verify `signature` over `digest` with the public part of `object`.
 fn verify_digest(object: &Object, digest: &[u8], signature: &TpmtSignature) -> TpmResult<()> {
+    check_signature_scheme(object, signature)?;
     match (&object.public.unique, &signature.signature) {
         (PublicId::Rsa(modulus), SignatureValue::Rsa(sig)) => {
             let PublicParms::Rsa { exponent, .. } = object.public.parameters else {

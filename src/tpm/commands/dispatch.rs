@@ -774,8 +774,11 @@ fn check_policy(
             return Err(TpmRc(rc::PCR_CHANGED).with_session(position));
         }
     }
+    // Part 3 clause 23.2.2 refuses a time limited policy once its limit has
+    // gone by, and once the run of Time it was measured against has ended,
+    // because Time restarts from zero at every _TPM_Init.
     if let Some(expiration) = s.policy.expiration {
-        if state.clock.time > expiration {
+        if s.time_epoch != state.clock.time_epoch || state.clock.time > expiration {
             return Err(TpmRc(rc::EXPIRED).with_session(position));
         }
     }

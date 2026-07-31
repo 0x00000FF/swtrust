@@ -1,4 +1,4 @@
-﻿//! Elliptic curve cryptography over prime fields.
+//! Elliptic curve cryptography over prime fields.
 //!
 //! Part 1 clause 11.2.5 defines what the TPM needs from ECC: key generation
 //! that can be repeated from a seed, ECDH point multiplication, ECDSA, EC
