@@ -895,6 +895,14 @@ fn check_policy(
             return Err(TpmRc(rc::EXPIRED).with_session(position));
         }
     }
+    // TPM2_PolicyTransportSPDM is a deferred assertion: the channel and the
+    // keys that carried it are checked when the policy authorizes, not when
+    // the assertion is made. This TPM has no secure transport layer, so no
+    // channel is ever present and Part 3 clause 23.25.1 answers
+    // TPM_RC_CHANNEL.
+    if s.policy.secure_channel_required {
+        return Err(TpmRc(rc::CHANNEL));
+    }
     // TPM2_PolicyPhysicalPresence requires the signal to still be asserted.
     if s.policy.physical_presence_required && !state.physical_presence {
         return Err(TpmRc(rc::PP));

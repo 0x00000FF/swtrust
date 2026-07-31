@@ -1194,12 +1194,62 @@ pub fn policy_parameters(state: &mut TpmState, request: &Request) -> TpmResult<R
 /// trial session.
 pub fn policy_transport_spdm(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
+    let mut r = request.reader();
+    let req_key_name = Tpm2bName::unmarshal(&mut r)?;
+    let tpm_key_name = Tpm2bName::unmarshal(&mut r)?;
+    r.expect_end()?;
+
+    // A Name that is given has to be a well formed one, Part 3 clause 23.25.1.
+    check_key_name(req_key_name.as_slice()).map_err(|e| e.with_parameter(1))?;
+    check_key_name(tpm_key_name.as_slice()).map_err(|e| e.with_parameter(2))?;
+
     let s = policy_session(state, handle)?;
-    if !s.is_trial() {
-        return Err(TpmRc(rc::CHANNEL));
+    // The assertion may only be made once, so a second one cannot replace the
+    // keys the first tied the policy to.
+    if s.policy.secure_channel_required {
+        return Err(TpmRc(rc::VALUE));
     }
-    s.extend_policy(cc::PolicyTransportSPDM, &[])?;
+    let auth_hash = s.auth_hash;
+
+    // Equation 11 covers both Names with their sizes, so the same Name given
+    // for one or the other does not produce the same digest.
+    let names_given = !req_key_name.is_empty() || !tpm_key_name.is_empty();
+    let key_hash = if names_given {
+        let mut w = Writer::new();
+        req_key_name.marshal(&mut w);
+        tpm_key_name.marshal(&mut w);
+        Some(hash::digest(auth_hash, &w.finish()?)?)
+    } else {
+        None
+    };
+
+    // Equation 12 leaves the digest out when the policy names no key.
+    s.extend_policy(
+        cc::PolicyTransportSPDM,
+        key_hash.as_deref().unwrap_or(&[]),
+    )?;
+    s.policy.secure_channel_required = true;
+    s.policy.secure_channel_key_hash = key_hash;
     respond(|_| Ok(()))
+}
+
+/// Check that a secure channel key Name is well formed, or absent.
+///
+/// Part 3 clause 23.25.1 requires a Name that is given to be a hash algorithm
+/// this TPM implements followed by a digest of that size.
+fn check_key_name(name: &[u8]) -> TpmResult<()> {
+    if name.is_empty() {
+        return Ok(());
+    }
+    if name.len() < 2 {
+        return Err(TpmRc(rc::SIZE));
+    }
+    let alg_id = u16::from_be_bytes([name[0], name[1]]);
+    let size = hash::digest_size(alg_id).map_err(|_| TpmRc(rc::HASH))?;
+    if name.len() != 2 + size {
+        return Err(TpmRc(rc::SIZE));
+    }
+    Ok(())
 }
 
 /// TPM2_Policy_AC_SendSelect, Part 3 clause 32.4.
@@ -1293,6 +1343,26 @@ mod tests {
             SymDef::null(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_secure_channel_key_name_has_to_be_well_formed() {
+        // Part 3 clause 23.25.1: an absent Name is allowed, and one that is
+        // given has to be a hash algorithm followed by a digest of its size.
+        check_key_name(&[]).unwrap();
+        let mut name = alg::SHA256.to_be_bytes().to_vec();
+        name.extend_from_slice(&[0u8; 32]);
+        check_key_name(&name).unwrap();
+
+        assert_eq!(check_key_name(&[0x00]).unwrap_err(), TpmRc(rc::SIZE));
+        assert_eq!(
+            check_key_name(&[0xff, 0xff, 0x00]).unwrap_err(),
+            TpmRc(rc::HASH)
+        );
+        // The right algorithm with the wrong digest length.
+        let mut short = alg::SHA256.to_be_bytes().to_vec();
+        short.extend_from_slice(&[0u8; 20]);
+        assert_eq!(check_key_name(&short).unwrap_err(), TpmRc(rc::SIZE));
     }
 
     #[test]

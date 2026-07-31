@@ -48,6 +48,11 @@ pub struct PolicyState {
     pub parameters_hash: Option<Vec<u8>>,
     /// Set by TPM2_PolicyPhysicalPresence.
     pub physical_presence_required: bool,
+    /// Set by TPM2_PolicyTransportSPDM, meaning a secure channel is required.
+    pub secure_channel_required: bool,
+    /// The digest of the secure channel key Names the policy is tied to, when
+    /// TPM2_PolicyTransportSPDM named either of them.
+    pub secure_channel_key_hash: Option<Vec<u8>>,
     /// When the authorization expires, in the TPM's time base.
     pub expiration: Option<u64>,
     /// The nonce that a ticket for this policy is bound to.
@@ -107,6 +112,8 @@ impl PolicyState {
         optional_bytes(w, &self.template_hash);
         optional_bytes(w, &self.parameters_hash);
         w.u8(u8::from(self.physical_presence_required));
+        w.u8(u8::from(self.secure_channel_required));
+        optional_bytes(w, &self.secure_channel_key_hash);
         match self.expiration {
             Some(t) => {
                 w.u8(1);
@@ -148,6 +155,8 @@ impl PolicyState {
         let template_hash = optional_bytes(r)?;
         let parameters_hash = optional_bytes(r)?;
         let physical_presence_required = r.u8()? != 0;
+        let secure_channel_required = r.u8()? != 0;
+        let secure_channel_key_hash = optional_bytes(r)?;
         let expiration = if r.u8()? == 0 { None } else { Some(r.u64()?) };
         let timeout_nonce = bytes(r)?;
         Ok(PolicyState {
@@ -163,6 +172,8 @@ impl PolicyState {
             template_hash,
             parameters_hash,
             physical_presence_required,
+            secure_channel_required,
+            secure_channel_key_hash,
             expiration,
             timeout_nonce,
         })
