@@ -81,6 +81,11 @@ pub fn self_test(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let mut r = request.reader();
     let full_test = r.u8()?;
     r.expect_end()?;
+    // Part 2 Table 48 makes TPMI_YES_NO a choice of exactly NO and YES, and
+    // gives TPM_RC_VALUE for anything else.
+    if full_test > 1 {
+        return Err(TpmRc(rc::VALUE).with_parameter(1));
+    }
     if full_test == 0 && state.self_test_done {
         return respond(|_| Ok(()));
     }
@@ -93,7 +98,7 @@ pub fn self_test(state: &mut TpmState, request: &Request) -> TpmResult<Response>
 /// A failure sets failure mode and answers TPM_RC_FAILURE. The digest of the
 /// running image is kept so TPM2_GetTestResult can report it.
 pub fn run_self_tests(state: &mut TpmState) -> TpmResult<()> {
-    match fips::known_answer_tests(&mut state.rng) {
+    match fips::known_answer_tests() {
         Ok(()) => {}
         Err(fips::Failure(which)) => {
             state.failure_mode = true;

@@ -332,12 +332,17 @@ pub fn generate(curve_id: u16, rng: &mut dyn Rng) -> TpmResult<EccKey> {
     let private = private_key_from_rng(&curve, rng)?;
     let point = multiply_generator(&curve, &private)?;
     let (public_x, public_y) = point.coordinates(&curve)?;
-    Ok(EccKey {
+    let key = EccKey {
         curve,
         private,
         public_x,
         public_y,
-    })
+    };
+    // FIPS 140-3 Table 40 asks for a pair-wise consistency test on every
+    // generated key pair. Doing it here rather than at the call sites means an
+    // ephemeral pair gets one too, and a new caller cannot leave it out.
+    crate::tpm::fips::pairwise_generated_ecc(&key)?;
+    Ok(key)
 }
 
 /// The ECDH shared point `d * Q`, as required by TPM2_ECDH_ZGen.

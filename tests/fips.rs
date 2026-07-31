@@ -241,6 +241,37 @@ fn a_generated_key_has_passed_its_pairwise_test() {
     }
 }
 
+#[test]
+fn self_test_refuses_a_value_that_is_not_yes_or_no() {
+    // Part 2 Table 48 makes fullTest a TPMI_YES_NO, which is exactly 0 or 1.
+    let h = harness("yesno");
+    startup(&h);
+    for good in [0u8, 1] {
+        let r = send(&h, &command(st::NO_SESSIONS, cc::SelfTest, &[], None, &[good]));
+        assert_eq!(r.code, rc::SUCCESS, "fullTest {good} -> {:08x}", r.code);
+    }
+    for bad in [2u8, 0x7f, 0xff] {
+        let r = send(&h, &command(st::NO_SESSIONS, cc::SelfTest, &[], None, &[bad]));
+        assert_ne!(r.code, rc::SUCCESS, "fullTest {bad} was accepted");
+    }
+}
+
+#[test]
+fn an_ephemeral_key_is_pair_wise_tested_too() {
+    // TPM2_EC_Ephemeral generates a key pair that never becomes an object, so
+    // the test has to live in the generator rather than in object creation.
+    // A key that came back is one that passed.
+    let h = harness("ephemeral");
+    startup(&h);
+    let mut p = Writer::new();
+    p.u16(0x0003); // NIST P-256
+    let r = send(
+        &h,
+        &command(st::NO_SESSIONS, cc::EC_Ephemeral, &[], None, &p.finish().unwrap()),
+    );
+    assert_eq!(r.code, rc::SUCCESS, "-> {:08x}", r.code);
+}
+
 fn ecc_signing_template() -> Vec<u8> {
     let mut t = Writer::new();
     t.u16(alg::ECC);

@@ -109,7 +109,7 @@ impl Drbg {
         // SP800-90B gives the repetition count and adaptive proportion tests,
         // which catch a source that has failed to a constant or to something
         // close to one. Seed material that fails them is not used.
-        crate::tpm::fips::HealthTests::new()
+        crate::tpm::fips::HealthTests::for_acquisition(seed.len())
             .check(&seed)
             .map_err(|_| TpmRc(rc::FAILURE))?;
         Drbg::new(&seed, b"swtrust")
@@ -174,6 +174,15 @@ impl Drbg {
     /// The V of the SP800-90A HMAC_DRBG working state.
     pub fn value(&self) -> &[u8] {
         &self.value
+    }
+
+    /// Put the reseed counter where a test needs it.
+    ///
+    /// Reaching the interval honestly would take 2^48 generate calls, and a
+    /// test has to be able to see what an exhausted instantiation does.
+    #[cfg(test)]
+    pub fn set_reseed_counter(&mut self, value: u64) {
+        self.reseed_counter = value;
     }
 
     /// True when the instantiation has reached its reseed interval.

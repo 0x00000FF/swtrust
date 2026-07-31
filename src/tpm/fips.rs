@@ -128,6 +128,11 @@ const ECDSA_PUBLIC_Y: &str = "ce4014c68811f9a21a1fdb2c0e6113e06db7ca93b7404e78dc
 const ECDSA_DIGEST: &str = "589591d61aaf6cbee157c322f701aff7866763ea12115b045062611dc0cf4b66";
 const ECDSA_R: &str = "770818352d99e1bb60f1a6fd5430144c388b98f4dcdf88048cf2e588e76f7e35";
 const ECDSA_S: &str = "8272b2ef9f79e6152defce3780587cc4d060a99dc0cbb49ebf8b1019705c3a35";
+/// Fixed randomization for the signing half, so it has one right answer.
+const ECDSA_SIGN_SEED: &str =
+    "5eed000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff";
+const ECDSA_SIGN_R: &str = "29566913c6eca9f487c6944f8e8fb0c9eaae45778b0dec63edf47273bbde04a8";
+const ECDSA_SIGN_S: &str = "d88129a08810535448366f86b74f688382bc2ae0e94f50b6476f7f222f5d4435";
 
 /// RSA 2048 with the default exponent, signing with PKCS1 v1.5 over SHA-256.
 const RSA_MODULUS: &str = concat!(
@@ -283,7 +288,7 @@ pub fn ecdh_kat() -> TestResult {
 /// signature it produces is not a fixed value. The sign half is checked by
 /// verifying what it produced, which is the same shape as a pair-wise
 /// consistency test and catches a signer that produces nothing usable.
-pub fn ecdsa_kat(rng: &mut dyn rand::Rng) -> TestResult {
+pub fn ecdsa_kat() -> TestResult {
     let public_x = vector("ECDSA", ECDSA_PUBLIC_X)?;
     let public_y = vector("ECDSA", ECDSA_PUBLIC_Y)?;
     let digest = vector("ECDSA", ECDSA_DIGEST)?;
@@ -304,9 +309,20 @@ pub fn ecdsa_kat(rng: &mut dyn rand::Rng) -> TestResult {
         return Err(Failure("ECDSA verify accepts a wrong digest"));
     }
 
+    // The signing half is given fixed randomization, so it has one right
+    // answer and can be compared with a pinned signature the way 140-3
+    // Table 39 asks. The per message secret cannot come from a generator that
+    // returns a constant, because a rejected candidate would be redrawn
+    // unchanged, so it comes from a generator with a fixed seed.
     let private = vector("ECDSA", ECDSA_PRIVATE)?;
     let d = crate::tpm::crypto::bn::BigNum::from_bytes(&private).map_err(|_| Failure("ECDSA"))?;
-    let made = ecc::ecdsa_sign(&group, &d, &digest, rng).map_err(|_| Failure("ECDSA sign"))?;
+    let seed = vector("ECDSA", ECDSA_SIGN_SEED)?;
+    let mut fixed =
+        rand::Drbg::new(&seed, b"ecdsa known answer test").map_err(|_| Failure("ECDSA sign"))?;
+    let made = ecc::ecdsa_sign(&group, &d, &digest, &mut fixed).map_err(|_| Failure("ECDSA sign"))?;
+    expect("ECDSA sign", &made.r, &vector("ECDSA", ECDSA_SIGN_R)?)?;
+    expect("ECDSA sign", &made.s, &vector("ECDSA", ECDSA_SIGN_S)?)?;
+    // The signature it produced must also verify, so the two halves agree.
     ecc::ecdsa_verify(&group, &public_x, &public_y, &digest, &made)
         .map_err(|_| Failure("ECDSA sign"))
 }
@@ -336,7 +352,7 @@ pub fn rsa_kat() -> TestResult {
 ///
 /// The first failure stops the run, because a module that has failed a self
 /// test must not carry on producing cryptographic output.
-pub fn known_answer_tests(rng: &mut dyn rand::Rng) -> TestResult {
+pub fn known_answer_tests() -> TestResult {
     hash_kats()?;
     hmac_kat()?;
     aes_cfb_kat()?;
@@ -344,7 +360,7 @@ pub fn known_answer_tests(rng: &mut dyn rand::Rng) -> TestResult {
     kdfe_kat()?;
     drbg_kat()?;
     ecdh_kat()?;
-    ecdsa_kat(rng)?;
+    ecdsa_kat()?;
     rsa_kat()?;
     Ok(())
 }
@@ -376,6 +392,11 @@ pub fn integrity() -> Result<Vec<u8>, Failure> {
 /// because a cipher that returned its input would otherwise pass.
 pub fn pairwise_rsa(key: &rsa::RsaPrivate, sign: bool, decrypt: bool) -> TpmResult<()> {
     let digest = hash::digest(alg::SHA256, b"pair-wise consistency test")?;
+    // Table 40 chooses the test by what the key is for, and picks the
+    // encryption one whenever the key does not sign. A key with neither
+    // attribute set is still a generated pair and still has to be tested, so
+    // it takes that branch rather than none.
+    let decrypt = decrypt || !sign;
 
     if sign {
         let encoded = rsa::pkcs1v15_sign_encode(alg::SHA256, &digest, key.size())?;
@@ -404,6 +425,31 @@ pub fn pairwise_rsa(key: &rsa::RsaPrivate, sign: bool, decrypt: bool) -> TpmResu
         }
     }
 
+    Ok(())
+}
+
+/// The pair-wise consistency test every generated ECC pair gets, wherever it
+/// was generated.
+///
+/// 140-3 Table 40 tests a key agreement key by recomputing its public value
+/// from its private one and comparing. This runs inside
+/// [`crate::tpm::crypto::ecc::generate`], so an ephemeral pair made for
+/// TPM2_ECDH_KeyGen, TPM2_EC_Ephemeral, TPM2_ECC_Encrypt, TPM2_Encapsulate or
+/// the labeled key encapsulation of Part 1 clause 20.3 is covered as well as a
+/// pair that becomes a loaded object.
+///
+/// Recomputing the same operation catches a fault that struck once, not a
+/// multiplication that is wrong every time; the known answer tests are what
+/// cover the second case.
+pub fn pairwise_generated_ecc(key: &ecc::EccKey) -> TpmResult<()> {
+    let point = ecc::multiply_generator(&key.curve, &key.private)?;
+    if point.is_at_infinity(&key.curve) {
+        return Err(TpmRc(rc::FAILURE));
+    }
+    let (x, y) = point.coordinates(&key.curve)?;
+    if x != key.public_x || y != key.public_y {
+        return Err(TpmRc(rc::FAILURE));
+    }
     Ok(())
 }
 
@@ -484,6 +530,9 @@ pub struct HealthTests {
     window_value: u8,
     window_count: usize,
     window_seen: usize,
+    /// Length of the adaptive proportion window and the count that fails it.
+    window: usize,
+    cutoff: usize,
 }
 
 /// Cutoff for the repetition count test.
@@ -504,6 +553,18 @@ pub const ADAPTIVE_WINDOW: usize = 512;
 /// source that has plainly failed rather than for ordinary variation.
 pub const ADAPTIVE_CUTOFF: usize = 128;
 
+/// Cutoff for the adaptive proportion test over one entropy acquisition.
+///
+/// This module takes its entropy in a single request rather than as a stream,
+/// so a 512 sample window would never fill and the test would never reach a
+/// verdict. The window is the acquisition instead, and the cutoff is chosen for
+/// it: over 48 octets a uniform source is expected to repeat any given value
+/// 48/256 times, and the chance of reaching ten is far below the 2^-20 false
+/// positive rate SP800-90B works to. A false failure would stop the TPM from
+/// starting, so the cutoff errs on the side of letting good entropy through
+/// while still catching a source that has plainly failed.
+pub const ACQUISITION_CUTOFF: usize = 10;
+
 impl Default for HealthTests {
     fn default() -> Self {
         HealthTests::new()
@@ -511,13 +572,30 @@ impl Default for HealthTests {
 }
 
 impl HealthTests {
+    /// Tests over the SP800-90B window, for a source read as a stream.
     pub fn new() -> HealthTests {
+        HealthTests::with_window(ADAPTIVE_WINDOW, ADAPTIVE_CUTOFF)
+    }
+
+    /// Tests over one acquisition, for a source read in a single request.
+    ///
+    /// The window is the acquisition, so the adaptive proportion test reaches a
+    /// verdict on what was actually taken instead of waiting for a stream that
+    /// never comes.
+    pub fn for_acquisition(size: usize) -> HealthTests {
+        HealthTests::with_window(size, ACQUISITION_CUTOFF)
+    }
+
+    /// Tests over a window of `window` samples, failing at `cutoff` of a value.
+    pub fn with_window(window: usize, cutoff: usize) -> HealthTests {
         HealthTests {
             last: None,
             repetitions: 0,
             window_value: 0,
             window_count: 0,
-            window_seen: ADAPTIVE_WINDOW,
+            window_seen: window,
+            window: window.max(1),
+            cutoff,
         }
     }
 
@@ -543,7 +621,7 @@ impl HealthTests {
 
             // Adaptive proportion. A finished window starts a new one on the
             // next octet, which becomes the value that window counts.
-            if self.window_seen >= ADAPTIVE_WINDOW {
+            if self.window_seen >= self.window {
                 self.window_value = b;
                 self.window_count = 1;
                 self.window_seen = 1;
@@ -552,7 +630,7 @@ impl HealthTests {
             self.window_seen += 1;
             if b == self.window_value {
                 self.window_count += 1;
-                if self.window_count >= ADAPTIVE_CUTOFF {
+                if self.window_count >= self.cutoff {
                     return Err(Failure("entropy adaptive proportion"));
                 }
             }
@@ -568,13 +646,11 @@ mod tests {
 
     #[test]
     fn every_known_answer_test_passes() {
-        let mut rng = rand::Drbg::new(&[0x5au8; 48], b"test").unwrap();
-        assert_eq!(known_answer_tests(&mut rng), Ok(()));
+        assert_eq!(known_answer_tests(), Ok(()));
     }
 
     #[test]
     fn each_known_answer_test_passes_on_its_own() {
-        let mut rng = rand::Drbg::new(&[0x5au8; 48], b"test").unwrap();
         assert_eq!(hash_kats(), Ok(()));
         assert_eq!(hmac_kat(), Ok(()));
         assert_eq!(aes_cfb_kat(), Ok(()));
@@ -582,7 +658,7 @@ mod tests {
         assert_eq!(kdfe_kat(), Ok(()));
         assert_eq!(drbg_kat(), Ok(()));
         assert_eq!(ecdh_kat(), Ok(()));
-        assert_eq!(ecdsa_kat(&mut rng), Ok(()));
+        assert_eq!(ecdsa_kat(), Ok(()));
         assert_eq!(rsa_kat(), Ok(()));
     }
 
@@ -634,6 +710,9 @@ mod tests {
             ("ECDSA_DIGEST", ECDSA_DIGEST, 32),
             ("ECDSA_R", ECDSA_R, 32),
             ("ECDSA_S", ECDSA_S, 32),
+            ("ECDSA_SIGN_SEED", ECDSA_SIGN_SEED, 48),
+            ("ECDSA_SIGN_R", ECDSA_SIGN_R, 32),
+            ("ECDSA_SIGN_S", ECDSA_SIGN_S, 32),
             ("RSA_MODULUS", RSA_MODULUS, 256),
             ("RSA_PRIME", RSA_PRIME, 128),
             ("RSA_DIGEST", RSA_DIGEST, 32),
@@ -743,6 +822,43 @@ mod tests {
             h.check(&skewed),
             Err(Failure("entropy adaptive proportion"))
         );
+    }
+
+    #[test]
+    fn the_acquisition_window_reaches_a_verdict_on_one_acquisition() {
+        // The module takes its entropy in a single request, so a 512 sample
+        // window would never fill and the test would never decide anything.
+        // The acquisition window has to reach a verdict on what was taken.
+        let size = 48;
+
+        // A source stuck at one value fails, on the repetition count first.
+        let mut h = HealthTests::for_acquisition(size);
+        assert!(h.check(&[0x7fu8; 48]).is_err());
+
+        // A source that alternates never repeats, so the proportion test is
+        // what has to catch it, and with this window it does.
+        let mut h = HealthTests::for_acquisition(size);
+        let skewed: Vec<u8> = (0..size).map(|i| (i % 2) as u8).collect();
+        assert_eq!(
+            h.check(&skewed),
+            Err(Failure("entropy adaptive proportion")),
+            "the window must decide within one acquisition"
+        );
+
+        // The window the stream form uses cannot decide on 48 samples, which
+        // is the reason the acquisition form exists.
+        let mut h = HealthTests::new();
+        assert_eq!(h.check(&skewed), Ok(()));
+    }
+
+    #[test]
+    fn an_acquisition_of_real_entropy_passes() {
+        // A false failure would stop the TPM from starting, so the cutoff has
+        // to leave real entropy alone. Drbg::from_system runs these tests on
+        // its seed, so this exercises the production path many times over.
+        for _ in 0..200 {
+            rand::Drbg::from_system().expect("real entropy failed a health test");
+        }
     }
 
     #[test]

@@ -96,6 +96,17 @@ impl Tpm {
     /// A state file that is already there is loaded; otherwise the TPM is
     /// manufactured and the new state is written.
     pub fn new(state_dir: impl AsRef<Path>, logger: Arc<Logger>) -> io::Result<Tpm> {
+        // The pre-operational self tests of FIPS 140-3 clause 10.3 run before
+        // anything else. Manufacturing a TPM generates seeds and writes a state
+        // file, and loading one logs a line; clause 10.3 requires the tests to
+        // pass before the module puts anything out. A failure here is fatal
+        // rather than a TPM in failure mode, because there is no TPM yet to be
+        // in that mode and nothing has been written.
+        let integrity = crate::tpm::fips::integrity()
+            .map_err(|e| io::Error::other(format!("integrity test failed: {}", e.0)))?;
+        crate::tpm::fips::known_answer_tests()
+            .map_err(|e| io::Error::other(format!("self test failed: {}", e.0)))?;
+
         let store = StateStore::new(state_dir)?;
         let state = match store.load()? {
             Some(data) => match TpmState::load(&data) {
@@ -121,6 +132,13 @@ impl Tpm {
                 s
             }
         };
+
+        let mut state = state;
+        // The digest the integrity test produced is what TPM2_GetTestResult
+        // reports, so it is kept rather than recomputed.
+        state.test_digest = integrity;
+        state.self_test_done = true;
+        state.test_failure = None;
 
         Ok(Tpm {
             state: Mutex::new(state),
