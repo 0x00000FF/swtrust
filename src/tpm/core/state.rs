@@ -583,17 +583,23 @@ impl TpmState {
             state.persistent.insert(handle, object);
         }
 
-        let commit_random = read_sized(&mut r)?;
-        let commit_count = r.u64()?;
-        let commit_used = read_sized(&mut r)?;
-        if commit_random.len() > config::COMMIT_NONCE_BYTES
-            || commit_used.len() > config::MAX_COMMIT_SEQUENCES as usize / 8
-        {
-            return Err(TpmRc(rc::BAD_CONTEXT));
+        // The commit values were added to the record after the first files
+        // were written, so a file that ends here is one from before and is
+        // read as having none. Startup then takes a fresh nonce rather than
+        // refusing to load a state that is otherwise good.
+        if !r.is_empty() {
+            let commit_random = read_sized(&mut r)?;
+            let commit_count = r.u64()?;
+            let commit_used = read_sized(&mut r)?;
+            if commit_random.len() > config::COMMIT_NONCE_BYTES
+                || commit_used.len() > config::MAX_COMMIT_SEQUENCES as usize / 8
+            {
+                return Err(TpmRc(rc::BAD_CONTEXT));
+            }
+            state
+                .commits
+                .restore(commit_random, commit_count, commit_used);
         }
-        state
-            .commits
-            .restore(commit_random, commit_count, commit_used);
 
         if !r.is_empty() {
             return Err(TpmRc(rc::BAD_CONTEXT));
@@ -884,6 +890,51 @@ mod tests {
         assert!(!s.persistent.contains_key(&hc::PERSISTENT_FIRST));
         assert!(s.persistent.contains_key(&hc::PLATFORM_PERSISTENT));
         assert_eq!(s.clock.reset_count, 0);
+    }
+
+    #[test]
+    fn a_state_file_without_the_commit_values_still_loads() {
+        // The commit values were appended to the record after the first files
+        // were written. One of those ends where they would start, and it holds
+        // hierarchy seeds and persistent objects that must not be thrown away
+        // because of a field that did not exist when it was saved.
+        let mut s = TpmState::manufacture().unwrap();
+        s.hierarchies.owner.auth = b"ownerauth".to_vec();
+        s.persistent.insert(hc::PERSISTENT_FIRST, object());
+        let saved = s.save().unwrap();
+
+        // Cut the record back to where the commit values begin, which is what
+        // an older file looks like: a nonce, a counter and an array, all at
+        // the end.
+        let (random, _, used) = s.commits.parts();
+        let tail = 2 + random.len() + 8 + 2 + used.len();
+        let older = &saved[..saved.len() - tail];
+
+        let back = TpmState::load(older).expect("an older state file was refused");
+        assert_eq!(back.hierarchies.owner.auth, b"ownerauth");
+        assert!(back.persistent.contains_key(&hc::PERSISTENT_FIRST));
+        // It carries no commit values, so a startup takes a fresh nonce.
+        assert!(!back.commits.is_ready());
+    }
+
+    #[test]
+    fn the_commit_values_survive_a_save_and_load() {
+        let mut s = TpmState::manufacture().unwrap();
+        let mut rng = crate::tpm::crypto::rand::Drbg::new(&[0x9au8; 48], b"t").unwrap();
+        s.commits.reset(&mut rng).unwrap();
+        let (r, counter) = s.commits.next(alg::SHA256, b"n", 256).unwrap();
+        s.commits.take(counter);
+
+        let back = TpmState::load(&s.save().unwrap()).unwrap();
+        assert!(back.commits.is_ready());
+        assert_eq!(back.commits.outstanding(), 1);
+        // The same counter gives the same value, which is what makes the split
+        // operation survive.
+        let mut back = back;
+        assert_eq!(
+            back.commits.use_counter(alg::SHA256, b"n", counter, 256).unwrap(),
+            r
+        );
     }
 
     #[test]

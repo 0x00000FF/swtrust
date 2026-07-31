@@ -152,14 +152,25 @@ impl Commits {
     /// signatures over the same commit value give away the private key, so
     /// this check is what keeps a commit to a single use.
     fn full_counter(&self, counter: u16) -> TpmResult<u64> {
+        // Step 2.
         let t = self.count as u16;
         let age = t.wrapping_sub(counter);
         if age == 0 || age as u32 >= config::MAX_COMMIT_SEQUENCES as u32 {
             return Err(TpmRc(rc::RANGE));
         }
+        // Steps 3 and 4 come before the reconstruction, and the order matters
+        // near the start of an epoch. With a count of one, a counter of 0xffff
+        // has an age of two by the wrapping subtraction and passes the window,
+        // but there is no such counter yet; the array says so, and reaching
+        // step 5 first would take the count below zero.
+        if !self.is_set(counter as u64) {
+            return Err(TpmRc(rc::VALUE));
+        }
         // Steps 5 to 7 rebuild the wider counter, which is the current one
         // less however far back the caller reached.
-        Ok(self.count - age as u64)
+        self.count
+            .checked_sub(age as u64)
+            .ok_or(TpmRc(rc::VALUE))
     }
 
     /// Recover the value for a counter and spend it.
@@ -174,10 +185,6 @@ impl Commits {
         bits: u32,
     ) -> TpmResult<Vec<u8>> {
         let full = self.full_counter(counter)?;
-        // Step 4.
-        if !self.is_set(full) {
-            return Err(TpmRc(rc::VALUE));
-        }
         let r = self.derive(name_alg, name, full, bits)?;
         // Step 9.
         self.set(full, false);
@@ -187,9 +194,6 @@ impl Commits {
     /// Recover the value for a counter without spending it.
     pub fn peek(&self, name_alg: u16, name: &[u8], counter: u16, bits: u32) -> TpmResult<Vec<u8>> {
         let full = self.full_counter(counter)?;
-        if !self.is_set(full) {
-            return Err(TpmRc(rc::VALUE));
-        }
         self.derive(name_alg, name, full, bits)
     }
 
@@ -331,6 +335,46 @@ mod tests {
         // The ones behind it are in the window and were handed out.
         assert!(c.use_counter(alg::SHA256, b"n", 9, 256).is_ok());
         assert!(c.use_counter(alg::SHA256, b"n", 0, 256).is_ok());
+    }
+
+    #[test]
+    fn an_early_counter_cannot_take_the_count_below_zero() {
+        // Near the start of an epoch a wrapping age can pass the window for a
+        // counter that does not exist yet. With a count of one, 0xffff has an
+        // age of two. Clause 44.2.5 checks the array at step 4, before the
+        // reconstruction at step 5, and that is what stops the subtraction.
+        let mut c = commits();
+        issue(&mut c, b"n");
+        for counter in [0xffffu16, 0xfffe, 0xff80] {
+            let got = c.use_counter(alg::SHA256, b"n", counter, 256);
+            assert!(
+                matches!(got, Err(e) if e == TpmRc(rc::VALUE) || e == TpmRc(rc::RANGE)),
+                "counter {counter:#06x} gave {got:?}"
+            );
+        }
+        // The one real counter still works.
+        assert!(c.use_counter(alg::SHA256, b"n", 0, 256).is_ok());
+    }
+
+    #[test]
+    fn a_counter_outside_the_window_says_range_not_value() {
+        // Clause 44.2.5 step 2 gives TPM_RC_RANGE, which is not the same
+        // answer as a counter the array simply does not hold.
+        let mut c = commits();
+        for _ in 0..10 {
+            issue(&mut c, b"n");
+        }
+        assert_eq!(
+            c.use_counter(alg::SHA256, b"n", 10, 256).unwrap_err(),
+            TpmRc(rc::RANGE),
+            "the current counter is outside the window"
+        );
+        // One inside the window whose bit was already spent is a value error.
+        c.use_counter(alg::SHA256, b"n", 5, 256).unwrap();
+        assert_eq!(
+            c.use_counter(alg::SHA256, b"n", 5, 256).unwrap_err(),
+            TpmRc(rc::VALUE)
+        );
     }
 
     #[test]

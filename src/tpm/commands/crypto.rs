@@ -579,10 +579,17 @@ pub fn sign_digest(
                     };
                     let order = curve.order()?;
                     let bits = ((order.bits() + 7) / 8 * 8) as u32;
-                    let commit_r = state
-                        .commits
-                        .use_counter(object.public.name_alg, &object.name, detail.count, bits)
-                        .map_err(|_| TpmRc(rc::VALUE).with_parameter(2))?;
+                    // Part 1 clause 44.2.5 gives TPM_RC_RANGE for a counter
+                    // outside the window and TPM_RC_VALUE for one the array
+                    // does not hold, so both are reported as they are. This
+                    // helper serves several commands, which number their
+                    // parameters differently, so it adds no qualifier.
+                    let commit_r = state.commits.use_counter(
+                        object.public.name_alg,
+                        &object.name,
+                        detail.count,
+                        bits,
+                    )?;
                     ecc::ecdaa_sign(
                         &curve,
                         &private,
