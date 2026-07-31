@@ -47,6 +47,10 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         names.push(dispatch::handle_name(state, *h)?);
     }
 
+    // Part 3 clause 5.5 checks that the sessions ask for a consistent set of
+    // things before any of them is used.
+    dispatch::check_session_attributes(&request)?;
+
     // Part 3 clause 5.6 checks each authorization before clause 5.7 decrypts a
     // parameter, and Part 1 clause 18.4 computes cpHash over the parameters as
     // they arrived, so the encrypted form is what the HMAC covers.
@@ -78,18 +82,6 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     // to prove it knows the session key. Part 1 clause 19.6.3 requires the
     // HMAC on every such session.
     for index in request.info.auth_handles as usize..request.sessions.len() {
-        let input = &request.sessions[index];
-        if input.handle == crate::tpm::constants::rh::RS_PW {
-            // A password session cannot encrypt, decrypt or audit.
-            if input.attributes.any(
-                crate::tpm::structures::attributes::SessionAttributes::DECRYPT
-                    | crate::tpm::structures::attributes::SessionAttributes::ENCRYPT
-                    | crate::tpm::structures::attributes::SessionAttributes::AUDIT,
-            ) {
-                return Err(TpmRc(rc::ATTRIBUTES).with_session(index + 1));
-            }
-            continue;
-        }
         let name_refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
         dispatch::check_unauthorized_session(state, &request, index, &name_refs)?;
     }

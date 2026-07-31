@@ -617,12 +617,6 @@ pub fn check_unauthorized_session(
         .get(input.handle)
         .map_err(|_| TpmRc(rc::VALUE).with_session(position))?;
 
-    // A session that asks for nothing needs to prove nothing.
-    if !input.attributes.any(
-        SessionAttributes::DECRYPT | SessionAttributes::ENCRYPT | SessionAttributes::AUDIT,
-    ) {
-        return Ok(());
-    }
     // An unbound, unsalted session has no key, so Part 1 clause 19.6.16 lets
     // it send an empty HMAC. It may not send a wrong one, so anything present
     // is still checked.
@@ -855,29 +849,79 @@ pub fn roll_response_nonces(state: &mut TpmState, request: &Request) -> TpmResul
     Ok(out)
 }
 
-/// The position of the session that asked to audit the command.
+/// Check that the session attributes are consistent, Part 3 clause 5.5.4.
 ///
-/// Part 1 clause 17.1 allows one audit session per command, so a second one is
-/// refused rather than silently ignored.
-pub fn audit_session_index(request: &Request) -> TpmResult<Option<usize>> {
-    let mut found = None;
+/// One session may audit, one may decrypt and one may encrypt. The audit
+/// session may not be one of the sessions that authorize a handle, and a
+/// session that authorizes nothing has to do at least one of the three.
+pub fn check_session_attributes(request: &Request) -> TpmResult<()> {
+    let auth_handles = request.info.auth_handles as usize;
+    let mut audit = None;
+    let mut decrypt = None;
+    let mut encrypt = None;
+
     for (index, input) in request.sessions.iter().enumerate() {
-        if !input.attributes.has(SessionAttributes::AUDIT) {
-            // Part 1 clause 17.3 allows auditExclusive and auditReset only in
-            // a session that is also auditing.
-            if input.attributes.any(
-                SessionAttributes::AUDIT_EXCLUSIVE | SessionAttributes::AUDIT_RESET,
-            ) {
-                return Err(TpmRc(rc::ATTRIBUTES).with_session(index + 1));
+        let position = index + 1;
+        let attributes = input.attributes;
+        let attributes_error = || TpmRc(rc::ATTRIBUTES).with_session(position);
+
+        // Part 1 clause 16.4 gives a password no session context, so it can
+        // carry none of the three.
+        if input.handle == rh::RS_PW
+            && attributes.any(
+                SessionAttributes::DECRYPT
+                    | SessionAttributes::ENCRYPT
+                    | SessionAttributes::AUDIT,
+            )
+        {
+            return Err(attributes_error());
+        }
+        // Part 1 clause 17.3 allows auditExclusive and auditReset only in a
+        // session that is also auditing.
+        if !attributes.has(SessionAttributes::AUDIT)
+            && attributes
+                .any(SessionAttributes::AUDIT_EXCLUSIVE | SessionAttributes::AUDIT_RESET)
+        {
+            return Err(attributes_error());
+        }
+        if attributes.has(SessionAttributes::AUDIT) {
+            if audit.is_some() || index < auth_handles {
+                return Err(attributes_error());
             }
-            continue;
+            audit = Some(index);
         }
-        if found.is_some() {
-            return Err(TpmRc(rc::ATTRIBUTES).with_session(index + 1));
+        if attributes.has(SessionAttributes::DECRYPT) {
+            if decrypt.is_some() {
+                return Err(attributes_error());
+            }
+            decrypt = Some(index);
         }
-        found = Some(index);
+        if attributes.has(SessionAttributes::ENCRYPT) {
+            if encrypt.is_some() {
+                return Err(attributes_error());
+            }
+            encrypt = Some(index);
+        }
+        // A session that authorizes no handle has to have a reason to be here.
+        if index >= auth_handles
+            && !attributes.any(
+                SessionAttributes::DECRYPT
+                    | SessionAttributes::ENCRYPT
+                    | SessionAttributes::AUDIT,
+            )
+        {
+            return Err(attributes_error());
+        }
     }
-    Ok(found)
+    Ok(())
+}
+
+/// The position of the session that asked to audit the command.
+pub fn audit_session_index(request: &Request) -> Option<usize> {
+    request
+        .sessions
+        .iter()
+        .position(|s| s.attributes.has(SessionAttributes::AUDIT))
 }
 
 /// Check the audit session before the command runs.
@@ -885,14 +929,11 @@ pub fn audit_session_index(request: &Request) -> TpmResult<Option<usize>> {
 /// Part 1 clause 17.1 restricts audit to HMAC sessions, and clause 17.3 gates
 /// the command on exclusivity as it stands at the start of the command.
 pub fn check_audit_session(state: &TpmState, request: &Request) -> TpmResult<()> {
-    let Some(index) = audit_session_index(request)? else {
+    let Some(index) = audit_session_index(request) else {
         return Ok(());
     };
     let input = &request.sessions[index];
     let position = index + 1;
-    if input.handle == rh::RS_PW {
-        return Err(TpmRc(rc::ATTRIBUTES).with_session(position));
-    }
     let s = state
         .sessions
         .get(input.handle)
@@ -922,7 +963,7 @@ pub fn update_audit(
     response_parameters: &[u8],
 ) -> TpmResult<()> {
     let name_refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
-    let audit_index = audit_session_index(request)?;
+    let audit_index = audit_session_index(request);
 
     if let Some(index) = audit_index {
         let input = &request.sessions[index];
@@ -1304,6 +1345,102 @@ mod tests {
         let req = parse(&state, &buf, 0).unwrap();
         let e = entity(&state, rh::OWNER).unwrap();
         assert!(check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).is_ok());
+    }
+
+    /// A session area holding the given attributes, all on loaded handles.
+    fn session_area(entries: &[(u32, u8)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (handle, attributes) in entries {
+            out.extend_from_slice(
+                &AuthCommand {
+                    session_handle: *handle,
+                    nonce: Tpm2bNonce::empty(),
+                    session_attributes: SessionAttributes(*attributes),
+                    hmac: Tpm2bAuth::empty(),
+                }
+                .to_bytes(),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn the_session_attributes_have_to_be_consistent() {
+        let state = TpmState::manufacture().unwrap();
+        let hmac = hc::HMAC_SESSION_FIRST;
+        let other = hc::HMAC_SESSION_FIRST + 1;
+        let cont = SessionAttributes::CONTINUE_SESSION;
+
+        // TPM2_NV_Read has one handle that needs authorization.
+        let read = |area: Vec<u8>| {
+            command(
+                st::SESSIONS,
+                cc::NV_Read,
+                &[rh::OWNER, hc::NV_INDEX_FIRST],
+                &area,
+                &[0x00, 0x08, 0x00, 0x00],
+            )
+        };
+
+        // An authorization session may not also audit.
+        let buf = read(session_area(&[(hmac, cont | SessionAttributes::AUDIT)]));
+        let req = parse(&state, &buf, 0).unwrap();
+        assert_eq!(
+            check_session_attributes(&req).unwrap_err(),
+            TpmRc(rc::ATTRIBUTES).with_session(1)
+        );
+
+        // Two sessions may not both audit.
+        let buf = read(session_area(&[
+            (rh::RS_PW, cont),
+            (hmac, cont | SessionAttributes::AUDIT),
+            (other, cont | SessionAttributes::AUDIT),
+        ]));
+        let req = parse(&state, &buf, 0).unwrap();
+        assert_eq!(
+            check_session_attributes(&req).unwrap_err(),
+            TpmRc(rc::ATTRIBUTES).with_session(3)
+        );
+
+        // Two sessions may not both decrypt.
+        let buf = read(session_area(&[
+            (rh::RS_PW, cont),
+            (hmac, cont | SessionAttributes::DECRYPT),
+            (other, cont | SessionAttributes::DECRYPT),
+        ]));
+        let req = parse(&state, &buf, 0).unwrap();
+        assert_eq!(
+            check_session_attributes(&req).unwrap_err(),
+            TpmRc(rc::ATTRIBUTES).with_session(3)
+        );
+
+        // A session that authorizes nothing has to ask for something.
+        let buf = read(session_area(&[(rh::RS_PW, cont), (hmac, cont)]));
+        let req = parse(&state, &buf, 0).unwrap();
+        assert_eq!(
+            check_session_attributes(&req).unwrap_err(),
+            TpmRc(rc::ATTRIBUTES).with_session(2)
+        );
+
+        // A password may not encrypt, decrypt or audit.
+        let buf = read(session_area(&[(
+            rh::RS_PW,
+            cont | SessionAttributes::ENCRYPT,
+        )]));
+        let req = parse(&state, &buf, 0).unwrap();
+        assert_eq!(
+            check_session_attributes(&req).unwrap_err(),
+            TpmRc(rc::ATTRIBUTES).with_session(1)
+        );
+
+        // One authorization and one session that encrypts the response is the
+        // ordinary arrangement.
+        let buf = read(session_area(&[
+            (rh::RS_PW, cont),
+            (hmac, cont | SessionAttributes::ENCRYPT),
+        ]));
+        let req = parse(&state, &buf, 0).unwrap();
+        check_session_attributes(&req).unwrap();
     }
 
     #[test]
