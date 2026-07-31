@@ -257,13 +257,15 @@ pub fn allows(handle_spec: Handle, handle: u32) -> bool {
         // A parent is an object or any hierarchy, including the null one.
         Kind::Parent => object(handle) || hierarchy(handle) || handle == rh::NULL,
         // An entity is anything that can hold an authorization value.
+        // Part 2 Table 52 lists TPM_RH_NULL as conditional, so it is allowed
+        // only where the command writes the trailing plus, which the check
+        // above has already taken care of.
         Kind::Entity => {
             object(handle)
                 || NvStore::is_nv_handle(handle)
                 || (hc::PCR_FIRST..=hc::PCR_LAST).contains(&handle)
                 || hierarchy(handle)
                 || handle == rh::LOCKOUT
-                || handle == rh::NULL
         }
         Kind::Pcr => (hc::PCR_FIRST..=hc::PCR_LAST).contains(&handle),
         Kind::Context => session::is_session_handle(handle) || ObjectSlots::is_transient(handle),
@@ -278,8 +280,8 @@ pub fn allows(handle_spec: Handle, handle: u32) -> bool {
             handle == rh::PLATFORM || handle == rh::OWNER || NvStore::is_nv_handle(handle)
         }
         Kind::Platform => handle == rh::PLATFORM,
-        Kind::Owner => handle == rh::OWNER || handle == rh::NULL,
-        Kind::Endorsement => handle == rh::ENDORSEMENT || handle == rh::NULL,
+        Kind::Owner => handle == rh::OWNER,
+        Kind::Endorsement => handle == rh::ENDORSEMENT,
         Kind::Provision => handle == rh::OWNER || handle == rh::PLATFORM,
         Kind::Clear => handle == rh::LOCKOUT || handle == rh::PLATFORM,
         Kind::Lockout => handle == rh::LOCKOUT,
@@ -385,6 +387,18 @@ mod tests {
             assert!(allows(h, handle), "{handle:#010x}");
         }
         assert!(!allows(h, hc::TRANSIENT_FIRST));
+    }
+
+    #[test]
+    fn the_null_handle_needs_the_trailing_plus() {
+        // Part 2 Table 52 makes TPM_RH_NULL conditional for TPMI_DH_ENTITY, so
+        // TPM2_PolicySecret, which is written without the plus, refuses it
+        // while TPM2_StartAuthSession, which has it, accepts it.
+        assert!(!allows(kind(cc::PolicySecret, 0).unwrap(), rh::NULL));
+        assert!(allows(kind(cc::StartAuthSession, 1).unwrap(), rh::NULL));
+        // The entity types it does take are unaffected.
+        assert!(allows(kind(cc::PolicySecret, 0).unwrap(), rh::OWNER));
+        assert!(allows(kind(cc::PolicySecret, 0).unwrap(), hc::NV_INDEX_FIRST));
     }
 
     #[test]
