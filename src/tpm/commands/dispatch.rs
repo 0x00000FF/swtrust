@@ -23,6 +23,8 @@ use crate::tpm::structures::capability::{AuthCommand, AuthResponse};
 
 use super::table::{self, CommandInfo};
 
+pub use super::handles::{allows as handle_allows, kind as handle_kind};
+
 /// Length of a command or response header.
 pub const HEADER_SIZE: usize = 10;
 
@@ -100,6 +102,12 @@ pub struct Entity {
     pub uses_lockout: bool,
     /// True when the entity accepts its authValue for user role actions.
     pub user_with_auth: bool,
+    /// True when an ADMIN role action needs a policy session.
+    ///
+    /// Part 3 clause 5.6.5 always requires one for an NV Index and for a
+    /// hierarchy, and for an object only when TPMA_OBJECT.adminWithPolicy is
+    /// SET.
+    pub admin_with_policy: bool,
 }
 
 /// Resolve the Name of a handle for the cpHash.
@@ -142,6 +150,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             policy: policy_of(&h.policy),
             uses_lockout: false,
             user_with_auth: true,
+            admin_with_policy: true,
         });
     }
     if handle == rh::LOCKOUT {
@@ -153,6 +162,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             policy: policy_of(&state.lockout_policy),
             uses_lockout: true,
             user_with_auth: true,
+            admin_with_policy: true,
         });
     }
     if handle == rh::PLATFORM_NV {
@@ -163,6 +173,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             policy: policy_of(&h.policy),
             uses_lockout: false,
             user_with_auth: true,
+            admin_with_policy: true,
         });
     }
     if (hc::PCR_FIRST..=hc::PCR_LAST).contains(&handle) {
@@ -172,11 +183,12 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             policy: policy_of(&state.pcr_policy),
             uses_lockout: false,
             user_with_auth: true,
+            admin_with_policy: true,
         });
     }
     if ObjectSlots::is_transient(handle) {
         let slot = state.objects.get(handle)?;
-        let (policy, user_with_auth, no_da) = match slot {
+        let (policy, user_with_auth, no_da, admin_with_policy) = match slot {
             crate::tpm::core::object::Slot::Object(o) => {
                 // Part 3 clause 5.6.1 needs both halves of the object to
                 // authorize it, because the authValue lives in the sensitive
@@ -190,9 +202,12 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
                         .object_attributes
                         .has(ObjectAttributes::USER_WITH_AUTH),
                     o.public.object_attributes.has(ObjectAttributes::NO_DA),
+                    o.public
+                        .object_attributes
+                        .has(ObjectAttributes::ADMIN_WITH_POLICY),
                 )
             }
-            crate::tpm::core::object::Slot::Sequence(_) => (None, true, true),
+            crate::tpm::core::object::Slot::Sequence(_) => (None, true, true, false),
         };
         return Ok(Entity {
             name,
@@ -200,6 +215,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             policy,
             uses_lockout: !no_da,
             user_with_auth,
+            admin_with_policy,
         });
     }
     if (hc::PERSISTENT_FIRST..=hc::PERSISTENT_LAST).contains(&handle) {
@@ -216,6 +232,10 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
                 .public
                 .object_attributes
                 .has(ObjectAttributes::USER_WITH_AUTH),
+            admin_with_policy: object
+                .public
+                .object_attributes
+                .has(ObjectAttributes::ADMIN_WITH_POLICY),
         });
     }
     if crate::tpm::core::nv::NvStore::is_nv_handle(handle) {
@@ -234,6 +254,9 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             policy,
             uses_lockout: !index.public.attributes.has(NvAttributes::NO_DA),
             user_with_auth: true,
+            // Part 3 clause 5.6.5 always requires a policy session for an
+            // ADMIN role action on an NV Index.
+            admin_with_policy: true,
         });
     }
     Err(TpmRc(rc::HANDLE))
@@ -522,11 +545,13 @@ pub fn check_authorization(
     let input = &request.sessions[index];
     let position = index + 1;
     let protected = da_protected(state, request, index, entity);
+    let role = super::handles::role(request.code, index);
 
     check_lockout(state, request, index, protected)?;
 
     // A password session carries the authorization value in the clear.
     if input.handle == rh::RS_PW {
+        check_role_allows_auth_value(role, entity, position)?;
         if !entity.user_with_auth {
             return Err(TpmRc(rc::AUTH_TYPE).with_session(position));
         }
@@ -545,8 +570,17 @@ pub fn check_authorization(
     }
 
     if s.is_policy() {
+        // Part 3 clause 5.6.6 requires an ADMIN or DUP role policy to name the
+        // command it authorizes, so authority to use an entity is not also
+        // authority to duplicate or administer it.
+        if matches!(role, super::handles::Role::Admin | super::handles::Role::Dup)
+            && s.policy.command_code != Some(request.code)
+        {
+            return Err(TpmRc(rc::POLICY_FAIL).with_session(position));
+        }
         check_policy(state, request, index, entity, cp_hash, &s, protected)?;
     } else {
+        check_role_allows_auth_value(role, entity, position)?;
         if !entity.user_with_auth {
             return Err(TpmRc(rc::AUTH_TYPE).with_session(position));
         }
@@ -571,6 +605,25 @@ pub fn check_authorization(
         }
     }
     Ok(())
+}
+
+/// Refuse a password or HMAC authorization where the role needs a policy.
+///
+/// Part 3 clause 5.6.4 gives the DUP role to policy sessions only. Clause
+/// 5.6.5 does the same for the ADMIN role when the entity is an NV Index, a
+/// hierarchy, or an object with adminWithPolicy SET.
+fn check_role_allows_auth_value(
+    role: super::handles::Role,
+    entity: &Entity,
+    position: usize,
+) -> TpmResult<()> {
+    match role {
+        super::handles::Role::Dup => Err(TpmRc(rc::AUTH_TYPE).with_session(position)),
+        super::handles::Role::Admin if entity.admin_with_policy => {
+            Err(TpmRc(rc::AUTH_TYPE).with_session(position))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// True when a failed authorization here has to count against the lockout.

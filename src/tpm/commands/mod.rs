@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod dispatch;
 pub mod duplication;
 pub mod execute;
+pub mod handles;
 pub mod hierarchy;
 pub mod management;
 pub mod nv;

@@ -41,6 +41,16 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         return Err(TpmRc(rc::PP));
     }
 
+    // Part 3 clause 5.4 refuses a handle whose value the command syntax does
+    // not allow, before anything is done with the entity it names.
+    for (index, handle) in request.handles.iter().enumerate() {
+        if let Some(kind) = dispatch::handle_kind(request.code, index) {
+            if !dispatch::handle_allows(kind, *handle) {
+                return Err(TpmRc(rc::VALUE).with_handle(index + 1));
+            }
+        }
+    }
+
     // Every handle that carries an authorization is checked in order.
     let mut names: Vec<Vec<u8>> = Vec::with_capacity(request.handles.len());
     for h in &request.handles {

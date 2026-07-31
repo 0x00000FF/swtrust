@@ -1727,6 +1727,99 @@ fn a_saved_policy_session_keeps_the_restrictions_it_recorded() {
 }
 
 #[test]
+fn a_handle_the_command_syntax_forbids_is_refused() {
+    let h = Harness::started("handletype");
+
+    // TPM2_Clear takes TPMI_RH_CLEAR, which Part 2 Table 68 limits to
+    // TPM_RH_LOCKOUT and TPM_RH_PLATFORM. Part 3 clause 5.4 refuses anything
+    // else with TPM_RC_VALUE against the handle, so an ordinary object the
+    // caller controls cannot authorize it.
+    for handle in [rh::OWNER, rh::ENDORSEMENT, hc::TRANSIENT_FIRST] {
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::Clear,
+            &[handle],
+            Some(&password(b"")),
+            &[],
+        ));
+        assert_eq!(
+            r.code & 0x03f,
+            rc::VALUE & 0x03f,
+            "TPM2_Clear accepted {handle:#010x} -> {:08x}",
+            r.code
+        );
+    }
+
+    // The two handles the type does allow get past the syntax check.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Clear,
+        &[rh::LOCKOUT],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "TPM2_Clear -> {:08x}", r.code);
+}
+
+#[test]
+fn a_dup_role_handle_needs_a_policy_session() {
+    let h = Harness::started("duprole");
+
+    // A duplicable key: fixedTPM and fixedParent both clear.
+    let mut t = Writer::new();
+    t.u16(0x0023); // TPM_ALG_ECC
+    t.u16(alg::SHA256);
+    t.u32(0x0020 | 0x0040 | 0x0004_0000); // sensitiveDataOrigin | userWithAuth | sign
+    t.u16(0);
+    t.u16(0x0010);
+    t.u16(0x0018);
+    t.u16(alg::SHA256);
+    t.u16(0x0003);
+    t.u16(0x0010);
+    t.u16(0);
+    t.u16(0);
+    let template = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let key = Reader::new(&r.body).u32().unwrap();
+
+    // Part 3 clause 5.6.4 gives objectHandle of TPM2_Duplicate the DUP role,
+    // which only a policy session satisfies. A password is refused, so an
+    // ordinary use authorization cannot export the private area.
+    let mut p = Writer::new();
+    p.u16(0); // encryptionKeyIn
+    p.u16(alg::NULL); // symmetricAlg
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Duplicate,
+        &[key, rh::NULL],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code & 0x03f,
+        rc::AUTH_TYPE & 0x03f,
+        "TPM2_Duplicate accepted a password -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
 fn the_vendor_test_command_echoes_its_input() {
     let h = Harness::started("vendor");
     let mut p = Writer::new();
