@@ -377,6 +377,22 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
         }
     }
 
+    // Part 3 clause 12.3 says the TPM validates that the authPolicy is either
+    // the size of the digest produced by nameAlg or the Empty Buffer. A policy
+    // of any other length can never match the digest a session accumulates, so
+    // the object would be loaded and then be unusable through the policy it
+    // claims to have.
+    if !public.auth_policy.is_empty() {
+        let want = match crate::tpm::crypto::hash::digest_size(public.name_alg) {
+            Ok(size) => size,
+            // With no name algorithm there is no digest, so no policy fits.
+            Err(_) => return Err(TpmRc(rc::SIZE)),
+        };
+        if public.auth_policy.as_slice().len() != want {
+            return Err(TpmRc(rc::SIZE));
+        }
+    }
+
     // An ECC public area names a point, and a point that is not on the curve is
     // not a public key. Every use of it fails later anyway, because the point
     // is validated whenever it is loaded into the library, but a key the TPM
@@ -718,6 +734,40 @@ mod tests {
         p.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&full).unwrap());
         assert_eq!(significant_bits(&full), 2048);
         assert!(validate_public(&p).is_ok());
+    }
+
+    #[test]
+    fn an_auth_policy_must_be_the_size_of_the_name_digest() {
+        use crate::tpm::structures::base::Tpm2bDigest;
+        // Part 3 clause 12.3: the authPolicy is either the size of the digest
+        // produced by nameAlg or the Empty Buffer.
+        let with_policy = |alg: u16, len: usize| {
+            let mut p = public(ObjectAttributes::SIGN_ENCRYPT);
+            p.name_alg = alg;
+            p.auth_policy = Tpm2bDigest::new(vec![0xaa; len]).unwrap();
+            p
+        };
+        // The right size for the algorithm named is accepted.
+        assert!(validate_public(&with_policy(alg::SHA256, 32)).is_ok());
+        assert!(validate_public(&with_policy(alg::SHA384, 48)).is_ok());
+        // A digest of another algorithm is not.
+        assert_eq!(
+            validate_public(&with_policy(alg::SHA256, 20)).unwrap_err(),
+            TpmRc(rc::SIZE)
+        );
+        assert_eq!(
+            validate_public(&with_policy(alg::SHA256, 48)).unwrap_err(),
+            TpmRc(rc::SIZE)
+        );
+        // An empty policy is always allowed.
+        let mut p = public(ObjectAttributes::SIGN_ENCRYPT);
+        p.auth_policy = Tpm2bDigest::empty();
+        assert!(validate_public(&p).is_ok());
+        // With no name algorithm there is no digest, so no policy fits.
+        assert_eq!(
+            validate_public(&with_policy(alg::NULL, 32)).unwrap_err(),
+            TpmRc(rc::SIZE)
+        );
     }
 
     #[test]
