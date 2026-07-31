@@ -589,6 +589,22 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let public = in_public.public_area;
     object::validate_public(&public).map_err(|e| e.with_parameter(2))?;
 
+    // The shared validator lets an asymmetric public area carry no key at all,
+    // because a creation template is written that way. TPM2_LoadExternal is
+    // not creating anything, so an empty modulus or an empty point is not a
+    // key it can load. Part 2 Table 194 says of an RSA keyBits of zero that
+    // "The value of zero is only valid for create", and an Empty Point is not
+    // a point on any curve.
+    match &public.unique {
+        PublicId::Rsa(modulus) if modulus.is_empty() => {
+            return Err(TpmRc(rc::KEY).with_parameter(2));
+        }
+        PublicId::Ecc(point) if point.x.is_empty() || point.y.is_empty() => {
+            return Err(TpmRc(rc::KEY).with_parameter(2));
+        }
+        _ => {}
+    }
+
     // An external object may not claim to be TPM resident.
     if public
         .object_attributes

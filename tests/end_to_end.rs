@@ -2054,6 +2054,61 @@ fn the_vendor_test_command_echoes_its_input() {
 }
 
 #[test]
+fn load_external_refuses_an_asymmetric_key_that_is_not_there() {
+    // A creation template may leave unique empty, so the shared validator
+    // allows it. TPM2_LoadExternal is not creating anything, and Part 2 Table
+    // 194 says of an RSA keyBits of zero that the value is only valid for
+    // create. An Empty Point is not a point on any curve either.
+    let h = Harness::started("emptykey");
+
+    let load = |template: &[u8]| {
+        let mut p = Writer::new();
+        p.u16(0); // inPrivate absent
+        p.u16(template.len() as u16);
+        p.bytes(template);
+        p.u32(rh::NULL);
+        h.send(&command(
+            st::NO_SESSIONS,
+            cc::LoadExternal,
+            &[],
+            None,
+            &p.finish().unwrap(),
+        ))
+    };
+
+    // An RSA public area with no modulus.
+    let mut t = Writer::new();
+    t.u16(alg::RSA);
+    t.u16(alg::SHA256);
+    t.u32(0x0040 | 0x0004_0000);
+    t.u16(0);
+    t.u16(0x0010);
+    t.u16(0x0016);
+    t.u16(alg::SHA256);
+    t.u16(2048);
+    t.u32(0);
+    t.u16(0); // no modulus
+    let r = load(&t.finish().unwrap());
+    assert_ne!(r.code, rc::SUCCESS, "an RSA key with no modulus loaded");
+
+    // An ECC public area with an Empty Point.
+    let mut t = Writer::new();
+    t.u16(alg::ECC);
+    t.u16(alg::SHA256);
+    t.u32(0x0040 | 0x0004_0000);
+    t.u16(0);
+    t.u16(0x0010);
+    t.u16(0x0018);
+    t.u16(alg::SHA256);
+    t.u16(0x0003);
+    t.u16(0x0010);
+    t.u16(0); // no x
+    t.u16(0); // no y
+    let r = load(&t.finish().unwrap());
+    assert_ne!(r.code, rc::SUCCESS, "an ECC key with no point loaded");
+}
+
+#[test]
 fn an_rsa_key_whose_modulus_disagrees_with_key_bits_is_refused() {
     // Part 2 Table 195 makes keyBits the number of bits in the public modulus,
     // and Part 3 clause 12.2 answers TPM_RC_KEY_SIZE when the key size and the

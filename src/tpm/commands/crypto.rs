@@ -1160,7 +1160,15 @@ pub fn ec_ephemeral(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let mut r = request.reader();
     let curve_id = r.u16()?;
     r.expect_end()?;
-    let curve = ecc::Curve::new(curve_id).map_err(|_| TpmRc(rc::CURVE).with_parameter(1))?;
+    // Part 2 Table 201 gives TPM_RC_CURVE to a curve the TPM does not offer.
+    // Curve::new answers exactly that, so nothing else is relabelled as it.
+    let curve = ecc::Curve::new(curve_id).map_err(|e| {
+        if e.value() == rc::CURVE {
+            e.with_parameter(1)
+        } else {
+            e
+        }
+    })?;
 
     // Part 1 clause 44.2.4: the ephemeral key is the commit value, and the
     // public half is [r]G. There is no key handle here, so the derivation of
