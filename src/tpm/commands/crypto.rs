@@ -511,10 +511,7 @@ pub fn sign_digest(
 
     match object.public.object_type {
         alg::RSA => {
-            let PublicParms::Rsa {
-                key_bits, exponent, ..
-            } = object.public.parameters
-            else {
+            let PublicParms::Rsa { exponent, .. } = object.public.parameters else {
                 return Err(TpmRc(rc::TYPE));
             };
             let PublicId::Rsa(modulus) = &object.public.unique else {
@@ -529,7 +526,11 @@ pub fn sign_digest(
             let block = match scheme.scheme {
                 alg::RSASSA => rsa::pkcs1v15_sign_encode(hash_alg, digest, size)?,
                 alg::RSAPSS => {
-                    let em = rsa::pss_encode(hash_alg, digest, key_bits as usize, &mut state.rng)?;
+                    // emBits comes from the modulus the key actually has. A
+                    // public area whose keyBits disagrees is refused when the
+                    // object is loaded, and sizing the padding here from the
+                    // key keeps that disagreement from running off the block.
+                    let em = rsa::pss_encode(hash_alg, digest, size * 8, &mut state.rng)?;
                     let mut b = vec![0u8; size - em.len()];
                     b.extend_from_slice(&em);
                     b

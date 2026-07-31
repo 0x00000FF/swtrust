@@ -2052,3 +2052,74 @@ fn the_vendor_test_command_echoes_its_input() {
     assert_eq!(r.code, rc::SUCCESS);
     assert_eq!(r.body, vec![0x00, 0x04, b'p', b'i', b'n', b'g']);
 }
+
+#[test]
+fn an_rsa_key_whose_modulus_disagrees_with_key_bits_is_refused() {
+    // Part 2 Table 195 makes keyBits the number of bits in the public modulus,
+    // and Part 3 clause 12.2 answers TPM_RC_KEY_SIZE when the key size and the
+    // public area disagree. Loading such a key used to succeed, and TPM2_Sign
+    // then sized the PSS padding from keyBits while the block came from the
+    // modulus, so the padding ran past the block.
+    let h = Harness::started("rsakeybits");
+
+    let mut t = Writer::new();
+    t.u16(alg::RSA);
+    t.u16(alg::SHA256);
+    // userWithAuth | sign. An external object may not claim to be TPM resident.
+    t.u32(0x0040 | 0x0004_0000);
+    t.u16(0); // authPolicy
+    t.u16(0x0010); // symmetric TPM_ALG_NULL
+    t.u16(0x0016); // scheme TPM_ALG_RSAPSS
+    t.u16(alg::SHA256);
+    t.u16(4096); // keyBits says 4096 bits
+    t.u32(0); // exponent, the default
+    t.u16(256); // but the modulus is 2048 bits
+    t.bytes(&[0xab; 256]);
+    let template = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(0); // inPrivate is absent
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u32(rh::NULL);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::LoadExternal,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    let expected = swtrust::tpm::error::TpmRc(rc::KEY_SIZE)
+        .with_parameter(2)
+        .value();
+    assert_eq!(r.code, expected, "got {:08x}", r.code);
+
+    // A modulus of the length keyBits names is loaded.
+    let mut t = Writer::new();
+    t.u16(alg::RSA);
+    t.u16(alg::SHA256);
+    t.u32(0x0040 | 0x0004_0000);
+    t.u16(0);
+    t.u16(0x0010);
+    t.u16(0x0016);
+    t.u16(alg::SHA256);
+    t.u16(2048);
+    t.u32(0);
+    t.u16(256);
+    t.bytes(&[0xab; 256]);
+    let template = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u32(rh::NULL);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::LoadExternal,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "got {:08x}", r.code);
+}

@@ -360,6 +360,20 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
         return Err(TpmRc(rc::HASH));
     }
 
+    // Part 2 Table 195 defines keyBits as the number of bits in the public
+    // modulus, and Part 3 clause 12.2 requires the key size to agree with the
+    // public area or the answer is TPM_RC_KEY_SIZE. A creation template names
+    // no modulus yet, so only a public area that carries one is checked.
+    if let (
+        crate::tpm::structures::keys::PublicId::Rsa(modulus),
+        crate::tpm::structures::keys::PublicParms::Rsa { key_bits, .. },
+    ) = (&public.unique, &public.parameters)
+    {
+        if !modulus.is_empty() && modulus.as_slice().len() * 8 != *key_bits as usize {
+            return Err(TpmRc(rc::KEY_SIZE));
+        }
+    }
+
     Ok(())
 }
 
@@ -599,6 +613,47 @@ mod tests {
                 | ObjectAttributes::SIGN_ENCRYPT
         ))
         .is_ok());
+    }
+
+    /// An RSA public area whose modulus is not the length keyBits names.
+    fn rsa_public(key_bits: u16, modulus_bytes: usize) -> TpmtPublic {
+        use crate::tpm::structures::base::Tpm2bPublicKeyRsa;
+        use crate::tpm::structures::schemes::{Scheme, SymDef};
+        TpmtPublic {
+            object_type: alg::RSA,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(ObjectAttributes::SIGN_ENCRYPT),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::Rsa {
+                symmetric: SymDef::null(),
+                scheme: Scheme::hash(alg::RSAPSS, alg::SHA256),
+                key_bits,
+                exponent: 0,
+            },
+            unique: PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&vec![0xab; modulus_bytes]).unwrap()),
+        }
+    }
+
+    #[test]
+    fn an_rsa_modulus_must_be_the_length_key_bits_names() {
+        // Part 2 Table 195 makes keyBits the number of bits in the public
+        // modulus, so a public area that says 4096 while carrying a 2048 bit
+        // modulus is refused rather than loaded.
+        assert_eq!(
+            validate_public(&rsa_public(4096, 256)).unwrap_err(),
+            TpmRc(rc::KEY_SIZE)
+        );
+        // The other direction is refused too.
+        assert_eq!(
+            validate_public(&rsa_public(2048, 512)).unwrap_err(),
+            TpmRc(rc::KEY_SIZE)
+        );
+        // A modulus of the stated length is accepted.
+        assert!(validate_public(&rsa_public(2048, 256)).is_ok());
+        // A creation template names no modulus yet, so it is left alone.
+        let mut template = rsa_public(2048, 256);
+        template.unique = PublicId::Rsa(Default::default());
+        assert!(validate_public(&template).is_ok());
     }
 }
 
