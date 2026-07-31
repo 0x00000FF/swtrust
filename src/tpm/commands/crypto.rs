@@ -1189,6 +1189,16 @@ pub fn ec_ephemeral(state: &mut TpmState, request: &Request) -> TpmResult<Respon
         return Err(TpmRc(rc::NO_RESULT));
     }
     let (x, y) = point.coordinates(&curve)?;
+    // The scalar is derived rather than drawn, so ecc::generate is not what
+    // made this pair and its pair-wise consistency test did not run. FIPS
+    // 140-3 Table 40 wants one on every generated pair, so it runs here.
+    crate::tpm::fips::pairwise_ecc(
+        curve_id,
+        &private.to_bytes_padded(curve.coordinate_size())?,
+        &x,
+        &y,
+        false,
+    )?;
     // Recorded only once the point is known good, the same order clause
     // 44.2.3 uses for TPM2_Commit.
     state.commits.take(counter);

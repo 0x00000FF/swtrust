@@ -580,7 +580,18 @@ pub fn commit(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     if let Some(point) = &first {
         e = as_point(point.multiply(&curve, &r_value)?)?;
     } else if second.is_none() {
-        e = as_point(ecc::multiply_generator(&curve, &r_value)?)?;
+        let point = ecc::multiply_generator(&curve, &r_value)?;
+        e = as_point(point)?;
+        // [r]G is a generated key pair, and the scalar was derived rather than
+        // drawn, so ecc::generate did not test it. FIPS 140-3 Table 40 asks
+        // for a pair-wise consistency test on every generated pair.
+        crate::tpm::fips::pairwise_ecc(
+            curve_id,
+            &r_value.to_bytes_padded(curve.coordinate_size())?,
+            e.x.as_slice(),
+            e.y.as_slice(),
+            false,
+        )?;
     }
 
     // Steps 13 and 14. Nothing above this point has recorded the counter, so
@@ -614,6 +625,20 @@ pub fn zgen_2phase(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         .clone();
     if object.public.object_type != alg::ECC {
         return Err(TpmRc(rc::TYPE).with_handle(1));
+    }
+    // Part 3 Table 54 names keyA "handle of an unrestricted ECC decryption
+    // key". A signing key or a restricted one would be used here as a key
+    // agreement scalar, which is not what its attributes allow.
+    if !object
+        .public
+        .object_attributes
+        .has(ObjectAttributes::DECRYPT)
+        || object
+            .public
+            .object_attributes
+            .has(ObjectAttributes::RESTRICTED)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }
     let Some(sensitive) = &object.sensitive else {
         return Err(TpmRc(rc::HANDLE).with_handle(1));
@@ -677,6 +702,16 @@ pub fn zgen_2phase(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     } else {
         // Clause 44.8.4.3, Full MQV.
         let q_e_a = ecc::multiply_generator(&curve, &d_e)?;
+        // The same pair TPM2_EC_Ephemeral produced, rebuilt here, so it is
+        // tested here as well.
+        let (ax, ay) = q_e_a.coordinates(&curve)?;
+        crate::tpm::fips::pairwise_ecc(
+            curve_id,
+            &d_e.to_bytes_padded(curve.coordinate_size())?,
+            &ax,
+            &ay,
+            false,
+        )?;
         let t_a = d_e
             .add(&d_s.mul(&avf(&curve, &q_e_a, &ctx)?, &ctx)?)?
             .modulo(&order, &ctx)?;

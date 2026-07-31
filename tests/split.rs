@@ -78,12 +78,18 @@ fn send(h: &Harness, buf: &[u8]) -> Answer {
 
 const PASSWORD: [u8; 9] = [0x40, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00];
 
-/// A primary ECC key on P-256 with the given signing scheme.
-fn primary(h: &Harness, scheme: u16, count: Option<u16>) -> (u32, Vec<u8>) {
+/// fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth | sign
+const SIGNING: u32 = 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000;
+/// The same, with decrypt in place of sign and restricted clear, which is
+/// what Part 3 Table 54 calls an unrestricted ECC decryption key.
+const DECRYPTING: u32 = 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0002_0000;
+
+/// A primary ECC key on P-256 with the given attributes and signing scheme.
+fn primary_with(h: &Harness, attrs: u32, scheme: u16, count: Option<u16>) -> (u32, Vec<u8>) {
     let mut t = Writer::new();
     t.u16(alg::ECC);
     t.u16(alg::SHA256);
-    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000);
+    t.u32(attrs);
     t.u16(0); // authPolicy
     t.u16(0x0010); // symmetric NULL
     t.u16(scheme);
@@ -126,6 +132,11 @@ fn primary(h: &Harness, scheme: u16, count: Option<u16>) -> (u32, Vec<u8>) {
     let public_size = rd.u16().unwrap() as usize;
     let public = rd.take(public_size).unwrap().to_vec();
     (handle, public)
+}
+
+/// A primary ECC signing key, which is what the commit tests want.
+fn primary(h: &Harness, scheme: u16, count: Option<u16>) -> (u32, Vec<u8>) {
+    primary_with(h, SIGNING, scheme, count)
 }
 
 /// The x and y of the public point in a marshalled TPMT_PUBLIC.
@@ -396,7 +407,7 @@ fn full_mqv_returns_one_point_computed_from_both_keys() {
     // so it has to differ from what the Full Unified Model gives and it has
     // to be a real point.
     let h = harness("mqv");
-    let (handle, _) = primary(&h, 0x0010, None);
+    let (handle, _) = primary_with(&h, DECRYPTING, 0x0010, None);
     let group = ecc::Curve::new(curve::NIST_P256).unwrap();
 
     let mut rng = swtrust::tpm::crypto::rand::Drbg::new(&[0x71u8; 48], b"peer").unwrap();
@@ -474,6 +485,70 @@ fn full_mqv_returns_one_point_computed_from_both_keys() {
 }
 
 #[test]
+fn two_phase_needs_an_unrestricted_decryption_key() {
+    // Part 3 Table 54 names keyA "handle of an unrestricted ECC decryption
+    // key". A signing key or a restricted one used as a key agreement scalar
+    // would be doing something its attributes do not allow.
+    let h = harness("keya");
+
+    let two_phase = |handle: u32| {
+        let mut p = Writer::new();
+        p.u16(curve::NIST_P256);
+        let r = send(
+            &h,
+            &command(st::NO_SESSIONS, cc::EC_Ephemeral, &[], None, &p.finish().unwrap()),
+        );
+        assert_eq!(r.code, rc::SUCCESS);
+        let mut rd = Reader::new(&r.body);
+        let n = rd.u16().unwrap() as usize;
+        rd.take(n).unwrap();
+        let counter = rd.u16().unwrap();
+
+        let mut rng = swtrust::tpm::crypto::rand::Drbg::new(&[0x91u8; 48], b"peer").unwrap();
+        let mut p = Writer::new();
+        for _ in 0..2 {
+            let k = ecc::generate(curve::NIST_P256, &mut rng).unwrap();
+            let mut inner = Writer::new();
+            inner.u16(k.public_x.len() as u16);
+            inner.bytes(&k.public_x);
+            inner.u16(k.public_y.len() as u16);
+            inner.bytes(&k.public_y);
+            let inner = inner.finish().unwrap();
+            p.u16(inner.len() as u16);
+            p.bytes(&inner);
+        }
+        p.u16(alg::ECDH);
+        p.u16(counter);
+        send(
+            &h,
+            &command(
+                st::SESSIONS,
+                cc::ZGen_2Phase,
+                &[handle],
+                Some(&PASSWORD),
+                &p.finish().unwrap(),
+            ),
+        )
+    };
+
+    // A signing key is refused.
+    let (signing, _) = primary_with(&h, SIGNING, 0x0010, None);
+    assert_ne!(two_phase(signing).code, rc::SUCCESS, "a signing key was accepted");
+
+    // So is a restricted decryption key, which is a storage key.
+    let (restricted, _) = primary_with(&h, DECRYPTING | 0x0001_0000, 0x0010, None);
+    assert_ne!(
+        two_phase(restricted).code,
+        rc::SUCCESS,
+        "a restricted key was accepted"
+    );
+
+    // An unrestricted decryption key is what the command is for.
+    let (good, _) = primary_with(&h, DECRYPTING, 0x0010, None);
+    assert_eq!(two_phase(good).code, rc::SUCCESS);
+}
+
+#[test]
 fn a_commit_survives_a_resume_and_a_restart_but_not_a_reset() {
     // Part 1 Table 41 puts the commit values in the state reset data, and
     // clause 34.4.4 saves that on any Shutdown(STATE) and restores it on the
@@ -540,7 +615,7 @@ fn an_ephemeral_key_completes_a_two_phase_exchange() {
     // Part 1 clause 44.8.4.2, the Full Unified Model: outZ1 is [ds]QsB and
     // outZ2 is [de]QeB, where de is the value the counter names.
     let h = harness("twophase");
-    let (handle, public) = primary(&h, 0x0010, None);
+    let (handle, public) = primary_with(&h, DECRYPTING, 0x0010, None);
     let group = ecc::Curve::new(curve::NIST_P256).unwrap();
 
     // The TPM's ephemeral public key, and the counter that names its private.
