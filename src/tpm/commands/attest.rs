@@ -235,7 +235,7 @@ pub fn get_time(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
 /// TPM2_NV_Certify, Part 3 clause 31.16.
 pub fn nv_certify(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let sign_handle = request.handle(0)?;
-    let _auth_handle = request.handle(1)?;
+    let auth_handle = request.handle(1)?;
     let nv_handle = request.handle(2)?;
     let mut r = request.reader();
     let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
@@ -244,6 +244,13 @@ pub fn nv_certify(state: &mut TpmState, request: &Request) -> TpmResult<Response
     let offset = r.u16()?;
 
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(3))?;
+    // Part 3 clause 31.16.1 certifies only what the authorization is entitled
+    // to read, so the same read authority TPM2_NV_Read applies holds here.
+    // The Index authorization is the second one, so that is the session whose
+    // type decides between the policy and the value attributes.
+    let is_policy = super::nv::auth_is_policy(state, request, 1);
+    super::nv::check_read_authority(index, auth_handle, is_policy)
+        .map_err(|e| e.with_handle(2))?;
     if index.read_locked {
         return Err(TpmRc(rc::NV_LOCKED));
     }

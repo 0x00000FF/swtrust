@@ -590,3 +590,138 @@ mod tests {
         .is_ok());
     }
 }
+
+/// Check that a sensitive area belongs with a public area.
+///
+/// Part 3 clause 12.2.1 answers TPM_RC_BINDING when the two do not go
+/// together. For a keyed hash or a symmetric key the public unique value is
+/// the obfuscated digest of the secret, and for an asymmetric key the public
+/// value is recomputed from the private one.
+pub fn check_binding(public: &TpmtPublic, sensitive: &TpmtSensitive) -> TpmResult<()> {
+    use crate::tpm::crypto::{bn, ecc, rsa};
+    use crate::tpm::structures::keys::{PublicId, PublicParms, SensitiveComposite};
+
+    if sensitive.sensitive_type != public.object_type {
+        return Err(TpmRc(rc::TYPE));
+    }
+    let bad = || TpmRc(rc::BINDING);
+    match (&public.unique, &sensitive.sensitive) {
+        (PublicId::KeyedHash(unique), SensitiveComposite::Bits(bits)) => {
+            check_obfuscated(public.name_alg, unique.as_slice(), sensitive.seed_value.as_slice(), bits.as_slice())
+        }
+        (PublicId::Sym(unique), SensitiveComposite::Sym(key)) => {
+            check_obfuscated(public.name_alg, unique.as_slice(), sensitive.seed_value.as_slice(), key.as_slice())
+        }
+        (PublicId::Rsa(modulus), SensitiveComposite::Rsa(prime)) => {
+            let PublicParms::Rsa { exponent, .. } = public.parameters else {
+                return Err(TpmRc(rc::TYPE));
+            };
+            // The prime has to divide the modulus, which is what makes it the
+            // private half of this key.
+            let key = rsa::RsaPrivate::from_prime(modulus.as_slice(), exponent, prime.as_slice())
+                .map_err(|_| bad())?;
+            let _ = key;
+            Ok(())
+        }
+        (PublicId::Ecc(point), SensitiveComposite::Ecc(scalar)) => {
+            let PublicParms::Ecc { curve_id, .. } = public.parameters else {
+                return Err(TpmRc(rc::TYPE));
+            };
+            let curve = ecc::Curve::new(curve_id).map_err(|_| bad())?;
+            let private = bn::BigNum::from_bytes(scalar.as_slice()).map_err(|_| bad())?;
+            let computed = ecc::multiply_generator(&curve, &private).map_err(|_| bad())?;
+            let (x, y) = computed.coordinates(&curve).map_err(|_| bad())?;
+            if x != point.x.as_slice() || y != point.y.as_slice() {
+                return Err(bad());
+            }
+            Ok(())
+        }
+        _ => Err(TpmRc(rc::TYPE)),
+    }
+}
+
+/// The unique value of a keyed hash or symmetric object.
+///
+/// Part 1 clause 25.2.2 obfuscates the secret with the seed so the public area
+/// binds to it without revealing it.
+fn check_obfuscated(
+    name_alg: u16,
+    unique: &[u8],
+    seed: &[u8],
+    secret: &[u8],
+) -> TpmResult<()> {
+    let expected = crate::tpm::crypto::hash::digest_parts(name_alg, &[seed, secret])?;
+    if unique != expected {
+        return Err(TpmRc(rc::BINDING));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use crate::tpm::crypto::hash;
+    use crate::tpm::structures::base::{Tpm2bDigest, Tpm2bSensitiveData};
+    use crate::tpm::structures::keys::{PublicId, PublicParms, SensitiveComposite};
+    use crate::tpm::structures::schemes::Scheme;
+
+    fn keyed_hash(seed: &[u8], secret: &[u8], unique: Vec<u8>) -> (TpmtPublic, TpmtSensitive) {
+        let public = TpmtPublic {
+            object_type: alg::KEYEDHASH,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(ObjectAttributes::USER_WITH_AUTH),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::KeyedHash {
+                scheme: Scheme::null(),
+            },
+            unique: PublicId::KeyedHash(Tpm2bDigest::new(unique).unwrap()),
+        };
+        let sensitive = TpmtSensitive {
+            sensitive_type: alg::KEYEDHASH,
+            auth_value: Tpm2bDigest::empty(),
+            seed_value: Tpm2bDigest::from_slice(seed).unwrap(),
+            sensitive: SensitiveComposite::Bits(Tpm2bSensitiveData::from_slice(secret).unwrap()),
+        };
+        (public, sensitive)
+    }
+
+    #[test]
+    fn a_sensitive_area_has_to_belong_with_its_public_area() {
+        let seed = [1u8; 32];
+        let secret = b"the sealed value";
+        let unique = hash::digest_parts(alg::SHA256, &[&seed, secret]).unwrap();
+
+        // Part 1 clause 25.2.2 obfuscates the secret into the unique value, so
+        // a matching pair is accepted.
+        let (public, sensitive) = keyed_hash(&seed, secret, unique.clone());
+        check_binding(&public, &sensitive).unwrap();
+
+        // A different secret under the same public area is refused, which is
+        // what Part 3 clause 12.2.1 answers TPM_RC_BINDING for.
+        let (public, sensitive) = keyed_hash(&seed, b"another value", unique.clone());
+        assert_eq!(
+            check_binding(&public, &sensitive).unwrap_err(),
+            TpmRc(rc::BINDING)
+        );
+
+        // So is the right secret under a different seed.
+        let (public, sensitive) = keyed_hash(&[2u8; 32], secret, unique);
+        assert_eq!(
+            check_binding(&public, &sensitive).unwrap_err(),
+            TpmRc(rc::BINDING)
+        );
+    }
+
+    #[test]
+    fn a_sensitive_area_of_the_wrong_type_is_refused() {
+        let seed = [1u8; 32];
+        let secret = b"value";
+        let unique = hash::digest_parts(alg::SHA256, &[&seed, secret]).unwrap();
+        let (public, mut sensitive) = keyed_hash(&seed, secret, unique);
+        sensitive.sensitive_type = alg::RSA;
+        assert_eq!(
+            check_binding(&public, &sensitive).unwrap_err(),
+            TpmRc(rc::TYPE)
+        );
+    }
+}

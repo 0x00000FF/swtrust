@@ -1081,6 +1081,11 @@ pub fn activate_credential(state: &TpmState, request: &Request) -> TpmResult<Res
     let secret = Tpm2bEncryptedSecret::unmarshal(&mut r)?;
 
     let key = object_of(state, key_handle).map_err(|e| e.with_handle(2))?;
+    // Part 3 clause 12.5.1 needs a Storage Key here, the same one that made
+    // the credential.
+    if !key.is_storage_key() {
+        return Err(TpmRc(rc::TYPE).with_handle(2));
+    }
     let Some(sensitive) = &key.sensitive else {
         return Err(TpmRc(rc::HANDLE).with_handle(2));
     };

@@ -36,8 +36,12 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         return Err(TpmRc(rc::INITIALIZE));
     }
 
-    // A command that needs physical presence must have it asserted.
-    if state.pp_commands.contains(&request.code) && !state.physical_presence {
+    // A command that needs physical presence must have it asserted. Part 3
+    // clause 26.2.1 says TPM2_PP_Commands always does, whatever the list that
+    // command itself maintains happens to hold.
+    let needs_pp =
+        request.code == cc::PP_Commands || state.pp_commands.contains(&request.code);
+    if needs_pp && !state.physical_presence {
         return Err(TpmRc(rc::PP));
     }
 

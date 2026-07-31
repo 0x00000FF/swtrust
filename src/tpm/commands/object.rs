@@ -522,9 +522,9 @@ pub fn load(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         in_private.as_slice(),
     )?;
     let sensitive = TpmtSensitive::from_bytes(&plain).map_err(|_| TpmRc(rc::SENSITIVE))?;
-    if sensitive.sensitive_type != public.object_type {
-        return Err(TpmRc(rc::TYPE).with_parameter(1));
-    }
+    // Part 3 clause 12.2.1 requires the two halves to belong together, which
+    // is what makes the public area a description of this private key.
+    object::check_binding(&public, &sensitive).map_err(|e| e.with_parameter(1))?;
 
     let object = Object::new(
         public,
@@ -544,7 +544,23 @@ pub fn load(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 /// TPM2_LoadExternal, Part 3 clause 12.3.
 pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let in_private = Tpm2bSensitive::unmarshal(&mut r).ok();
+    // The sensitive area is optional, which the specification writes as a
+    // sized buffer of length zero. Part 3 clause 5.8.2 fails a malformed one
+    // rather than reading it as absent.
+    let in_private = {
+        let size = r.u16()?;
+        if size == 0 {
+            None
+        } else {
+            let mut body = r.sub(size as usize).map_err(|e| e.with_parameter(1))?;
+            let sensitive = crate::tpm::structures::keys::TpmtSensitive::unmarshal(&mut body)
+                .map_err(|e| e.with_parameter(1))?;
+            if !body.is_empty() {
+                return Err(TpmRc(rc::SIZE).with_parameter(1));
+            }
+            Some(Tpm2bSensitive { sensitive_area: sensitive })
+        }
+    };
     let in_public = Tpm2bPublic::unmarshal(&mut r)?;
     let hierarchy = r.u32()?;
 
@@ -573,6 +589,8 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
             if s.sensitive_area.sensitive_type != public.object_type {
                 return Err(TpmRc(rc::TYPE).with_parameter(1));
             }
+            object::check_binding(&public, &s.sensitive_area)
+                .map_err(|e| e.with_parameter(1))?;
             Some(s.sensitive_area)
         }
         _ => None,

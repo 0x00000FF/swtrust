@@ -289,9 +289,11 @@ pub fn import(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     }
 
     let sensitive = TpmtSensitive::from_bytes(&body).map_err(|_| TpmRc(rc::SENSITIVE))?;
-    if sensitive.sensitive_type != public.object_type {
-        return Err(TpmRc(rc::TYPE).with_parameter(3));
-    }
+    // Part 3 clause 12.8.1 imports only a private area that goes with the
+    // public one, so the blob this command produces cannot later load as
+    // something the public area does not describe.
+    crate::tpm::core::object::check_binding(&public, &sensitive)
+        .map_err(|e| e.with_parameter(3))?;
 
     // Re-wrap under the new parent so the object can be loaded here.
     let private = protect::wrap_private(

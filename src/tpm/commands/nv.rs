@@ -49,7 +49,7 @@ fn check_write_authority(index: &NvIndex, auth_handle: u32, is_policy: bool) -> 
 }
 
 /// Check that the authorization handle may read this Index.
-fn check_read_authority(index: &NvIndex, auth_handle: u32, is_policy: bool) -> TpmResult<()> {
+pub fn check_read_authority(index: &NvIndex, auth_handle: u32, is_policy: bool) -> TpmResult<()> {
     let a = index.public.attributes;
     let allowed = match auth_handle {
         rh::PLATFORM => a.has(NvAttributes::PPREAD),
@@ -73,7 +73,12 @@ fn check_read_authority(index: &NvIndex, auth_handle: u32, is_policy: bool) -> T
 /// True when the first authorization of the command came from a policy
 /// session rather than a password or HMAC session.
 fn first_auth_is_policy(state: &TpmState, request: &Request) -> bool {
-    let Some(input) = request.sessions.first() else {
+    auth_is_policy(state, request, 0)
+}
+
+/// True when the authorization at `index` came from a policy session.
+pub fn auth_is_policy(state: &TpmState, request: &Request, index: usize) -> bool {
+    let Some(input) = request.sessions.get(index) else {
         return false;
     };
     if input.handle == rh::RS_PW {
