@@ -116,14 +116,18 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     dispatch::decrypt_parameters(state, &mut request, &auth_values)?;
 
     state.command_audit_suppressed = false;
-    let response = super::run_command(state, &request)?;
 
-    // Part 3 clause 5.8.2 refuses a command whose parameter area holds more
-    // than its schematic defines. The command has now read what it expects,
-    // so anything left over means the buffer was not the command it claimed.
+    // The command action runs against a copy. Part 3 clause 5.6 leaves the
+    // TPM unchanged when a command fails, and clause 5.8.2 cannot know that a
+    // parameter area holds surplus octets until the command has read the ones
+    // it wants. Working on a copy gives both: nothing reaches the TPM until
+    // the action has succeeded and the whole parameter area is accounted for.
+    let mut working = state.clone();
+    let response = super::run_command(&mut working, &request)?;
     if !request.parameters_fully_read() {
         return Err(TpmRc(rc::SIZE));
     }
+    *state = working;
 
     // The response nonces are rolled forward before the response parameter is
     // encrypted, because Part 1 clause 21.3 keys that encryption with the new

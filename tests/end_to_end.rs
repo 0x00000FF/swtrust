@@ -1863,6 +1863,73 @@ fn trailing_parameter_octets_are_refused_without_changing_anything() {
         "TPM2_Clear ran despite the error"
     );
 
+    // A command that does take parameters behaves the same way: appending an
+    // octet to TPM2_HierarchyChangeAuth is refused and the authorization is
+    // left as it was, rather than changed by a command that reported failure.
+    let mut p = Writer::new();
+    p.u16(7);
+    p.bytes(b"changed");
+    let mut params = p.finish().unwrap();
+    params.push(0x00);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"secret")),
+        &params,
+    ));
+    assert_eq!(r.code, rc::SIZE, "trailing octet -> {:08x}", r.code);
+
+    // The old value still authorizes, so nothing was written.
+    let mut p = Writer::new();
+    p.u16(6);
+    p.bytes(b"secret");
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"secret")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "the authorization was changed anyway");
+
+    // A malformed TPM2_StartAuthSession leaves no session behind either.
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&[0xa5u8; 32]);
+    p.u16(0);
+    p.u8(0x01);
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let mut params = p.finish().unwrap();
+    params.push(0x00);
+    for _ in 0..8 {
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::StartAuthSession,
+            &[rh::NULL, rh::NULL],
+            None,
+            &params,
+        ));
+        assert_eq!(r.code, rc::SIZE, "StartAuthSession -> {:08x}", r.code);
+    }
+    // The session slots are still free, so a well formed request succeeds.
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&[0xa5u8; 32]);
+    p.u16(0);
+    p.u8(0x01);
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "session slots were leaked");
+
     // The same command without the trailing octets is accepted.
     let r = h.send(&command(
         st::SESSIONS,
