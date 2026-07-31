@@ -143,6 +143,16 @@ fn validate_new_public(state: &TpmState, public: &NvPublic, auth_handle: u32) ->
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
     }
+    // Part 2 Table 224 says the policy is computed using the nameAlg, so one
+    // of any other length can never match the digest a policy session builds.
+    // The Index would be defined and then never open to the policy it names.
+    if !public.auth_policy.is_empty() {
+        let want = crate::tpm::structures::base::digest_size(public.name_alg)
+            .ok_or(TpmRc(rc::HASH).with_parameter(2))?;
+        if public.auth_policy.as_slice().len() != want {
+            return Err(TpmRc(rc::SIZE).with_parameter(2));
+        }
+    }
     // The written bit is set by the TPM, never by the caller.
     if a.has(NvAttributes::WRITTEN) {
         return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
@@ -565,6 +575,36 @@ mod tests {
         assert!(validate_new_public(&state, &i.public, rh::OWNER).is_err());
         let mut i = i;
         i.public.auth_policy = Tpm2bDigest::from_slice(&[0u8; 32]).unwrap();
+        assert!(validate_new_public(&state, &i.public, rh::OWNER).is_ok());
+    }
+
+    #[test]
+    fn an_index_policy_must_be_the_size_of_the_name_digest() {
+        // Part 2 Table 224: the policy is computed using the nameAlg, so one
+        // of another size can never match what a policy session builds.
+        let state = TpmState::manufacture().unwrap();
+        let mut i = index(
+            NvAttributes::POLICYWRITE | NvAttributes::OWNERREAD,
+            nt::ORDINARY,
+            8,
+        );
+        i.public.name_alg = alg::SHA256;
+
+        i.public.auth_policy = Tpm2bDigest::from_slice(&[0u8; 32]).unwrap();
+        assert!(validate_new_public(&state, &i.public, rh::OWNER).is_ok());
+
+        for wrong in [20usize, 48, 64] {
+            i.public.auth_policy = Tpm2bDigest::from_slice(&vec![0u8; wrong]).unwrap();
+            assert_eq!(
+                validate_new_public(&state, &i.public, rh::OWNER).unwrap_err(),
+                TpmRc(rc::SIZE).with_parameter(2),
+                "a {wrong} octet policy was accepted for a SHA-256 Index"
+            );
+        }
+
+        // A SHA-384 Index takes a SHA-384 policy.
+        i.public.name_alg = alg::SHA384;
+        i.public.auth_policy = Tpm2bDigest::from_slice(&[0u8; 48]).unwrap();
         assert!(validate_new_public(&state, &i.public, rh::OWNER).is_ok());
     }
 
