@@ -1615,6 +1615,118 @@ fn an_hmac_key_signs_the_message_and_not_a_digest() {
 }
 
 #[test]
+fn a_saved_policy_session_keeps_the_restrictions_it_recorded() {
+    let h = Harness::started("policyctx");
+
+    // A real policy session, not a trial one, so the assertions bind.
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&[0xa5u8; 32]);
+    p.u16(0);
+    p.u8(0x01); // TPM_SE_POLICY
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+    let session = Reader::new(&r.body).u32().unwrap();
+
+    // Record two assertions: a command code and a command parameter digest.
+    let mut p = Writer::new();
+    p.u32(cc::Unseal);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PolicyCommandCode,
+        &[session],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "PolicyCommandCode -> {:08x}", r.code);
+
+    let cp_hash = [0x5au8; 32];
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&cp_hash);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PolicyCpHash,
+        &[session],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "PolicyCpHash -> {:08x}", r.code);
+
+    let get_digest = command(st::NO_SESSIONS, cc::PolicyGetDigest, &[session], None, &[]);
+    let before = h.send(&get_digest).body;
+
+    // Save the context and drop the loaded session.
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::ContextSave,
+        &[session],
+        None,
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "ContextSave -> {:08x}", r.code);
+    let context = r.body.clone();
+
+    let r = h.send(&get_digest);
+    assert_eq!(r.code & 0x03f, rc::HANDLE & 0x03f, "the session is gone");
+
+    // Load it back. Part 1 clause 27.2.1 rebuilds the whole session.
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::ContextLoad,
+        &[],
+        None,
+        &context,
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "ContextLoad -> {:08x}", r.code);
+    let loaded = Reader::new(&r.body).u32().unwrap();
+    assert_eq!(loaded, session, "a session returns to its own handle");
+
+    // The digest came back.
+    let get_digest = command(st::NO_SESSIONS, cc::PolicyGetDigest, &[loaded], None, &[]);
+    assert_eq!(h.send(&get_digest).body, before);
+
+    // So did the cpHash restriction: Part 3 clause 23.2.2 refuses a second
+    // assertion that names a different command.
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&[0x11u8; 32]);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PolicyCpHash,
+        &[loaded],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::CPHASH, "a reloaded cpHash still binds");
+
+    // And the digest did not move when that assertion was refused.
+    assert_eq!(h.send(&get_digest).body, before);
+
+    // Repeating the same value is accepted, which shows the restriction is
+    // the one that was recorded before the save.
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&cp_hash);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PolicyCpHash,
+        &[loaded],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "the same cpHash is accepted");
+}
+
+#[test]
 fn the_vendor_test_command_echoes_its_input() {
     let h = Harness::started("vendor");
     let mut p = Writer::new();
