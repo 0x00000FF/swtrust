@@ -933,10 +933,6 @@ pub fn update_audit(
             let s = state.sessions.get_mut(input.handle)?;
             s.audit.is_audit = true;
             s.audit.digest = digest;
-            // Part 1 clause 17.1 drops the binding once a session audits,
-            // because the audit HMAC no longer covers the bound authValue.
-            s.bind = rh::NULL;
-            s.bind_name.clear();
         }
     }
 
@@ -1111,6 +1107,17 @@ pub fn close_sessions(state: &mut TpmState, request: &Request) {
         if !input.attributes.has(SessionAttributes::CONTINUE_SESSION) {
             let _ = state.sessions.remove(input.handle);
             continue;
+        }
+        // Part 1 clause 17.1 drops the binding of a session that audits, from
+        // the next command onwards. The response of this command still uses
+        // the bound key, because that is the key the caller computed with.
+        // The dictionary attack protection of the bound entity stays, because
+        // the session key still carries that entity's authorization value.
+        if input.attributes.has(SessionAttributes::AUDIT) {
+            if let Ok(s) = state.sessions.get_mut(input.handle) {
+                s.bind = rh::NULL;
+                s.bind_name.clear();
+            }
         }
         // Only a session that actually authorized a handle is spent.
         if index >= request.info.auth_handles as usize {
