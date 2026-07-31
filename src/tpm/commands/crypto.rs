@@ -1112,22 +1112,19 @@ pub fn activate_credential(state: &TpmState, request: &Request) -> TpmResult<Res
         .copied()
         .ok_or(TpmRc(rc::TYPE).with_handle(2))?;
 
-    let seed = match (&key.public.unique, key.public.object_type) {
-        (PublicId::Rsa(modulus), alg::RSA) => {
-            let PublicParms::Rsa { exponent, .. } = key.public.parameters else {
-                return Err(TpmRc(rc::TYPE));
-            };
-            let private = rsa::RsaPrivate::from_prime(
-                modulus.as_slice(),
-                exponent,
-                sensitive.sensitive.as_slice(),
-            )?;
-            let plain = rsa::private_op(&private, secret.as_slice())?;
-            rsa::oaep_decode(name_alg, &plain, b"IDENTITY\0")
-                .map_err(|_| TpmRc(rc::VALUE).with_parameter(2))?
+    let seed = crate::tpm::core::protect::seed_from_private(
+        &key.public,
+        sensitive,
+        secret.as_slice(),
+        b"IDENTITY ",
+    )
+    .map_err(|e| {
+        if e.0 == rc::TYPE {
+            e.with_handle(2)
+        } else {
+            TpmRc(rc::VALUE).with_parameter(2)
         }
-        _ => return Err(TpmRc(rc::TYPE).with_handle(2)),
-    };
+    })?;
 
     let activate = object_of(state, activate_handle).map_err(|e| e.with_handle(1))?;
     let credential = crate::tpm::core::protect::unwrap_credential(

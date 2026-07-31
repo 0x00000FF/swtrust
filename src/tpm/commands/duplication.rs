@@ -1,18 +1,18 @@
 //! Duplication, Part 3 clause 13, and the remaining management commands.
 
-use crate::tpm::constants::{alg, rc, rh};
+use crate::tpm::constants::{rc, rh};
 use crate::tpm::core::names;
 use crate::tpm::core::object::{Object, Slot};
 use crate::tpm::core::protect;
 use crate::tpm::core::state::TpmState;
-use crate::tpm::crypto::{hash, rand::Rng, rsa, sym};
+use crate::tpm::crypto::{hash, rand::Rng, sym};
 use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Unmarshal};
 use crate::tpm::structures::attributes::ObjectAttributes;
 use crate::tpm::structures::base::{
     Tpm2bEncryptedSecret, Tpm2bName, Tpm2bPrivate, Tpm2bSymKey,
 };
-use crate::tpm::structures::keys::{PublicId, PublicParms, Tpm2bPublic, TpmtSensitive};
+use crate::tpm::structures::keys::{Tpm2bPublic, TpmtSensitive};
 use crate::tpm::structures::schemes::SymDef;
 
 use super::dispatch::{Request, Response};
@@ -33,22 +33,7 @@ fn seed_to_parent(
     new_parent: &Object,
     label: &[u8],
 ) -> TpmResult<(Vec<u8>, Vec<u8>)> {
-    let name_alg = new_parent.public.name_alg;
-    let seed_size = hash::digest_size(name_alg)?;
-    let seed = state.rng.bytes(seed_size)?;
-    let secret = match (&new_parent.public.unique, new_parent.public.object_type) {
-        (PublicId::Rsa(modulus), alg::RSA) => {
-            let PublicParms::Rsa { exponent, .. } = new_parent.public.parameters else {
-                return Err(TpmRc(rc::TYPE));
-            };
-            let public = rsa::RsaPublic::new(modulus.as_slice(), exponent)?;
-            let block =
-                rsa::oaep_encode(name_alg, public.size(), &seed, label, &mut state.rng)?;
-            rsa::public_op(&public, &block)?
-        }
-        _ => return Err(TpmRc(rc::TYPE)),
-    };
-    Ok((seed, secret))
+    protect::seed_to_public(&new_parent.public, label, &mut state.rng)
 }
 
 /// Recover a seed a duplication arrived with.
@@ -56,22 +41,7 @@ fn seed_from_parent(parent: &Object, secret: &[u8], label: &[u8]) -> TpmResult<V
     let Some(sensitive) = &parent.sensitive else {
         return Err(TpmRc(rc::HANDLE));
     };
-    match (&parent.public.unique, parent.public.object_type) {
-        (PublicId::Rsa(modulus), alg::RSA) => {
-            let PublicParms::Rsa { exponent, .. } = parent.public.parameters else {
-                return Err(TpmRc(rc::TYPE));
-            };
-            let private = rsa::RsaPrivate::from_prime(
-                modulus.as_slice(),
-                exponent,
-                sensitive.sensitive.as_slice(),
-            )?;
-            let plain = rsa::private_op(&private, secret)?;
-            rsa::oaep_decode(parent.public.name_alg, &plain, label)
-                .map_err(|_| TpmRc(rc::VALUE))
-        }
-        _ => Err(TpmRc(rc::TYPE)),
-    }
+    protect::seed_from_private(&parent.public, sensitive, secret, label)
 }
 
 /// Apply the inner wrap of Part 1 clause 23.2.
@@ -464,6 +434,7 @@ pub fn duplicate_label() -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tpm::constants::alg;
 
     #[test]
     fn the_inner_wrap_round_trips_and_detects_tampering() {
