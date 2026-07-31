@@ -535,12 +535,12 @@ pub fn commit(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         }
     };
 
-    let r_value = ecc::private_key_from_rng(&curve, &mut state.rng)?;
-    let e_point = ecc::multiply_generator(&curve, &r_value)?;
-    let (ex, ey) = e_point.coordinates(&curve)?;
+    // Generated through ecc::generate rather than assembled here, so the
+    // pair-wise consistency test of FIPS 140-3 Table 40 covers this pair too.
+    let ephemeral = ecc::generate(curve.curve_id(), &mut state.rng)?;
     let e = EccPoint {
-        x: Tpm2bEccParameter::new(ex)?,
-        y: Tpm2bEccParameter::new(ey)?,
+        x: Tpm2bEccParameter::new(ephemeral.public_x.clone())?,
+        y: Tpm2bEccParameter::new(ephemeral.public_y.clone())?,
     };
     // With no second point supplied, L is the point at infinity.
     let l = EccPoint::default();

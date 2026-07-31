@@ -272,6 +272,95 @@ fn an_ephemeral_key_is_pair_wise_tested_too() {
     assert_eq!(r.code, rc::SUCCESS, "-> {:08x}", r.code);
 }
 
+#[test]
+fn commit_generates_a_point_that_passed_its_pairwise_test() {
+    // TPM2_Commit builds an ephemeral pair, which used to be assembled from a
+    // scalar and a multiplication rather than through ecc::generate, so it had
+    // no pair-wise consistency test. The point it returns has to be a real one.
+    let h = harness("commit");
+    startup(&h);
+
+    let mut t = Writer::new();
+    t.u16(alg::ECC);
+    t.u16(alg::SHA256);
+    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000);
+    t.u16(0);
+    t.u16(0x0010); // symmetric NULL
+    t.u16(0x001C); // TPM_ALG_ECDAA, which TPM2_Commit needs
+    t.u16(alg::SHA256);
+    t.u16(0x0003); // NIST P-256
+    t.u16(0x0010);
+    t.u16(0);
+    t.u16(0);
+    let template = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let auth = [0x40u8, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let r = send(
+        &h,
+        &command(
+            st::SESSIONS,
+            cc::CreatePrimary,
+            &[rh::OWNER],
+            Some(&auth),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let handle = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    // P1 given as a point with two empty coordinates, then s2 and y2 absent.
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(0);
+    p.u16(0);
+    let r = send(
+        &h,
+        &command(
+            st::SESSIONS,
+            cc::Commit,
+            &[handle],
+            Some(&auth),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_eq!(r.code, rc::SUCCESS, "Commit -> {:08x}", r.code);
+
+    // Read past K and L to E, which is the generated point.
+    let mut rd = Reader::new(&r.body);
+    rd.u32().unwrap(); // parameterSize
+    for _ in 0..2 {
+        let n = rd.u16().unwrap() as usize;
+        rd.take(n).unwrap();
+    }
+    let e_size = rd.u16().unwrap() as usize;
+    let e = rd.take(e_size).unwrap().to_vec();
+    let mut er = Reader::new(&e);
+    let xn = er.u16().unwrap() as usize;
+    let x = er.take(xn).unwrap().to_vec();
+    let yn = er.u16().unwrap() as usize;
+    let y = er.take(yn).unwrap().to_vec();
+    assert_eq!(x.len(), 32);
+    assert_eq!(y.len(), 32);
+
+    // The point it produced has to be on the curve, which is what the
+    // pair-wise consistency test inside the generator checks.
+    let curve = swtrust::tpm::crypto::ecc::Curve::new(0x0003).unwrap();
+    assert!(
+        swtrust::tpm::crypto::ecc::Point::from_coordinates(&curve, &x, &y).is_ok(),
+        "TPM2_Commit returned a point that is not on the curve"
+    );
+}
+
 fn ecc_signing_template() -> Vec<u8> {
     let mut t = Writer::new();
     t.u16(alg::ECC);

@@ -383,14 +383,19 @@ impl PcrBanks {
         }
         // Part 3 clause 22.1 counts an extend once for each bank that changes,
         // unlike a reset, which is counted once however many banks it clears.
-        let mut changed: u32 = 0;
+        // The count is of banks, not of entries: nothing stops a caller naming
+        // the same algorithm twice, and both extends land in one bank.
+        let mut counted: Vec<u16> = Vec::with_capacity(digests.len());
         for (alg, digest) in digests {
             if !self.has_bank(*alg) {
                 continue;
             }
             self.extend_digest(*alg, index, digest)?;
-            changed += 1;
+            if !counted.contains(alg) {
+                counted.push(*alg);
+            }
         }
+        let changed = counted.len() as u32;
         if !no_increment(index) {
             self.update_counter = self.update_counter.wrapping_add(changed);
         }
@@ -561,6 +566,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b.update_counter(), 3, "only the allocated bank counted");
+
+        // Naming one bank twice changes it twice but is still one bank, so
+        // the counter moves once. Nothing stops a caller sending that list.
+        let before = b.update_counter();
+        b.extend(
+            0,
+            0,
+            &[(alg::SHA256, vec![3u8; 32]), (alg::SHA256, vec![4u8; 32])],
+        )
+        .unwrap();
+        assert_eq!(b.update_counter(), before + 1, "one bank, so one count");
 
         // Clearing the same register in every bank counts once. PCR 20 resets
         // from locality two and is not one of the registers that never count.

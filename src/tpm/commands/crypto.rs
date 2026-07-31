@@ -1137,8 +1137,16 @@ pub fn ec_ephemeral(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let mut r = request.reader();
     let curve_id = r.u16()?;
     r.expect_end()?;
-    let key = ecc::generate(curve_id, &mut state.rng)
-        .map_err(|_| TpmRc(rc::CURVE).with_parameter(1))?;
+    // A curve this TPM does not offer is the caller's mistake, but a failed
+    // pair-wise consistency test is not: reporting it as TPM_RC_CURVE would
+    // hide a self test failure that has to reach failure mode.
+    let key = ecc::generate(curve_id, &mut state.rng).map_err(|e| {
+        if e.value() == rc::FAILURE {
+            e
+        } else {
+            TpmRc(rc::CURVE).with_parameter(1)
+        }
+    })?;
     // The commit counter identifies the ephemeral value for a later
     // TPM2_Commit; this TPM does not retain commitments, so it is always zero.
     respond(move |w| {

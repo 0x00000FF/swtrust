@@ -799,6 +799,32 @@ mod tests {
     }
 
     #[test]
+    fn no_module_builds_an_ecc_key_pair_of_its_own() {
+        // The pair-wise consistency test lives inside ecc::generate, so a
+        // module that assembles a scalar and a point itself would slip past
+        // it. That is how TPM2_Commit and the labeled seed encapsulation came
+        // to have no test, so the arrangement is pinned here.
+        const SOURCES: &[(&str, &str)] = &[
+            ("core/protect.rs", include_str!("core/protect.rs")),
+            ("commands/signing.rs", include_str!("commands/signing.rs")),
+            ("commands/crypto.rs", include_str!("commands/crypto.rs")),
+            ("commands/object.rs", include_str!("commands/object.rs")),
+            ("commands/duplication.rs", include_str!("commands/duplication.rs")),
+        ];
+        for (name, source) in SOURCES {
+            // Everything before the first test section is the working code.
+            let code = match source.find("#[cfg(test)]") {
+                Some(i) => &source[..i],
+                None => source,
+            };
+            assert!(
+                !code.contains("private_key_from_rng"),
+                "{name} builds an ECC private scalar itself, so the pair it                  makes gets no pair-wise consistency test. Call ecc::generate."
+            );
+        }
+    }
+
+    #[test]
     fn the_repetition_count_test_fails_a_stuck_source() {
         let mut h = HealthTests::new();
         assert_eq!(h.check(&[1, 2, 3, 4, 5]), Ok(()));

@@ -411,11 +411,14 @@ pub fn seed_to_public(
             let PublicParms::Ecc { curve_id, .. } = public.parameters else {
                 return Err(TpmRc(rc::TYPE));
             };
-            let curve = ecc::Curve::new(curve_id)?;
-            let ephemeral = ecc::private_key_from_rng(&curve, rng)?;
-            let public_point = ecc::multiply_generator(&curve, &ephemeral)?;
-            let (ex, ey) = public_point.coordinates(&curve)?;
-            let (z, _) = ecc::ecdh(&curve, &ephemeral, point.x.as_slice(), point.y.as_slice())?;
+            // Generated through ecc::generate rather than assembled here, so
+            // the pair-wise consistency test of FIPS 140-3 Table 40 covers this
+            // pair as it covers every other one.
+            let ephemeral_key = ecc::generate(curve_id, rng)?;
+            let curve = &ephemeral_key.curve;
+            let ephemeral = &ephemeral_key.private;
+            let (ex, ey) = (ephemeral_key.public_x.clone(), ephemeral_key.public_y.clone());
+            let (z, _) = ecc::ecdh(curve, ephemeral, point.x.as_slice(), point.y.as_slice())?;
             let seed = kdfe(
                 name_alg,
                 &z,
