@@ -113,8 +113,8 @@ const ROWS: &[Row] = &[
     (cc::CreateLoaded, &[H(Parent, false)], &[R::User]),
     (cc::CreatePrimary, &[H(Hierarchy, false)], &[R::User]),
     (cc::Decapsulate, &[H(Object, false)], &[R::User]),
-    (cc::DictionaryAttackLockReset, &[H(Lockout, false), H(Lockout, false)], &[R::None, R::User]),
-    (cc::DictionaryAttackParameters, &[H(Lockout, false), H(Lockout, false)], &[R::None, R::User]),
+    (cc::DictionaryAttackLockReset, &[H(Lockout, false)], &[R::User]),
+    (cc::DictionaryAttackParameters, &[H(Lockout, false)], &[R::User]),
     (cc::Duplicate, &[H(Object, false), H(Object, true)], &[R::Dup, R::None]),
     (cc::ECC_Decrypt, &[H(Object, false)], &[R::User]),
     (cc::ECC_Encrypt, &[H(Object, false)], &[R::None]),
@@ -195,7 +195,7 @@ const ROWS: &[Row] = &[
     (cc::Rewrap, &[H(Object, true), H(Object, true)], &[R::User, R::None]),
     (cc::SequenceComplete, &[H(Object, false)], &[R::User]),
     (cc::SequenceUpdate, &[H(Object, false)], &[R::User]),
-    (cc::SetAlgorithmSet, &[H(Platform, false), H(Platform, false)], &[R::None, R::User]),
+    (cc::SetAlgorithmSet, &[H(Platform, false)], &[R::User]),
     (cc::SetCapability, &[H(HierarchyAuth, true)], &[R::User]),
     // Part 3 Table 197 writes the type and the name on one line, so this row
     // is added by hand rather than taken from the table sweep.
@@ -376,6 +376,13 @@ mod tests {
                     info.code
                 );
             }
+            // The row may not describe handles the command does not have,
+            // which would mean the schematic and the dispatch table disagree.
+            assert!(
+                kind(info.code, info.handles as usize).is_none(),
+                "{:#010x} has more interfaces than handles",
+                info.code
+            );
         }
     }
 
