@@ -290,11 +290,6 @@ impl NvStore {
 
     /// Apply a Startup(CLEAR) to the volatile lock state.
     ///
-    /// A read lock is cleared when the Index has TPMA_NV_CLEAR_STCLEAR and a
-    /// write lock when it has TPMA_NV_WRITE_STCLEAR. An Index locked by
-    /// TPMA_NV_WRITEDEFINE stays locked.
-    /// Apply a Startup(CLEAR) to the volatile lock state.
-    ///
     /// Part 1 clause 13.6 fixes the rules: a read lock is dropped when the
     /// Index has TPMA_NV_READ_STCLEAR, and a write lock when it has
     /// TPMA_NV_WRITE_STCLEAR, except that an Index with TPMA_NV_WRITEDEFINE
@@ -323,16 +318,18 @@ impl NvStore {
                 index.public.attributes =
                     index.public.attributes.without(NvAttributes::WRITTEN);
             }
-            // An orderly counter may have advanced past its last saved value,
-            // so after a disorderly shutdown it steps forward to stay
-            // monotonic.
+            // An orderly counter only reaches NV every MAX_ORDERLY_COUNT
+            // increments, so the saved value may be that many behind what the
+            // counter had reached. Setting the low bits makes the next
+            // increment carry past every value the counter could have held,
+            // which is what keeps it monotonic.
             if disorderly
                 && index.public.attributes.has(NvAttributes::ORDERLY)
                 && index.index_type() == nt::COUNTER
                 && index.written()
             {
                 if let Ok(v) = index.counter_value() {
-                    index.data = v.saturating_add(1).to_be_bytes().to_vec();
+                    index.data = (v | config::MAX_ORDERLY_COUNT).to_be_bytes().to_vec();
                 }
             }
         }
@@ -606,12 +603,18 @@ mod tests {
             store.get(hc::NV_INDEX_FIRST).unwrap().counter_value().unwrap(),
             1
         );
-        // A disorderly one may have lost an increment, so the counter jumps to
-        // stay monotonic.
+        // A disorderly one may have lost up to MAX_ORDERLY_COUNT increments,
+        // so the low bits are filled in and the next increment carries past
+        // every value the counter could have held.
         store.on_startup_clear_with(true);
         assert_eq!(
             store.get(hc::NV_INDEX_FIRST).unwrap().counter_value().unwrap(),
-            2
+            config::MAX_ORDERLY_COUNT
+        );
+        store.get_mut(hc::NV_INDEX_FIRST).unwrap().increment().unwrap();
+        assert_eq!(
+            store.get(hc::NV_INDEX_FIRST).unwrap().counter_value().unwrap(),
+            config::MAX_ORDERLY_COUNT + 1
         );
     }
 

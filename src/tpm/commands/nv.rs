@@ -298,6 +298,7 @@ pub fn nv_write(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
     index
         .write(offset, data.as_slice())
         .map_err(|e| if e.0 == rc::NV_RANGE { e } else { e.with_parameter(1) })?;
+    note_orderly_write(state, nv_handle);
     respond(|_| Ok(()))
 }
 
@@ -307,6 +308,7 @@ pub fn nv_increment(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let nv_handle = request.handle(1)?;
     writable(state, request, nv_handle, auth_handle)?;
     state.nv.get_mut(nv_handle)?.increment()?;
+    note_orderly_write(state, nv_handle);
     respond(|_| Ok(()))
 }
 
@@ -318,6 +320,7 @@ pub fn nv_extend(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let data = Tpm2bMaxNvBuffer::unmarshal(&mut r)?;
     writable(state, request, nv_handle, auth_handle)?;
     state.nv.get_mut(nv_handle)?.extend(data.as_slice())?;
+    note_orderly_write(state, nv_handle);
     respond(|_| Ok(()))
 }
 
@@ -329,7 +332,21 @@ pub fn nv_set_bits(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     let bits = r.u64()?;
     writable(state, request, nv_handle, auth_handle)?;
     state.nv.get_mut(nv_handle)?.set_bits(bits)?;
+    note_orderly_write(state, nv_handle);
     respond(|_| Ok(()))
+}
+
+/// Record that an Index with TPMA_NV_ORDERLY has moved away from the value NV
+/// holds, which clears TPMA_STARTUP_CLEAR.orderly until the next shutdown.
+fn note_orderly_write(state: &mut TpmState, nv_handle: u32) {
+    let orderly = state
+        .nv
+        .get(nv_handle)
+        .map(|i| i.public.attributes.has(NvAttributes::ORDERLY))
+        .unwrap_or(false);
+    if orderly {
+        state.nv_is_no_longer_orderly();
+    }
 }
 
 /// TPM2_NV_WriteLock, Part 3 clause 31.13.

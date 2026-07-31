@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::tpm::config;
-use crate::tpm::constants::{alg, rc, su};
+use crate::tpm::constants::{rc, rh, su};
 use crate::tpm::crypto::rand::Drbg;
 use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Reader, Unmarshal, Writer};
@@ -117,25 +117,30 @@ impl Unmarshal for ClockState {
     }
 }
 
-/// Command audit state, Part 1 clause 20.
+/// Command audit state, Part 1 clause 32.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditState {
     pub alg: u16,
     pub digest: Vec<u8>,
     pub counter: u64,
     pub commands: Vec<u32>,
-    /// The session that currently holds exclusive audit, if any.
+    /// The session that currently holds exclusive audit, or
+    /// TPM_RH_UNASSIGNED when no session does.
     pub exclusive_session: u32,
 }
 
 impl Default for AuditState {
+    /// The values a manufactured TPM starts with.
+    ///
+    /// Part 3 clause 21.1 always audits TPM2_SetCommandCodeAuditStatus, and
+    /// the audit hash starts as the one the TPM protects contexts with.
     fn default() -> Self {
         AuditState {
-            alg: alg::NULL,
+            alg: config::CONTEXT_INTEGRITY_HASH_ALG,
             digest: Vec::new(),
             counter: 0,
-            commands: Vec::new(),
-            exclusive_session: 0,
+            commands: vec![crate::tpm::constants::cc::SetCommandCodeAuditStatus],
+            exclusive_session: rh::UNASSIGNED,
         }
     }
 }
@@ -166,10 +171,13 @@ pub struct TpmState {
     /// Set once the TPM has been manufactured, so a fresh state file is
     /// distinguishable from a saved one.
     pub manufactured: bool,
+    /// The argument of the last TPM2_Shutdown, or `su::NONE` while the TPM is
+    /// running. It decides which of the three startup sequences of Part 1
+    /// clause 12.2 the next TPM2_Startup performs.
+    pub shutdown_type: u16,
 
     // Values that do not survive power loss.
     pub started: bool,
-    pub startup_type: u16,
     pub startup_clear: StartupClearAttributes,
     pub pcr: PcrBanks,
     pub objects: ObjectSlots,
@@ -182,6 +190,12 @@ pub struct TpmState {
     pub rng: Drbg,
     /// Data collected between _TPM_Hash_Start and _TPM_Hash_End.
     pub hcrtm_buffer: Option<Vec<u8>>,
+    /// Set by the running command to keep itself out of the command audit.
+    ///
+    /// Part 3 clause 21.1 audits TPM2_SetCommandCodeAuditStatus except when it
+    /// is used to change the audit algorithm, which the changed algorithm is
+    /// itself the evidence of.
+    pub command_audit_suppressed: bool,
 }
 
 impl std::fmt::Debug for TpmState {
@@ -189,7 +203,7 @@ impl std::fmt::Debug for TpmState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TpmState")
             .field("started", &self.started)
-            .field("startup_type", &self.startup_type)
+            .field("shutdown_type", &self.shutdown_type)
             .field("reset_count", &self.clock.reset_count)
             .field("objects", &self.objects.len())
             .field("sessions", &self.sessions.len())
@@ -223,8 +237,8 @@ impl TpmState {
             pcr_auth: Vec::new(),
             pcr_policy: TpmtHa::null(),
             manufactured: true,
+            shutdown_type: su::NONE,
             started: false,
-            startup_type: su::CLEAR,
             startup_clear: StartupClearAttributes(0),
             pcr: PcrBanks::new(config::DEFAULT_PCR_BANKS)?,
             objects: ObjectSlots::new(),
@@ -236,50 +250,86 @@ impl TpmState {
             self_test_done: true,
             rng,
             hcrtm_buffer: None,
+            command_audit_suppressed: false,
         })
     }
 
-    /// Apply a TPM Reset, which is TPM2_Startup(CLEAR) after a power cycle.
+    /// Apply TPM2_Startup(TPM_SU_CLEAR).
+    ///
+    /// Part 1 clause 12.2 makes this a TPM Restart when the previous shutdown
+    /// was TPM2_Shutdown(TPM_SU_STATE) and a TPM Reset otherwise. Both clear
+    /// the same volatile state; they differ in which of the two reset counters
+    /// moves, and a Reset that followed no shutdown at all also has to repair
+    /// the NV data that only lived in RAM.
     pub fn on_startup_clear(&mut self) -> TpmResult<()> {
+        let restart = self.shutdown_type == su::STATE;
+        let disorderly = self.shutdown_type == su::NONE;
         self.hierarchies.on_reset(&mut self.rng)?;
         self.pcr.allocate(&self.pcr_allocation.clone())?;
+        self.pcr.reset_update_counter();
         self.objects.clear();
         self.sessions.clear();
-        self.nv.on_startup_clear();
-        self.clock.reset_count = self.clock.reset_count.wrapping_add(1);
-        self.clock.total_reset_count = self.clock.total_reset_count.wrapping_add(1);
-        self.clock.restart_count = 0;
+        self.nv.on_startup_clear_with(disorderly);
+        if restart {
+            self.clock.restart_count = self.clock.restart_count.wrapping_add(1);
+        } else {
+            self.clock.reset_count = self.clock.reset_count.wrapping_add(1);
+            self.clock.total_reset_count = self.clock.total_reset_count.wrapping_add(1);
+            self.clock.restart_count = 0;
+        }
         self.clock.time = 0;
-        self.audit.digest.clear();
-        self.audit.exclusive_session = 0;
-        self.startup_clear = StartupClearAttributes(
-            StartupClearAttributes::PH_ENABLE
-                | StartupClearAttributes::SH_ENABLE
-                | StartupClearAttributes::EH_ENABLE
-                | StartupClearAttributes::PH_ENABLE_NV,
-        );
-        self.started = true;
-        self.startup_type = su::CLEAR;
+        // Part 1 clause 32 keeps the command audit digest across an orderly
+        // shutdown and drops it when power was lost without one.
+        if disorderly {
+            self.audit.digest.clear();
+        }
+        self.audit.exclusive_session = rh::UNASSIGNED;
+        self.begin_operation(!disorderly);
         Ok(())
     }
 
-    /// Apply a TPM Restart or Resume, which is TPM2_Startup(STATE).
+    /// Apply TPM2_Startup(TPM_SU_STATE), which is a TPM Resume.
     ///
     /// The saved state is already loaded, so only the volatile pieces that a
-    /// Startup(STATE) still discards are cleared.
+    /// Resume still discards are cleared.
     pub fn on_startup_state(&mut self) -> TpmResult<()> {
         self.objects.flush_st_clear();
+        // The lock bits that a Startup(CLEAR) drops are dropped here too,
+        // because TPMA_NV_READ_STCLEAR and TPMA_NV_WRITE_STCLEAR are cleared
+        // by every _TPM_Init, not by the startup type.
+        self.nv.on_startup_clear_with(false);
         self.clock.restart_count = self.clock.restart_count.wrapping_add(1);
         self.clock.time = 0;
-        self.startup_clear = StartupClearAttributes(
-            StartupClearAttributes::PH_ENABLE
-                | StartupClearAttributes::SH_ENABLE
-                | StartupClearAttributes::EH_ENABLE
-                | StartupClearAttributes::PH_ENABLE_NV,
-        );
-        self.started = true;
-        self.startup_type = su::STATE;
+        self.begin_operation(true);
         Ok(())
+    }
+
+    /// Put the TPM into the running state that every TPM2_Startup reaches.
+    ///
+    /// `orderly` says the startup was preceded by a matching TPM2_Shutdown,
+    /// which is what TPMA_STARTUP_CLEAR.orderly reports. The recorded shutdown
+    /// type goes back to `su::NONE` so a power loss from here is seen as the
+    /// disorderly shutdown that it is.
+    fn begin_operation(&mut self, orderly: bool) {
+        let mut attributes = StartupClearAttributes::PH_ENABLE
+            | StartupClearAttributes::SH_ENABLE
+            | StartupClearAttributes::EH_ENABLE
+            | StartupClearAttributes::PH_ENABLE_NV;
+        if orderly {
+            attributes |= StartupClearAttributes::ORDERLY;
+        }
+        self.startup_clear = StartupClearAttributes(attributes);
+        self.started = true;
+        self.shutdown_type = su::NONE;
+    }
+
+    /// Record that RAM backed NV data has moved away from what NV holds.
+    ///
+    /// TPMA_STARTUP_CLEAR.orderly stays SET only while the two agree, so any
+    /// write to an Index with TPMA_NV_ORDERLY clears it.
+    pub fn nv_is_no_longer_orderly(&mut self) {
+        self.startup_clear =
+            self.startup_clear.without(StartupClearAttributes::ORDERLY);
     }
 
     /// Apply TPM2_Clear, Part 3 clause 24.6.
@@ -297,9 +347,9 @@ impl TpmState {
         self.objects
             .flush_hierarchy(crate::tpm::constants::rh::ENDORSEMENT);
         self.clock.reset_count = 0;
-        self.audit.commands.clear();
-        self.audit.alg = alg::NULL;
-        self.audit.digest.clear();
+        // Part 1 clause 32 resets only the audit counter here. The selected
+        // algorithm, the list of audited commands and the digest all survive
+        // TPM2_Clear.
         self.audit.counter = 0;
         Ok(())
     }
@@ -337,6 +387,10 @@ impl TpmState {
         self.lockout_policy.marshal(&mut w);
         w.sized16(&self.pcr_auth);
         self.pcr_policy.marshal(&mut w);
+        // The shutdown type is saved so a reload can tell whether the previous
+        // shutdown was orderly, which decides how the orderly NV values come
+        // back.
+        w.u16(self.shutdown_type);
 
         w.u32(self.pcr_allocation.len() as u32);
         for a in &self.pcr_allocation {
@@ -421,6 +475,7 @@ impl TpmState {
         state.lockout_policy = TpmtHa::unmarshal(&mut r)?;
         state.pcr_auth = read_sized(&mut r)?;
         state.pcr_policy = TpmtHa::unmarshal(&mut r)?;
+        state.shutdown_type = r.u16()?;
 
         let count = bounded_count(&mut r, config::HASH_COUNT)?;
         state.pcr_allocation = (0..count).map(|_| r.u16()).collect::<TpmResult<_>>()?;
@@ -497,7 +552,7 @@ fn bounded_count(r: &mut Reader<'_>, max: usize) -> TpmResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tpm::constants::{hc, rh};
+    use crate::tpm::constants::{alg, hc, rh};
     use crate::tpm::structures::attributes::{nt, NvAttributes, ObjectAttributes};
     use crate::tpm::structures::base::Tpm2bDigest;
     use crate::tpm::structures::keys::{PublicId, PublicParms, TpmtPublic};
@@ -568,9 +623,78 @@ mod tests {
         let mut s = TpmState::manufacture().unwrap();
         s.on_startup_clear().unwrap();
         let resets = s.clock.reset_count;
+        s.shutdown_type = su::STATE;
         s.on_startup_state().unwrap();
         assert_eq!(s.clock.reset_count, resets);
         assert_eq!(s.clock.restart_count, 1);
+    }
+
+    #[test]
+    fn a_startup_clear_after_a_state_shutdown_is_a_restart() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        assert_eq!(s.clock.reset_count, 1);
+
+        // TPM Restart keeps the reset count and moves the restart count.
+        s.shutdown_type = su::STATE;
+        s.on_startup_clear().unwrap();
+        assert_eq!(s.clock.reset_count, 1);
+        assert_eq!(s.clock.total_reset_count, 1);
+        assert_eq!(s.clock.restart_count, 1);
+
+        // TPM Reset moves the reset count and puts the restart count back.
+        s.shutdown_type = su::CLEAR;
+        s.on_startup_clear().unwrap();
+        assert_eq!(s.clock.reset_count, 2);
+        assert_eq!(s.clock.total_reset_count, 2);
+        assert_eq!(s.clock.restart_count, 0);
+    }
+
+    #[test]
+    fn the_orderly_bit_follows_the_previous_shutdown() {
+        let mut s = TpmState::manufacture().unwrap();
+        // A fresh TPM has seen no shutdown at all.
+        s.on_startup_clear().unwrap();
+        assert!(!s.startup_clear.has(StartupClearAttributes::ORDERLY));
+        assert_eq!(s.shutdown_type, su::NONE);
+
+        s.shutdown_type = su::CLEAR;
+        s.on_startup_clear().unwrap();
+        assert!(s.startup_clear.has(StartupClearAttributes::ORDERLY));
+
+        // A write to RAM backed NV data puts the bit back down.
+        s.nv_is_no_longer_orderly();
+        assert!(!s.startup_clear.has(StartupClearAttributes::ORDERLY));
+    }
+
+    #[test]
+    fn the_shutdown_type_survives_a_save_and_load() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        s.shutdown_type = su::STATE;
+        let saved = s.save().unwrap();
+        let loaded = TpmState::load(&saved).unwrap();
+        assert_eq!(loaded.shutdown_type, su::STATE);
+    }
+
+    #[test]
+    fn a_startup_updates_the_pcr_counter_only_when_the_registers_change() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        s.pcr
+            .extend(0, 0, &[(alg::SHA256, vec![1u8; 32])])
+            .unwrap();
+        assert_eq!(s.pcr.update_counter(), 1);
+
+        // A TPM Resume keeps the registers, so the counter carries over.
+        s.shutdown_type = su::STATE;
+        s.on_startup_state().unwrap();
+        assert_eq!(s.pcr.update_counter(), 1);
+
+        // A TPM Reset puts the registers back, so the counter starts again.
+        s.shutdown_type = su::CLEAR;
+        s.on_startup_clear().unwrap();
+        assert_eq!(s.pcr.update_counter(), 0);
     }
 
     #[test]

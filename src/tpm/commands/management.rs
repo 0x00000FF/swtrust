@@ -31,9 +31,10 @@ pub fn startup(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     match startup_type {
         su::CLEAR => state.on_startup_clear()?,
         su::STATE => {
-            // A Startup(STATE) with no saved state is a TPM Reset instead,
-            // reported as TPM_RC_VALUE per Part 3 clause 9.3.3.
-            if state.startup_type != su::STATE {
+            // A Startup(STATE) that was not preceded by Shutdown(STATE) has
+            // no state to resume, which Part 3 clause 9.3.3 reports as
+            // TPM_RC_VALUE.
+            if state.shutdown_type != su::STATE {
                 return Err(TpmRc(rc::VALUE).with_parameter(1));
             }
             state.on_startup_state()?
@@ -48,16 +49,17 @@ pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
     let mut r = request.reader();
     let shutdown_type = r.u16()?;
     match shutdown_type {
-        su::CLEAR => {
-            state.startup_type = su::CLEAR;
-            state.clock.safe = true;
-        }
-        su::STATE => {
-            state.startup_type = su::STATE;
+        su::CLEAR | su::STATE => {
+            state.shutdown_type = shutdown_type;
             state.clock.safe = true;
         }
         _ => return Err(TpmRc(rc::VALUE).with_parameter(1)),
     }
+    // The state reaches the state file with the shutdown recorded, so the
+    // RAM backed NV data is once again what NV holds.
+    state.startup_clear = state
+        .startup_clear
+        .with(crate::tpm::structures::attributes::StartupClearAttributes::ORDERLY);
     state.started = false;
     respond(|_| Ok(()))
 }
@@ -569,7 +571,7 @@ fn pcr_properties(property: u32) -> Vec<TaggedPcrSelect> {
         (pt_pcr::RESET_L4, 4),
     ] {
         add(tag, &move |i| {
-            pcr::attributes(i).reset_locality & (1 << locality) != 0
+            pcr::reset_capability_locality(i) & (1 << locality) != 0
         });
     }
     add(pt_pcr::NO_INCREMENT, &|i| pcr::no_increment(i));
@@ -691,10 +693,13 @@ mod tests {
         assert!(r0.select.is_selected(16));
         assert!(r0.select.is_selected(23));
         assert!(!r0.select.is_selected(0));
-        // The dynamic root of trust registers are not reset by command at any
-        // locality; the TCB registers reset from localities two and three.
+        // No command resets PCR 17, but a D-RTM event does, at locality four,
+        // and the capability reports every way a register can be reset.
         let r4 = find(pt_pcr::RESET_L4);
-        assert!(!r4.select.is_selected(17));
+        assert!(r4.select.is_selected(17));
+        assert!(!r4.select.is_selected(0));
+        assert!(!r4.select.is_selected(16));
+        // The TCB registers reset by command from localities two and three.
         let r2 = find(pt_pcr::RESET_L2);
         assert!(r2.select.is_selected(21));
         assert!(r2.select.is_selected(22));
@@ -705,12 +710,13 @@ mod tests {
             assert!(ni.select.is_selected(index), "PCR {index}");
         }
         assert!(!ni.select.is_selected(0));
-        // Only the static and application registers are saved.
+        // Only the static root of trust registers are saved.
         let save = find(pt_pcr::SAVE);
         assert!(save.select.is_selected(0));
-        assert!(save.select.is_selected(23));
+        assert!(save.select.is_selected(15));
         assert!(!save.select.is_selected(16));
         assert!(!save.select.is_selected(17));
+        assert!(!save.select.is_selected(23));
         // The registers a D-RTM resets are reported.
         let drtm = find(pt_pcr::DRTM_RESET);
         assert!(drtm.select.is_selected(17));

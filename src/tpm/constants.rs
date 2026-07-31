@@ -465,6 +465,10 @@ pub mod st {
 pub mod su {
     pub const CLEAR: u16 = 0x0000;
     pub const STATE: u16 = 0x0001;
+    /// Not a TPM_SU value. It is recorded in place of a shutdown type while
+    /// the TPM is running, so a state file reloaded after power was lost
+    /// shows that no TPM2_Shutdown arrived.
+    pub const NONE: u16 = 0xFFFF;
 }
 
 pub mod se {

@@ -62,6 +62,23 @@ pub struct AuditState {
     pub digest: Vec<u8>,
 }
 
+/// Extend an audit digest, Part 1 clause 17.1 and clause 32.
+///
+/// `auditDigest_new = H(auditDigest_old || cpHash || rpHash)`. An empty
+/// `digest` starts a new sequence, which the equation begins from a Zero
+/// Digest of the size the hash produces.
+pub fn extend_audit(
+    hash_alg: u16,
+    digest: &[u8],
+    cp_hash: &[u8],
+    rp_hash: &[u8],
+) -> TpmResult<Vec<u8>> {
+    let size = hash::digest_size(hash_alg)?;
+    let zero = vec![0u8; size];
+    let old = if digest.len() == size { digest } else { &zero };
+    hash::digest_parts(hash_alg, &[old, cp_hash, rp_hash])
+}
+
 /// One authorization session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
@@ -82,6 +99,10 @@ pub struct Session {
     /// The Name of the bound entity, used to decide whether the authValue is
     /// already covered by the session key.
     pub bind_name: Vec<u8>,
+    /// True when the bound entity is protected by the dictionary attack
+    /// counter, which Part 1 clause 16.8.7 carries into every use of the
+    /// session because the session key holds that entity's authValue.
+    pub bind_uses_lockout: bool,
     /// The symmetric definition used for parameter encryption.
     pub symmetric: SymDef,
     /// Policy state, unused by an HMAC session.
@@ -115,6 +136,7 @@ impl Session {
             session_key,
             bind,
             bind_name,
+            bind_uses_lockout: false,
             symmetric,
             policy: PolicyState {
                 digest: vec![0u8; digest_len],
@@ -140,27 +162,52 @@ impl Session {
         self.session_type == se::HMAC
     }
 
-    /// True when the session is bound to the entity with this Name.
+    /// The value that identifies the entity a session is bound to.
+    ///
+    /// Part 1 clause 19.6.10 identifies the bound entity by its Name followed
+    /// by its authorization value, not by the Name alone. An NV Index or a
+    /// persistent object can be removed and recreated with the same Name but a
+    /// different authorization value, and without the value in the identifier a
+    /// session bound to the old entity would still count as bound to the new
+    /// one and would leave the new value out of the HMAC key.
+    pub fn bind_id(name: &[u8], auth_value: &[u8]) -> Vec<u8> {
+        let mut id = name.to_vec();
+        id.extend_from_slice(trim_auth(auth_value));
+        id
+    }
+
+    /// True when the session is bound to the entity with this Name and value.
     ///
     /// Part 1 clause 19.6.4 leaves the authorization value out of the HMAC key
     /// when the session is bound to the entity being authorized, because the
     /// session key already covers it.
-    pub fn is_bound_to(&self, name: &[u8]) -> bool {
+    pub fn is_bound_to(&self, name: &[u8], auth_value: &[u8]) -> bool {
         self.bind != crate::tpm::constants::rh::NULL
             && !self.bind_name.is_empty()
-            && self.bind_name == name
+            && self.bind_name == Session::bind_id(name, auth_value)
     }
 
     /// The HMAC key for authorizing an entity with this Name and authValue.
     pub fn hmac_key(&self, entity_name: &[u8], auth_value: &[u8]) -> Vec<u8> {
         let mut key = self.session_key.clone();
-        if !self.is_bound_to(entity_name) {
+        if !self.is_bound_to(entity_name, auth_value) {
             // Trailing zero octets of an authValue are removed before use, as
             // Part 1 clause 19.6.4.3 requires, so that an authValue padded to
             // the digest size gives the same HMAC as the unpadded value.
             key.extend_from_slice(trim_auth(auth_value));
         }
         key
+    }
+
+    /// The value parameter encryption folds in, Part 1 clause 18.1.
+    ///
+    /// `sessionValue = sessionKey || authValue` when the session also
+    /// authorizes a handle. Binding does not change this, unlike the
+    /// authorization HMAC key.
+    pub fn session_value(&self, auth_value: &[u8]) -> Vec<u8> {
+        let mut value = self.session_key.clone();
+        value.extend_from_slice(trim_auth(auth_value));
+        value
     }
 
     /// Reset the policy digest to zeros, which TPM2_PolicyRestart does.
@@ -272,10 +319,48 @@ pub fn auth_hmac(
     nonce_older: &[u8],
     attributes: SessionAttributes,
 ) -> TpmResult<Vec<u8>> {
+    auth_hmac_with_nonces(
+        auth_hash,
+        hmac_key,
+        p_hash,
+        nonce_newer,
+        nonce_older,
+        &[],
+        &[],
+        attributes,
+    )
+}
+
+/// The authorization HMAC including the auxiliary session nonces.
+///
+/// Part 1 clause 19.6.3.4 puts the nonceTPM of the decrypt and encrypt
+/// sessions into the HMAC of the first authorization, so those sessions cannot
+/// be stripped from the command without invalidating it:
+///
+/// `HMAC(key, pHash || nonceNewer || nonceOlder || nonceTPMdecrypt ||
+///  nonceTPMencrypt || sessionAttributes)`
+#[allow(clippy::too_many_arguments)]
+pub fn auth_hmac_with_nonces(
+    auth_hash: u16,
+    hmac_key: &[u8],
+    p_hash: &[u8],
+    nonce_newer: &[u8],
+    nonce_older: &[u8],
+    nonce_decrypt: &[u8],
+    nonce_encrypt: &[u8],
+    attributes: SessionAttributes,
+) -> TpmResult<Vec<u8>> {
     hmac_parts(
         auth_hash,
         hmac_key,
-        &[p_hash, nonce_newer, nonce_older, &[attributes.0]],
+        &[
+            p_hash,
+            nonce_newer,
+            nonce_older,
+            nonce_decrypt,
+            nonce_encrypt,
+            &[attributes.0],
+        ],
     )
 }
 
@@ -557,16 +642,47 @@ mod tests {
 
         // Bound to this entity: the authValue is left out.
         s.bind = hc::TRANSIENT_FIRST;
-        s.bind_name = name.clone();
+        s.bind_name = Session::bind_id(&name, b"pw");
         assert_eq!(s.hmac_key(&name, b"pw"), s.session_key);
         // Bound to a different entity: the authValue is appended again.
         assert_eq!(s.hmac_key(&[8u8; 34], b"pw"), expected);
     }
 
     #[test]
+    fn binding_covers_the_authorization_value_as_well_as_the_name() {
+        // An entity that is removed and recreated with the same Name but a
+        // different authorization value must not count as the bound entity.
+        let mut s = session(se::HMAC);
+        let name = vec![9u8; 34];
+        s.bind = hc::TRANSIENT_FIRST;
+        s.bind_name = Session::bind_id(&name, b"old");
+
+        assert!(s.is_bound_to(&name, b"old"));
+        assert!(!s.is_bound_to(&name, b"new"));
+        // The replacement's value therefore goes into the HMAC key.
+        let mut expected = s.session_key.clone();
+        expected.extend_from_slice(b"new");
+        assert_eq!(s.hmac_key(&name, b"new"), expected);
+    }
+
+    #[test]
     fn the_hmac_key_trims_a_padded_authorization_value() {
         let s = session(se::HMAC);
         assert_eq!(s.hmac_key(&[1u8; 34], b"pw\0\0"), s.hmac_key(&[1u8; 34], b"pw"));
+    }
+
+    #[test]
+    fn the_session_value_always_includes_the_authorization_value() {
+        // Part 1 clause 18.1 keeps the authValue in the parameter encryption
+        // key even when the session is bound to the entity.
+        let mut s = session(se::HMAC);
+        let name = vec![9u8; 34];
+        s.bind = hc::TRANSIENT_FIRST;
+        s.bind_name = Session::bind_id(&name, b"pw");
+        assert_eq!(s.hmac_key(&name, b"pw"), s.session_key);
+        let mut expected = s.session_key.clone();
+        expected.extend_from_slice(b"pw");
+        assert_eq!(s.session_value(b"pw"), expected);
     }
 
     #[test]

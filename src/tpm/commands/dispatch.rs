@@ -308,7 +308,11 @@ pub fn parse(state: &TpmState, buf: &[u8], locality: u8) -> TpmResult<Request> {
 ///
 /// Part 1 clause 21.3 encrypts only the first parameter of the command, and
 /// only when it is a sized buffer.
-pub fn decrypt_parameters(state: &TpmState, request: &mut Request) -> TpmResult<()> {
+pub fn decrypt_parameters(
+    state: &TpmState,
+    request: &mut Request,
+    auth_values: &[Vec<u8>],
+) -> TpmResult<()> {
     let Some((index, input)) = request
         .sessions
         .iter()
@@ -326,7 +330,8 @@ pub fn decrypt_parameters(state: &TpmState, request: &mut Request) -> TpmResult<
         .map_err(|e| e.with_session(index + 1))?;
     let body = first_sized_parameter(&request.parameters)
         .ok_or_else(|| TpmRc(rc::SIZE).with_parameter(1))?;
-    let plain = transform_parameter(state, s, input, body, false)?;
+    let extra = auth_values.get(index).cloned().unwrap_or_default();
+    let plain = transform_parameter(s, input, &extra, body, false)?;
     splice_first_parameter(&mut request.parameters, &plain);
     Ok(())
 }
@@ -336,6 +341,7 @@ pub fn encrypt_parameters(
     state: &TpmState,
     request: &Request,
     parameters: &mut Vec<u8>,
+    auth_values: &[Vec<u8>],
 ) -> TpmResult<()> {
     let Some((index, input)) = request
         .sessions
@@ -352,9 +358,36 @@ pub fn encrypt_parameters(
     let Some(body) = first_sized_parameter(parameters) else {
         return Ok(());
     };
-    let cipher = transform_parameter(state, s, input, body, true)?;
+    let extra = auth_values.get(index).cloned().unwrap_or_default();
+    let cipher = transform_parameter(s, input, &extra, body, true)?;
     splice_first_parameter(parameters, &cipher);
     Ok(())
+}
+
+/// The nonceTPM of the decrypt and encrypt sessions, when they are not the
+/// session whose HMAC is being computed.
+///
+/// Part 1 clause 19.6.3.4 folds these into the HMAC of the first authorization
+/// so an attacker cannot strip an encryption session and receive plaintext.
+pub fn auxiliary_nonces(
+    state: &TpmState,
+    request: &Request,
+    for_index: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    let nonce_of = |attribute: u8| -> Vec<u8> {
+        request
+            .sessions
+            .iter()
+            .enumerate()
+            .find(|(i, s)| *i != for_index && s.attributes.has(attribute))
+            .and_then(|(_, s)| state.sessions.get(s.handle).ok())
+            .map(|s| s.nonce_tpm.clone())
+            .unwrap_or_default()
+    };
+    (
+        nonce_of(SessionAttributes::DECRYPT),
+        nonce_of(SessionAttributes::ENCRYPT),
+    )
 }
 
 /// The body of the sized parameter at position `index`, counting from zero.
@@ -398,9 +431,9 @@ fn splice_first_parameter(parameters: &mut [u8], body: &[u8]) {
 /// The nonce order differs between the two directions: a command uses
 /// nonceCaller as the newer nonce, a response uses nonceTPM.
 fn transform_parameter(
-    state: &TpmState,
     s: &Session,
     input: &SessionInput,
+    auth_value: &[u8],
     body: &[u8],
     response: bool,
 ) -> TpmResult<Vec<u8>> {
@@ -409,24 +442,30 @@ fn transform_parameter(
     } else {
         (input.nonce_caller.clone(), s.nonce_tpm.clone())
     };
-    // The key material is the session key followed by the authValue of the
-    // first handle, when that handle is one the session authorizes.
-    let extra = first_handle_auth(state, s, input)?;
+    // Part 1 clause 18.1 keys the encryption with sessionKey followed by the
+    // authValue of the entity the session authorizes, whether or not the
+    // session is bound to that entity. `auth_value` is empty for a session
+    // that authorizes nothing.
+    let session_value = s.session_value(auth_value);
 
     match s.symmetric.algorithm {
         alg::XOR => {
             let mut out = body.to_vec();
-            let mut key = s.session_key.clone();
-            key.extend_from_slice(session::trim_auth(&extra));
-            sym::xor_obfuscate(s.symmetric.key_bits, &key, &newer, &older, &mut out)?;
+            sym::xor_obfuscate(
+                s.symmetric.key_bits,
+                &session_value,
+                &newer,
+                &older,
+                &mut out,
+            )?;
             Ok(out)
         }
         alg::AES => {
             let block = sym::block_size(alg::AES)?;
             let (key, iv) = session::parameter_encryption_key(
                 s.auth_hash,
-                &s.session_key,
-                &extra,
+                &session_value,
+                &[],
                 &newer,
                 &older,
                 s.symmetric.key_bits,
@@ -440,21 +479,6 @@ fn transform_parameter(
         }
         _ => Err(TpmRc(rc::SYMMETRIC)),
     }
-}
-
-/// The authorization value folded into a parameter encryption key.
-fn first_handle_auth(
-    state: &TpmState,
-    s: &Session,
-    _input: &SessionInput,
-) -> TpmResult<Vec<u8>> {
-    // Part 1 clause 21.3 uses the authValue of the entity the session
-    // authorizes, and nothing when the session is bound to that entity.
-    if s.bind != rh::NULL {
-        return Ok(Vec::new());
-    }
-    let _ = state;
-    Ok(Vec::new())
 }
 
 /// Check one authorization.
@@ -471,6 +495,8 @@ pub fn check_authorization(
 ) -> TpmResult<()> {
     let input = &request.sessions[index];
     let position = index + 1;
+
+    check_lockout(state, request, index, entity)?;
 
     // A password session carries the authorization value in the clear.
     if input.handle == rh::RS_PW {
@@ -498,12 +524,15 @@ pub fn check_authorization(
             return Err(TpmRc(rc::AUTH_TYPE).with_session(position));
         }
         let key = s.hmac_key(&entity.name, &entity.auth);
-        let expected = session::auth_hmac(
+        let (nonce_decrypt, nonce_encrypt) = auxiliary_nonces(state, request, index);
+        let expected = session::auth_hmac_with_nonces(
             s.auth_hash,
             &key,
             cp_hash,
             &input.nonce_caller,
             &s.nonce_tpm,
+            &nonce_decrypt,
+            &nonce_encrypt,
             input.attributes,
         )?;
         if !constant_time_eq(&expected, &input.hmac) {
@@ -513,6 +542,51 @@ pub fn check_authorization(
         if entity.uses_lockout {
             clear_failures(state);
         }
+    }
+    Ok(())
+}
+
+/// Refuse an authorization that Lockout mode blocks.
+///
+/// Part 1 clause 16.8.1 names the three ways an authValue is used: as a
+/// password, as the authValue in the authorization HMAC, and as the authValue
+/// in the sessionKey of a bound session. Part 1 clause 16.8.3 blocks all three
+/// while the TPM is in Lockout mode. A policy that never calls for the
+/// authValue uses none of them, so it still authorizes.
+fn check_lockout(
+    state: &TpmState,
+    request: &Request,
+    index: usize,
+    entity: &Entity,
+) -> TpmResult<()> {
+    if !state.lockout.in_lockout {
+        return Ok(());
+    }
+    // TPM2_DictionaryAttackLockReset is how a caller leaves Lockout mode, so
+    // Part 1 clause 16.8.3 lets it run even though it takes lockoutAuth.
+    if request.code == cc::DictionaryAttackLockReset {
+        return Ok(());
+    }
+    let input = &request.sessions[index];
+    let uses_auth_value = if input.handle == rh::RS_PW {
+        true
+    } else {
+        match state.sessions.get(input.handle) {
+            Ok(s) => {
+                // Part 1 clause 16.8.7 keeps the protection of the bound
+                // entity on every use of the session, whatever it authorizes.
+                if s.bind_uses_lockout {
+                    return Err(TpmRc(rc::LOCKOUT));
+                }
+                !s.is_policy() || s.policy.auth_value_needed || s.policy.password_needed
+            }
+            // The session is unknown, so treat it as one that would use the
+            // value and let the authorization itself report the handle.
+            Err(_) => true,
+        }
+    };
+    if uses_auth_value && entity.uses_lockout {
+        return Err(TpmRc(rc::LOCKOUT));
     }
     Ok(())
 }
@@ -541,18 +615,22 @@ pub fn check_unauthorized_session(
     ) {
         return Ok(());
     }
-    // An unbound, unsalted session has no key to prove, so there is nothing to
-    // check. Such a session provides no confidentiality anyway.
-    if s.session_key.is_empty() {
+    // An unbound, unsalted session has no key, so Part 1 clause 19.6.16 lets
+    // it send an empty HMAC. It may not send a wrong one, so anything present
+    // is still checked.
+    if s.session_key.is_empty() && input.hmac.is_empty() {
         return Ok(());
     }
     let cp = session::cp_hash(s.auth_hash, request.code, names, &request.parameters)?;
-    let expected = session::auth_hmac(
+    let (nonce_decrypt, nonce_encrypt) = auxiliary_nonces(state, request, index);
+    let expected = session::auth_hmac_with_nonces(
         s.auth_hash,
         &s.session_key,
         &cp,
         &input.nonce_caller,
         &s.nonce_tpm,
+        &nonce_decrypt,
+        &nonce_encrypt,
         input.attributes,
     )?;
     if !constant_time_eq(&expected, &input.hmac) {
@@ -686,9 +764,14 @@ fn check_policy(
             return Err(TpmRc(rc::POLICY_FAIL).with_session(position));
         }
     }
-    // TPM2_PolicyParameters fixes the digest of the whole parameter area.
+    // TPM2_PolicyParameters fixes the digest of the parameter area. Part 3
+    // clause 23.24.1 defines pHash as H(commandCode || parameters): the same
+    // input as a cpHash with the handle Names left out.
     if let Some(expected) = &s.policy.parameters_hash {
-        let got = crate::tpm::crypto::hash::digest(s.auth_hash, &request.parameters)?;
+        let got = crate::tpm::crypto::hash::digest_parts(
+            s.auth_hash,
+            &[&request.code.to_be_bytes(), &request.parameters],
+        )?;
         if !constant_time_eq(expected, &got) {
             return Err(TpmRc(rc::POLICY_FAIL).with_session(position));
         }
@@ -700,18 +783,28 @@ fn check_policy(
         return compare_auth(state, &input.hmac, &entity.auth, entity.uses_lockout)
             .map_err(|e| e.with_session(position));
     }
-    if s.policy.auth_value_needed {
-        let key = {
+    // A bound or salted policy session holds a session key, and Part 1 clause
+    // 19.6.16 requires it to prove that key even when the policy itself does
+    // not call for the authorization value. TPM2_PolicyAuthValue additionally
+    // folds the entity value into the key.
+    let needs_hmac = s.policy.auth_value_needed || !s.session_key.is_empty();
+    if needs_hmac {
+        let key = if s.policy.auth_value_needed {
             let mut k = s.session_key.clone();
             k.extend_from_slice(session::trim_auth(&entity.auth));
             k
+        } else {
+            s.session_key.clone()
         };
-        let expected = session::auth_hmac(
+        let (nonce_decrypt, nonce_encrypt) = auxiliary_nonces(state, request, index);
+        let expected = session::auth_hmac_with_nonces(
             s.auth_hash,
             &key,
             cp_hash,
             &input.nonce_caller,
             &s.nonce_tpm,
+            &nonce_decrypt,
+            &nonce_encrypt,
             input.attributes,
         )?;
         if !constant_time_eq(&expected, &input.hmac) {
@@ -754,18 +847,176 @@ pub fn roll_response_nonces(state: &mut TpmState, request: &Request) -> TpmResul
     Ok(out)
 }
 
+/// The position of the session that asked to audit the command.
+///
+/// Part 1 clause 17.1 allows one audit session per command, so a second one is
+/// refused rather than silently ignored.
+pub fn audit_session_index(request: &Request) -> TpmResult<Option<usize>> {
+    let mut found = None;
+    for (index, input) in request.sessions.iter().enumerate() {
+        if !input.attributes.has(SessionAttributes::AUDIT) {
+            // Part 1 clause 17.3 allows auditExclusive and auditReset only in
+            // a session that is also auditing.
+            if input.attributes.any(
+                SessionAttributes::AUDIT_EXCLUSIVE | SessionAttributes::AUDIT_RESET,
+            ) {
+                return Err(TpmRc(rc::ATTRIBUTES).with_session(index + 1));
+            }
+            continue;
+        }
+        if found.is_some() {
+            return Err(TpmRc(rc::ATTRIBUTES).with_session(index + 1));
+        }
+        found = Some(index);
+    }
+    Ok(found)
+}
+
+/// Check the audit session before the command runs.
+///
+/// Part 1 clause 17.1 restricts audit to HMAC sessions, and clause 17.3 gates
+/// the command on exclusivity as it stands at the start of the command.
+pub fn check_audit_session(state: &TpmState, request: &Request) -> TpmResult<()> {
+    let Some(index) = audit_session_index(request)? else {
+        return Ok(());
+    };
+    let input = &request.sessions[index];
+    let position = index + 1;
+    if input.handle == rh::RS_PW {
+        return Err(TpmRc(rc::ATTRIBUTES).with_session(position));
+    }
+    let s = state
+        .sessions
+        .get(input.handle)
+        .map_err(|_| TpmRc(rc::VALUE).with_session(position))?;
+    if !s.is_hmac() {
+        return Err(TpmRc(rc::ATTRIBUTES).with_session(position));
+    }
+    if input.attributes.has(SessionAttributes::AUDIT_EXCLUSIVE)
+        && state.audit.exclusive_session != input.handle
+    {
+        return Err(TpmRc(rc::EXCLUSIVE));
+    }
+    Ok(())
+}
+
+/// Update the audit digests after the command has succeeded.
+///
+/// `command_parameters` are the parameters as they arrived, before any were
+/// decrypted, and `response_parameters` are the ones being returned, after any
+/// were encrypted. Part 1 clause 15.7 and clause 15.8 compute the two hashes
+/// over exactly those octets.
+pub fn update_audit(
+    state: &mut TpmState,
+    request: &Request,
+    names: &[Vec<u8>],
+    command_parameters: &[u8],
+    response_parameters: &[u8],
+) -> TpmResult<()> {
+    let name_refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
+    let audit_index = audit_session_index(request)?;
+
+    if let Some(index) = audit_index {
+        let input = &request.sessions[index];
+        // A command may have flushed the session it audited with.
+        if let Ok(s) = state.sessions.get(input.handle) {
+            let hash_alg = s.auth_hash;
+            let was_audit = s.audit.is_audit;
+            let old = if input.attributes.has(SessionAttributes::AUDIT_RESET) || !was_audit {
+                Vec::new()
+            } else {
+                s.audit.digest.clone()
+            };
+            let cp = session::cp_hash(hash_alg, request.code, &name_refs, command_parameters)?;
+            let rp = session::rp_hash(hash_alg, rc::SUCCESS, request.code, response_parameters)?;
+            let digest = session::extend_audit(hash_alg, &old, &cp, &rp)?;
+            let s = state.sessions.get_mut(input.handle)?;
+            s.audit.is_audit = true;
+            s.audit.digest = digest;
+            // Part 1 clause 17.1 drops the binding once a session audits,
+            // because the audit HMAC no longer covers the bound authValue.
+            s.bind = rh::NULL;
+            s.bind_name.clear();
+        }
+    }
+
+    // Part 1 clause 17.2 hands exclusivity to whichever session audited the
+    // command, and takes it away when any other auditable command runs. A
+    // command that is allowed no session at all is not auditable and so
+    // leaves the exclusive session alone.
+    if !takes_no_sessions(request.code) {
+        state.audit.exclusive_session = match audit_index {
+            Some(index) => request.sessions[index].handle,
+            None => rh::UNASSIGNED,
+        };
+    }
+
+    if command_audit_applies(state, request.code) {
+        let hash_alg = state.audit.alg;
+        let cp = session::cp_hash(hash_alg, request.code, &name_refs, command_parameters)?;
+        let rp = session::rp_hash(hash_alg, rc::SUCCESS, request.code, response_parameters)?;
+        // Part 1 clause 32 counts a new log when the digest register is empty,
+        // so the counter moves on the first audited command of a sequence.
+        if state.audit.digest.len() != crate::tpm::crypto::hash::digest_size(hash_alg)? {
+            state.audit.counter = state.audit.counter.wrapping_add(1);
+        }
+        state.audit.digest = session::extend_audit(hash_alg, &state.audit.digest, &cp, &rp)?;
+    }
+    Ok(())
+}
+
+/// True for the commands Part 1 clause 17.2 lists as carrying no session, and
+/// therefore as leaving the current exclusive audit session alone.
+fn takes_no_sessions(code: u32) -> bool {
+    matches!(
+        code,
+        cc::ContextSave | cc::ContextLoad | cc::FlushContext | cc::Startup | cc::ReadClock
+    )
+}
+
+/// True when the command code is one the TPM records in the command audit.
+///
+/// Part 3 clause 21.1 always audits TPM2_SetCommandCodeAuditStatus and never
+/// audits TPM2_Shutdown, whatever the selected list says.
+pub fn command_audit_applies(state: &TpmState, code: u32) -> bool {
+    if code == cc::Shutdown || state.failure_mode || state.command_audit_suppressed {
+        return false;
+    }
+    if code == cc::SetCommandCodeAuditStatus {
+        return true;
+    }
+    state.audit.commands.contains(&code)
+}
+
+/// The exclusive status a session has, for the response session area.
+fn is_exclusive(state: &TpmState, handle: u32) -> bool {
+    handle != rh::RS_PW && state.audit.exclusive_session == handle
+}
+
+/// What an authorization used, captured before the command ran.
+///
+/// Part 1 clause 19.6.10 builds the response HMAC key the same way as the
+/// command HMAC key, so the Name and authorization value have to be the ones
+/// the command was authorized against. A command may change the Name, as the
+/// first write to an NV Index does, or remove the entity outright, as
+/// TPM2_NV_UndefineSpaceSpecial does.
+#[derive(Debug, Clone, Default)]
+pub struct AuthContext {
+    pub name: Vec<u8>,
+    pub auth: Vec<u8>,
+}
+
 /// Build the response authorization area.
 ///
-/// `nonces` holds the values [`roll_response_nonces`] produced and
-/// `auth_values` the authorization value of each authorized entity, which the
-/// response HMAC key needs just as the command HMAC key did.
+/// `nonces` holds the values [`roll_response_nonces`] produced and `contexts`
+/// what each authorization used before the command ran.
 pub fn build_response_sessions(
     state: &mut TpmState,
     request: &Request,
     response_code: u32,
     parameters: &[u8],
     nonces: &[Vec<u8>],
-    auth_values: &[Vec<u8>],
+    contexts: &[AuthContext],
 ) -> TpmResult<Vec<u8>> {
     let mut w = Writer::new();
     for (index, input) in request.sessions.iter().enumerate() {
@@ -778,12 +1029,15 @@ pub fn build_response_sessions(
             .marshal(&mut w);
             continue;
         }
+        // Part 1 clause 17.2 reports the exclusive status the session holds
+        // now, whatever the command asked for.
+        let attributes = response_attributes(state, input);
         let new_nonce = nonces.get(index).cloned().unwrap_or_default();
         let Ok(s) = state.sessions.get(input.handle) else {
             // The session went away, so there is nothing to answer with.
             AuthResponse {
                 nonce: Tpm2bNonce::new(new_nonce)?,
-                session_attributes: input.attributes,
+                session_attributes: attributes,
                 hmac: Tpm2bAuth::empty(),
             }
             .marshal(&mut w);
@@ -799,22 +1053,22 @@ pub fn build_response_sessions(
             || s.policy.password_needed
             || !s.session_key.is_empty();
         let hmac = if carries_hmac {
-            let entity_name = request
-                .handles
-                .get(index)
-                .map(|h| handle_name(state, *h))
-                .transpose()?
-                .unwrap_or_default();
-            let auth = auth_values.get(index).cloned().unwrap_or_default();
+            let context = contexts.get(index).cloned().unwrap_or_default();
             let s = state.sessions.get(input.handle)?;
-            let key = s.hmac_key(&entity_name, &auth);
+            let key = if index < request.info.auth_handles as usize {
+                s.hmac_key(&context.name, &context.auth)
+            } else {
+                // A session that authorized nothing keys with the session key
+                // alone, just as its command HMAC did.
+                s.session_key.clone()
+            };
             session::auth_hmac(
                 auth_hash,
                 &key,
                 &rp,
                 &new_nonce,
                 &input.nonce_caller,
-                input.attributes,
+                attributes,
             )?
         } else {
             Vec::new()
@@ -822,12 +1076,25 @@ pub fn build_response_sessions(
 
         AuthResponse {
             nonce: Tpm2bNonce::new(new_nonce)?,
-            session_attributes: input.attributes,
+            session_attributes: attributes,
             hmac: Tpm2bAuth::new(hmac)?,
         }
         .marshal(&mut w);
     }
     w.finish()
+}
+
+/// The attributes echoed back for one session.
+///
+/// Only auditExclusive differs from what the command sent: Part 1 clause 17.2
+/// makes it report whether the session holds exclusive status now.
+fn response_attributes(state: &TpmState, input: &SessionInput) -> SessionAttributes {
+    let mut attributes = input.attributes;
+    attributes.set(
+        SessionAttributes::AUDIT_EXCLUSIVE,
+        input.attributes.has(SessionAttributes::AUDIT) && is_exclusive(state, input.handle),
+    );
+    attributes
 }
 
 /// Close every session the caller did not ask to keep.
@@ -1034,13 +1301,118 @@ mod tests {
             let _ = check_authorization(&mut state, &req, 0, &e, &[0u8; 32]);
         }
         assert!(state.lockout.in_lockout);
-        // A success clears the counter.
+
+        // Part 1 clause 16.8.3 refuses the protected value while the TPM is
+        // in Lockout mode, even when the caller has it right.
         let auth = password_auth(b"secret");
         let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
         let req = parse(&state, &buf, 0).unwrap();
         let e = entity(&state, rh::OWNER).unwrap();
+        assert_eq!(
+            check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap_err(),
+            TpmRc(rc::LOCKOUT)
+        );
+
+        // Once out of Lockout mode a success clears the counter.
+        state.lockout.in_lockout = false;
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = entity(&state, rh::OWNER).unwrap();
         check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
         assert_eq!(state.lockout.failed_tries, 0);
+    }
+
+    #[test]
+    fn lockout_stops_a_policy_that_calls_for_the_auth_value() {
+        let mut state = TpmState::manufacture().unwrap();
+        state.hierarchies.owner.auth = b"secret".to_vec();
+        state.lockout.in_lockout = true;
+
+        let handle = state.sessions.allocate_handle(se::POLICY).unwrap();
+        let s = Session::new(
+            handle,
+            se::POLICY,
+            alg::SHA256,
+            vec![0u8; 32],
+            vec![0u8; 32],
+            Vec::new(),
+            rh::NULL,
+            Vec::new(),
+            crate::tpm::structures::schemes::SymDef::null(),
+        )
+        .unwrap();
+        state.sessions.insert(s).unwrap();
+
+        let auth = AuthCommand {
+            session_handle: handle,
+            nonce: Tpm2bNonce::new(vec![0u8; 32]).unwrap(),
+            session_attributes: SessionAttributes(SessionAttributes::CONTINUE_SESSION),
+            hmac: Tpm2bAuth::empty(),
+        }
+        .to_bytes();
+        let buf = command(st::SESSIONS, cc::Clear, &[rh::OWNER], &auth, &[]);
+
+        // A policy that never calls for the authValue uses no protected value,
+        // so Lockout mode does not reach it. It fails on the policy instead.
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = entity(&state, rh::OWNER).unwrap();
+        assert_ne!(
+            check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap_err(),
+            TpmRc(rc::LOCKOUT)
+        );
+
+        // A policy that called TPM2_PolicyAuthValue does use it.
+        state
+            .sessions
+            .get_mut(handle)
+            .unwrap()
+            .policy
+            .auth_value_needed = true;
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = entity(&state, rh::OWNER).unwrap();
+        assert_eq!(
+            check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap_err(),
+            TpmRc(rc::LOCKOUT)
+        );
+    }
+
+    #[test]
+    fn lockout_follows_a_session_bound_to_a_protected_entity() {
+        let mut state = TpmState::manufacture().unwrap();
+        state.lockout.in_lockout = true;
+
+        let handle = state.sessions.allocate_handle(se::HMAC).unwrap();
+        let mut s = Session::new(
+            handle,
+            se::HMAC,
+            alg::SHA256,
+            vec![0u8; 32],
+            vec![0u8; 32],
+            Vec::new(),
+            hc::TRANSIENT_FIRST,
+            b"bound".to_vec(),
+            crate::tpm::structures::schemes::SymDef::null(),
+        )
+        .unwrap();
+        s.bind_uses_lockout = true;
+        state.sessions.insert(s).unwrap();
+
+        let auth = AuthCommand {
+            session_handle: handle,
+            nonce: Tpm2bNonce::new(vec![0u8; 32]).unwrap(),
+            session_attributes: SessionAttributes(SessionAttributes::CONTINUE_SESSION),
+            hmac: Tpm2bAuth::empty(),
+        }
+        .to_bytes();
+        // TPM_RH_PLATFORM is exempt, but Part 1 clause 16.8.7 still blocks the
+        // session because its key holds the bound entity's authValue.
+        let buf = command(st::SESSIONS, cc::Clear, &[rh::PLATFORM], &auth, &[]);
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = entity(&state, rh::PLATFORM).unwrap();
+        assert!(!e.uses_lockout);
+        assert_eq!(
+            check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap_err(),
+            TpmRc(rc::LOCKOUT)
+        );
     }
 
     #[test]

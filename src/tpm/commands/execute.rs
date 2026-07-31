@@ -1,4 +1,4 @@
-//! The command execution pipeline.
+﻿//! The command execution pipeline.
 //!
 //! [`run`] takes a command buffer and produces a response buffer. It applies
 //! the checks Part 3 clause 5 lists in order, calls the command, then builds
@@ -47,30 +47,10 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         names.push(dispatch::handle_name(state, *h)?);
     }
 
-    // While the TPM is in lockout, no authorization value that the dictionary
-    // attack counter protects may be used, and neither may lockoutAuth. Part 1
-    // clause 19.8.3 keeps the exempt entities usable so the platform can still
-    // recover the TPM.
-    if state.lockout.in_lockout {
-        for index in 0..request.info.auth_handles as usize {
-            let Ok(handle) = request.handle(index) else {
-                continue;
-            };
-            if handle == crate::tpm::constants::rh::LOCKOUT {
-                return Err(TpmRc(rc::LOCKOUT));
-            }
-            if let Ok(entity) = dispatch::entity(state, handle) {
-                if entity.uses_lockout {
-                    return Err(TpmRc(rc::LOCKOUT));
-                }
-            }
-        }
-    }
-
     // Part 3 clause 5.6 checks each authorization before clause 5.7 decrypts a
     // parameter, and Part 1 clause 18.4 computes cpHash over the parameters as
     // they arrived, so the encrypted form is what the HMAC covers.
-    let mut auth_values: Vec<Vec<u8>> = Vec::with_capacity(request.sessions.len());
+    let mut contexts: Vec<dispatch::AuthContext> = Vec::with_capacity(request.sessions.len());
     for index in 0..request.info.auth_handles as usize {
         if index >= request.sessions.len() {
             return Err(TpmRc(rc::AUTH_MISSING).with_session(index + 1));
@@ -86,8 +66,12 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         let name_refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
         let cp = session::cp_hash(auth_hash, request.code, &name_refs, &request.parameters)?;
         dispatch::check_authorization(state, &request, index, &entity, &cp)?;
-        auth_values.push(entity.auth.clone());
+        contexts.push(dispatch::AuthContext {
+            name: entity.name.clone(),
+            auth: entity.auth.clone(),
+        });
     }
+    let auth_values: Vec<Vec<u8>> = contexts.iter().map(|c| c.auth.clone()).collect();
 
     // A session past the authorization handles carries no authorization, but
     // if it asks to encrypt or decrypt a parameter, or to audit, it still has
@@ -110,8 +94,16 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         dispatch::check_unauthorized_session(state, &request, index, &name_refs)?;
     }
 
-    dispatch::decrypt_parameters(state, &mut request)?;
+    // Part 1 clause 17.3 evaluates the exclusive status before the command
+    // runs, so a command that asks for it and does not have it never executes.
+    dispatch::check_audit_session(state, &request)?;
 
+    // The audit digests cover the command parameters as they arrived, so a
+    // copy is kept before the first one is decrypted.
+    let command_parameters = request.parameters.clone();
+    dispatch::decrypt_parameters(state, &mut request, &auth_values)?;
+
+    state.command_audit_suppressed = false;
     let response = super::run_command(state, &request)?;
 
     // The response nonces are rolled forward before the response parameter is
@@ -124,7 +116,11 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     };
 
     let mut parameters = response.parameters.clone();
-    dispatch::encrypt_parameters(state, &request, &mut parameters)?;
+    dispatch::encrypt_parameters(state, &request, &mut parameters, &auth_values)?;
+
+    // Part 1 clause 17.1 and clause 32 update the audit digests only once the
+    // command has succeeded and the response has been built.
+    dispatch::update_audit(state, &request, &names, &command_parameters, &parameters)?;
 
     let mut body = Writer::new();
     if let Some(h) = response.handle {
@@ -141,7 +137,7 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
             rc::SUCCESS,
             &parameters,
             &nonces,
-            &auth_values,
+            &contexts,
         )?;
         body.bytes(&area);
     }
@@ -193,8 +189,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tpm::constants::su;
-    use crate::tpm::marshal::Writer;
+    use crate::tpm::constants::{alg, rh, se, su};
+    use crate::tpm::core::session::Session;
+    use crate::tpm::structures::schemes::SymDef;
+    use crate::tpm::marshal::{Marshal, Writer};
+    use crate::tpm::structures::attributes::SessionAttributes;
+    use crate::tpm::structures::base::{Tpm2bAuth, Tpm2bNonce};
+    use crate::tpm::structures::capability::AuthCommand;
 
     fn startup(su_type: u16) -> Vec<u8> {
         let mut w = Writer::new();
@@ -216,6 +217,69 @@ mod tests {
 
     fn response_code(buf: &[u8]) -> u32 {
         u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]])
+    }
+
+    /// An unbound, unsalted HMAC session, which Part 1 clause 16.6.16 lets
+    /// authorize with an empty HMAC.
+    fn load_hmac_session(state: &mut TpmState) -> u32 {
+        let handle = state.sessions.allocate_handle(se::HMAC).unwrap();
+        let s = Session::new(
+            handle,
+            se::HMAC,
+            alg::SHA256,
+            vec![0u8; 32],
+            vec![0u8; 32],
+            Vec::new(),
+            rh::NULL,
+            Vec::new(),
+            SymDef::null(),
+        )
+        .unwrap();
+        state.sessions.insert(s).unwrap()
+    }
+
+    /// A command with no handles carrying one session with these attributes.
+    fn audited(code: u32, handle: u32, attributes: u8, parameters: &[u8]) -> Vec<u8> {
+        let auth = AuthCommand {
+            session_handle: handle,
+            nonce: Tpm2bNonce::new(vec![0u8; 32]).unwrap(),
+            session_attributes: SessionAttributes(attributes),
+            hmac: Tpm2bAuth::empty(),
+        }
+        .to_bytes();
+
+        let mut body = Writer::new();
+        body.u32(auth.len() as u32);
+        body.bytes(&auth);
+        body.bytes(parameters);
+        let body = body.finish().unwrap();
+
+        let mut w = Writer::new();
+        w.u16(st::SESSIONS);
+        w.u32((HEADER_SIZE + body.len()) as u32);
+        w.u32(code);
+        w.bytes(&body);
+        w.finish().unwrap()
+    }
+
+    /// TPM2_GetRandom carrying one session with the given attributes.
+    fn get_random_audited(handle: u32, attributes: u8) -> Vec<u8> {
+        audited(cc::GetRandom, handle, attributes, &[0x00, 0x08])
+    }
+
+    /// TPM2_GetTestResult, whose response is the same every time it runs.
+    fn get_test_result_audited(handle: u32, attributes: u8) -> Vec<u8> {
+        audited(cc::GetTestResult, handle, attributes, &[])
+    }
+
+    /// The session attributes the TPM echoed in the first response session.
+    fn response_session_attributes(buf: &[u8]) -> u8 {
+        // header, parameterSize, the sized random buffer, then the session.
+        let parameter_size =
+            u32::from_be_bytes([buf[10], buf[11], buf[12], buf[13]]) as usize;
+        let session = &buf[14 + parameter_size..];
+        let nonce_size = u16::from_be_bytes([session[0], session[1]]) as usize;
+        session[2 + nonce_size]
     }
 
     #[test]
@@ -263,6 +327,123 @@ mod tests {
         w.u32(0x0000_0123);
         let r = run(&mut state, 0, &w.finish().unwrap());
         assert_eq!(response_code(&r), rc::COMMAND_CODE);
+    }
+
+    #[test]
+    fn an_audit_session_records_the_command_and_becomes_exclusive() {
+        let mut state = TpmState::manufacture().unwrap();
+        run(&mut state, 0, &startup(su::CLEAR));
+        let handle = load_hmac_session(&mut state);
+
+        let attributes = SessionAttributes::CONTINUE_SESSION | SessionAttributes::AUDIT;
+        let r = run(&mut state, 0, &get_random_audited(handle, attributes));
+        assert_eq!(response_code(&r), rc::SUCCESS);
+
+        let s = state.sessions.get(handle).unwrap();
+        assert!(s.audit.is_audit);
+        assert_eq!(s.audit.digest.len(), 32);
+        assert_eq!(state.audit.exclusive_session, handle);
+        // Part 1 clause 17.2 reports the exclusive status the session reached.
+        assert_eq!(
+            response_session_attributes(&r) & SessionAttributes::AUDIT_EXCLUSIVE,
+            SessionAttributes::AUDIT_EXCLUSIVE
+        );
+
+        // A second audited command extends the same digest.
+        let first = s.audit.digest.clone();
+        run(&mut state, 0, &get_random_audited(handle, attributes));
+        assert_ne!(state.sessions.get(handle).unwrap().audit.digest, first);
+    }
+
+    #[test]
+    fn an_unaudited_command_takes_the_exclusive_status_away() {
+        let mut state = TpmState::manufacture().unwrap();
+        run(&mut state, 0, &startup(su::CLEAR));
+        let handle = load_hmac_session(&mut state);
+        let attributes = SessionAttributes::CONTINUE_SESSION | SessionAttributes::AUDIT;
+        run(&mut state, 0, &get_random_audited(handle, attributes));
+        assert_eq!(state.audit.exclusive_session, handle);
+
+        // TPM2_GetRandom is auditable, so running it without the session ends
+        // the exclusive run.
+        run(&mut state, 0, &get_random(8));
+        assert_eq!(state.audit.exclusive_session, rh::UNASSIGNED);
+
+        // Asking for exclusivity that the session no longer has fails the
+        // command, and Part 1 clause 17.3 leaves the session alone.
+        let exclusive = attributes | SessionAttributes::AUDIT_EXCLUSIVE;
+        let r = run(&mut state, 0, &get_random_audited(handle, exclusive));
+        assert_eq!(response_code(&r), rc::EXCLUSIVE);
+        assert!(state.sessions.get(handle).unwrap().audit.is_audit);
+    }
+
+    #[test]
+    fn a_policy_session_may_not_audit() {
+        let mut state = TpmState::manufacture().unwrap();
+        run(&mut state, 0, &startup(su::CLEAR));
+        let handle = state.sessions.allocate_handle(se::POLICY).unwrap();
+        let s = Session::new(
+            handle,
+            se::POLICY,
+            alg::SHA256,
+            vec![0u8; 32],
+            vec![0u8; 32],
+            Vec::new(),
+            rh::NULL,
+            Vec::new(),
+            SymDef::null(),
+        )
+        .unwrap();
+        state.sessions.insert(s).unwrap();
+
+        let attributes = SessionAttributes::CONTINUE_SESSION | SessionAttributes::AUDIT;
+        let r = run(&mut state, 0, &get_random_audited(handle, attributes));
+        assert_eq!(
+            response_code(&r),
+            TpmRc(rc::ATTRIBUTES).with_session(1).0
+        );
+    }
+
+    #[test]
+    fn audit_reset_starts_the_digest_again() {
+        let mut state = TpmState::manufacture().unwrap();
+        run(&mut state, 0, &startup(su::CLEAR));
+        let handle = load_hmac_session(&mut state);
+        let attributes = SessionAttributes::CONTINUE_SESSION | SessionAttributes::AUDIT;
+        run(&mut state, 0, &get_test_result_audited(handle, attributes));
+        let first = state.sessions.get(handle).unwrap().audit.digest.clone();
+        run(&mut state, 0, &get_test_result_audited(handle, attributes));
+        assert_ne!(state.sessions.get(handle).unwrap().audit.digest, first);
+
+        // TPM2_GetTestResult answers the same way every time, so a reset puts
+        // the digest back to what the first audit of it produced.
+        let reset = attributes | SessionAttributes::AUDIT_RESET;
+        run(&mut state, 0, &get_test_result_audited(handle, reset));
+        assert_eq!(state.sessions.get(handle).unwrap().audit.digest, first);
+    }
+
+    #[test]
+    fn command_audit_records_the_selected_commands_only() {
+        let mut state = TpmState::manufacture().unwrap();
+        run(&mut state, 0, &startup(su::CLEAR));
+        assert!(state.audit.digest.is_empty());
+        assert_eq!(state.audit.counter, 0);
+
+        // TPM2_GetRandom is not in the list a manufactured TPM starts with.
+        run(&mut state, 0, &get_random(8));
+        assert!(state.audit.digest.is_empty());
+
+        state.audit.commands.push(cc::GetRandom);
+        run(&mut state, 0, &get_random(8));
+        assert_eq!(state.audit.digest.len(), 32);
+        // Part 1 clause 32 counts the log that just started.
+        assert_eq!(state.audit.counter, 1);
+
+        // A second command extends the same log without counting again.
+        let first = state.audit.digest.clone();
+        run(&mut state, 0, &get_random(8));
+        assert_ne!(state.audit.digest, first);
+        assert_eq!(state.audit.counter, 1);
     }
 
     #[test]

@@ -35,12 +35,12 @@ const LOCALITY_TWO_TO_FOUR: u8 = 0b0001_1100;
 
 /// Localities zero through three.
 const LOCALITY_ZERO_TO_THREE: u8 = 0b0000_1111;
-/// Localities one through four.
-const LOCALITY_ONE_TO_FOUR: u8 = 0b0001_1110;
+/// Localities one through three.
+const LOCALITY_ONE_TO_THREE: u8 = 0b0000_1110;
 /// Localities two and three, which reset the TCB registers by command.
 const LOCALITY_TWO_AND_THREE: u8 = 0b0000_1100;
-/// Locality three and four.
-const LOCALITY_THREE_AND_FOUR: u8 = 0b0001_1000;
+/// Locality two alone.
+const LOCALITY_TWO: u8 = 0b0000_0100;
 
 /// The attributes of `index` under the PC Client Platform Profile, clause 4.7.1
 /// Table 14.
@@ -63,33 +63,28 @@ pub fn attributes(index: u16) -> PcrAttributes {
             starts_at_ones: false,
         },
         16 | 23 => PcrAttributes {
-            reset_locality: ALL_LOCALITIES,
+            reset_locality: LOCALITY_ZERO_TO_THREE,
             extend_locality: ALL_LOCALITIES,
             starts_at_ones: false,
         },
-        17 => PcrAttributes {
-            reset_locality: 0,
-            extend_locality: LOCALITY_TWO_TO_FOUR,
-            starts_at_ones: true,
-        },
-        18 => PcrAttributes {
+        17 | 18 => PcrAttributes {
             reset_locality: 0,
             extend_locality: LOCALITY_TWO_TO_FOUR,
             starts_at_ones: true,
         },
         19 => PcrAttributes {
             reset_locality: 0,
-            extend_locality: LOCALITY_THREE_AND_FOUR,
+            extend_locality: LOCALITY_TWO_AND_THREE,
             starts_at_ones: true,
         },
         20 => PcrAttributes {
-            reset_locality: 0,
-            extend_locality: LOCALITY_ONE_TO_FOUR,
+            reset_locality: LOCALITY_TWO_AND_THREE,
+            extend_locality: LOCALITY_ONE_TO_THREE,
             starts_at_ones: true,
         },
         21 | 22 => PcrAttributes {
             reset_locality: LOCALITY_TWO_AND_THREE,
-            extend_locality: LOCALITY_TWO_AND_THREE,
+            extend_locality: LOCALITY_TWO,
             starts_at_ones: true,
         },
         _ => PcrAttributes {
@@ -102,10 +97,23 @@ pub fn attributes(index: u16) -> PcrAttributes {
 
 /// True when the register is saved across a Startup(STATE).
 ///
-/// The PC Client profile saves the static root of trust registers and the
-/// application register, not the debug or dynamic ones.
+/// The PC Client profile saves only the static root of trust registers.
 pub fn is_saved(index: u16) -> bool {
-    matches!(index, 0..=15 | 23)
+    matches!(index, 0..=15)
+}
+
+/// The localities at which `index` can be reset by any means.
+///
+/// TPM_PT_PCR_RESET_Lx reports every way a register can be reset, not only
+/// TPM2_PCR_Reset, so the registers a D-RTM event resets are reported at
+/// locality four even though no command resets them.
+pub fn reset_capability_locality(index: u16) -> u8 {
+    let attrs = attributes(index);
+    if attrs.starts_at_ones {
+        attrs.reset_locality | LOCALITY_FOUR
+    } else {
+        attrs.reset_locality
+    }
 }
 
 /// True when `index` is a PCR this TPM implements.
@@ -168,6 +176,15 @@ impl PcrBanks {
     /// The current update counter.
     pub fn update_counter(&self) -> u32 {
         self.update_counter
+    }
+
+    /// Put the update counter back to zero.
+    ///
+    /// Part 1 clause 17.8 keeps the counter across a TPM Resume, and starts it
+    /// again from zero on a TPM Reset or a TPM Restart, because the registers
+    /// go back to their reset values at the same time.
+    pub fn reset_update_counter(&mut self) {
+        self.update_counter = 0;
     }
 
     /// Read one register.
@@ -470,9 +487,9 @@ mod tests {
         for loc in 0..=4 {
             assert_eq!(b.reset(0, loc).unwrap_err(), TpmRc(rc::LOCALITY));
         }
-        // The dynamic root of trust registers are reset by a D-RTM event, not
-        // by command, so PCR 17 through 20 refuse TPM2_PCR_Reset everywhere.
-        for index in 17..=20u16 {
+        // PCR 17 through 19 are reset by a D-RTM event, not by command, so
+        // they refuse TPM2_PCR_Reset at every locality.
+        for index in 17..=19u16 {
             for loc in 0..=4 {
                 assert_eq!(
                     b.reset(index, loc).unwrap_err(),
@@ -481,12 +498,17 @@ mod tests {
                 );
             }
         }
-        // The TCB registers reset from localities two and three.
-        assert_eq!(b.reset(21, 1).unwrap_err(), TpmRc(rc::LOCALITY));
-        assert_eq!(b.reset(21, 4).unwrap_err(), TpmRc(rc::LOCALITY));
+        // PCR 20 through 22 reset from localities two and three only.
+        for index in 20..=22u16 {
+            assert_eq!(b.reset(index, 1).unwrap_err(), TpmRc(rc::LOCALITY));
+            assert_eq!(b.reset(index, 4).unwrap_err(), TpmRc(rc::LOCALITY));
+        }
         b.reset(21, 2).unwrap();
         assert!(b.read(alg::SHA256, 21).unwrap().iter().all(|v| *v == 0));
         b.reset(22, 3).unwrap();
+        // The debug and application registers do not reset from locality four.
+        assert_eq!(b.reset(16, 4).unwrap_err(), TpmRc(rc::LOCALITY));
+        b.reset(16, 3).unwrap();
     }
 
     #[test]
@@ -496,20 +518,29 @@ mod tests {
         assert_eq!(attributes(16).extend_locality, 0b0001_1111);
         assert_eq!(attributes(17).extend_locality, 0b0001_1100);
         assert_eq!(attributes(18).extend_locality, 0b0001_1100);
-        assert_eq!(attributes(19).extend_locality, 0b0001_1000);
-        assert_eq!(attributes(20).extend_locality, 0b0001_1110);
-        assert_eq!(attributes(21).extend_locality, 0b0000_1100);
-        assert_eq!(attributes(22).extend_locality, 0b0000_1100);
+        assert_eq!(attributes(19).extend_locality, 0b0000_1100);
+        assert_eq!(attributes(20).extend_locality, 0b0000_1110);
+        assert_eq!(attributes(21).extend_locality, 0b0000_0100);
+        assert_eq!(attributes(22).extend_locality, 0b0000_0100);
         assert_eq!(attributes(23).extend_locality, 0b0001_1111);
 
-        // Command reset localities.
+        // Command reset localities. The debug and application registers reset
+        // from localities zero through three, not four.
         assert_eq!(attributes(0).reset_locality, 0);
-        assert_eq!(attributes(16).reset_locality, 0b0001_1111);
-        for index in 17..=20u16 {
+        assert_eq!(attributes(16).reset_locality, 0b0000_1111);
+        for index in 17..=19u16 {
             assert_eq!(attributes(index).reset_locality, 0, "PCR {index}");
         }
+        assert_eq!(attributes(20).reset_locality, 0b0000_1100);
         assert_eq!(attributes(21).reset_locality, 0b0000_1100);
-        assert_eq!(attributes(23).reset_locality, 0b0001_1111);
+        assert_eq!(attributes(23).reset_locality, 0b0000_1111);
+
+        // The reported reset capability also covers the D-RTM event, which
+        // resets PCR 17 through 22 at locality four.
+        assert_eq!(reset_capability_locality(0), 0);
+        assert_eq!(reset_capability_locality(16), 0b0000_1111);
+        assert_eq!(reset_capability_locality(17), 0b0001_0000);
+        assert_eq!(reset_capability_locality(21), 0b0001_1100);
 
         // The registers a D-RTM resets start as all ones.
         for index in 0..=16u16 {
@@ -528,13 +559,13 @@ mod tests {
             assert!(!no_increment(index), "PCR {index}");
         }
 
-        // Only the static and application registers are saved.
+        // Only the static root of trust registers are saved.
         for index in 0..=15u16 {
             assert!(is_saved(index), "PCR {index}");
         }
-        assert!(!is_saved(16));
-        assert!(!is_saved(17));
-        assert!(is_saved(23));
+        for index in 16..=23u16 {
+            assert!(!is_saved(index), "PCR {index}");
+        }
     }
 
     #[test]

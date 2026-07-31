@@ -45,6 +45,9 @@ pub const CONTEXT_GAP_MAX: u32 = u16::MAX as u32;
 
 /// Number of bits in the orderly shutdown counter.
 pub const ORDERLY_BITS: u32 = 8;
+/// Largest number of increments an orderly counter may take between the NV
+/// writes that record its value.
+pub const MAX_ORDERLY_COUNT: u64 = (1u64 << ORDERLY_BITS) - 1;
 /// Number of clock updates between NV writes of the clock value, in ms.
 pub const NV_CLOCK_UPDATE_INTERVAL: u32 = 1 << 17;
 

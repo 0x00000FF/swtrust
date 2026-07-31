@@ -1,6 +1,6 @@
 //! Attestation, Part 3 clause 18, and the audit digests of clause 21.
 
-use crate::tpm::constants::{alg, rc, rh};
+use crate::tpm::constants::{alg, cc, rc, rh};
 use crate::tpm::core::object::Object;
 use crate::tpm::core::state::TpmState;
 use crate::tpm::crypto::hash;
@@ -299,11 +299,7 @@ pub fn get_command_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
     let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
 
-    let digest_alg = if state.audit.alg == alg::NULL {
-        crate::tpm::config::CONTEXT_INTEGRITY_HASH_ALG
-    } else {
-        state.audit.alg
-    };
+    let digest_alg = state.audit.alg;
     let audit_digest = state.audit.digest.clone();
     let counter = state.audit.counter;
     // The command digest covers the list of audited commands.
@@ -321,9 +317,12 @@ pub fn get_command_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
     };
     let (info, signature) =
         attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested)?;
-    // Part 3 clause 18.5.2 resets the digest once it has been reported.
-    state.audit.digest.clear();
-    state.audit.counter = state.audit.counter.wrapping_add(1);
+    // Part 1 clause 32 ends the audit log when the command returns a
+    // signature, so a report taken with TPM_RH_NULL leaves the log running.
+    // The counter is not touched here; it moves when the next log starts.
+    if sign_handle != rh::NULL {
+        state.audit.digest.clear();
+    }
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -343,25 +342,39 @@ pub fn set_command_code_audit_status(
     let set_list = TpmlCc::unmarshal(&mut r)?;
     let clear_list = TpmlCc::unmarshal(&mut r)?;
 
-    if audit_alg != alg::NULL {
-        if !hash::is_supported(audit_alg) {
-            return Err(TpmRc(rc::HASH).with_parameter(1));
-        }
-        if audit_alg != state.audit.alg {
-            // Changing the algorithm restarts the digest.
-            state.audit.alg = audit_alg;
-            state.audit.digest.clear();
-        }
+    if audit_alg != alg::NULL && !hash::is_supported(audit_alg) {
+        return Err(TpmRc(rc::HASH).with_parameter(1));
     }
+    // Part 3 clause 21.2.1 lets one command change the algorithm or the list,
+    // never both.
+    if audit_alg != alg::NULL && audit_alg != state.audit.alg {
+        if !set_list.items.is_empty() || !clear_list.items.is_empty() {
+            return Err(TpmRc(rc::VALUE).with_parameter(1));
+        }
+        state.audit.alg = audit_alg;
+        state.audit.digest.clear();
+        // Changing the algorithm is not itself an audited event.
+        state.command_audit_suppressed = true;
+        return respond(|_| Ok(()));
+    }
+
+    // A command code that is not implemented or that is already in the state
+    // asked for is not an error, it simply changes nothing. setList is applied
+    // first so a code in both lists ends up not audited.
     for code in &set_list.items {
         if super::table::lookup(*code).is_none() {
-            return Err(TpmRc(rc::VALUE).with_parameter(2));
+            continue;
         }
         if !state.audit.commands.contains(code) {
             state.audit.commands.push(*code);
         }
     }
     for code in &clear_list.items {
+        // TPM2_SetCommandCodeAuditStatus is always audited, so asking to
+        // clear it is ignored.
+        if *code == cc::SetCommandCodeAuditStatus {
+            continue;
+        }
         state.audit.commands.retain(|c| c != code);
     }
     state.audit.commands.sort_unstable();
