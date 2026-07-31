@@ -20,7 +20,7 @@ use crate::tpm::structures::signature::{Ticket, TpmtSignature, VerifiedTicket};
 use super::crypto::{
     check_digest_size, check_signature_scheme, check_signing_key, sign_digest, sign_message,
     signing_scheme, signs_a_message, verified_ticket_hmac, verify_digest_public,
-    verify_hash_ticket, verify_message,
+    verify_hash_ticket, verify_message, with_counter_parameter,
 };
 use super::dispatch::{Request, Response};
 use super::execute::{respond, respond_with_handle};
@@ -123,7 +123,8 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
         }
         verify_hash_ticket(state, &validation, hash_alg, digest.as_slice(), 3)?;
     }
-    let signature = sign_digest(state, &object, &scheme, digest.as_slice())?;
+    let signature = sign_digest(state, &object, &scheme, digest.as_slice())
+        .map_err(|e| with_counter_parameter(e, &object, 1))?;
     respond(move |w| {
         signature.marshal(w);
         Ok(())

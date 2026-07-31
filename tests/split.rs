@@ -769,6 +769,62 @@ fn an_ecdaa_attestation_hides_the_signer() {
 }
 
 #[test]
+fn a_bad_counter_names_the_parameter_that_carried_it() {
+    // Part 2 clause 6.6.2 adds TPM_RC_P and the parameter number when an error
+    // belongs to a parameter. The counter arrives in a different parameter of
+    // each command, so each one says which of its own.
+    let h = harness("qualify");
+    let (handle, _) = primary(&h, 0x001A, Some(0));
+
+    // TPM2_Sign carries it in inScheme, which is parameter 2.
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&[0x5au8; 32]);
+    p.u16(0x001A);
+    p.u16(alg::SHA256);
+    p.u16(4242); // never committed
+    p.u16(st::HASHCHECK);
+    p.u32(rh::NULL);
+    p.u16(0);
+    let r = send(
+        &h,
+        &command(
+            st::SESSIONS,
+            cc::Sign,
+            &[handle],
+            Some(&PASSWORD),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_ne!(r.code, rc::SUCCESS);
+    assert_eq!(r.code & 0x040, 0x040, "TPM_RC_P is not set: {:08x}", r.code);
+    assert_eq!((r.code >> 8) & 0xf, 2, "wrong parameter: {:08x}", r.code);
+
+    // TPM2_SignDigest carries it in context, which is parameter 1.
+    let mut p = Writer::new();
+    p.u16(2);
+    p.u16(4242);
+    p.u16(32);
+    p.bytes(&[0x11u8; 32]);
+    p.u16(st::HASHCHECK);
+    p.u32(rh::NULL);
+    p.u16(0);
+    let r = send(
+        &h,
+        &command(
+            st::SESSIONS,
+            cc::SignDigest,
+            &[handle],
+            Some(&PASSWORD),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_ne!(r.code, rc::SUCCESS);
+    assert_eq!(r.code & 0x040, 0x040, "TPM_RC_P is not set: {:08x}", r.code);
+    assert_eq!((r.code >> 8) & 0xf, 1, "wrong parameter: {:08x}", r.code);
+}
+
+#[test]
 fn two_phase_needs_an_unrestricted_decryption_key() {
     // Part 3 Table 54 names keyA "handle of an unrestricted ECC decryption
     // key". A signing key or a restricted one used as a key agreement scalar

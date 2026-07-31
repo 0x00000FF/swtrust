@@ -59,6 +59,7 @@ fn attest_and_sign(
     in_scheme: &Scheme,
     extra_data: &Tpm2bData,
     attested: Attested,
+    scheme_parameter: usize,
 ) -> TpmResult<(Tpm2bAttest, TpmtSignature)> {
     let (object, scheme) = if sign_handle == rh::NULL {
         (None, None)
@@ -120,7 +121,12 @@ fn attest_and_sign(
             } else {
                 hash::digest(hash_alg, &body)?
             };
-            sign_digest(state, &object, &scheme, &digest)?
+            // Part 2 clause 6.6.2 names the parameter an error belongs to,
+            // and for a commit counter that is the scheme this command was
+            // given.
+            sign_digest(state, &object, &scheme, &digest).map_err(|e| {
+                super::crypto::with_counter_parameter(e, &object, scheme_parameter)
+            })?
         }
         _ => TpmtSignature::null(),
     };
@@ -149,7 +155,7 @@ pub fn certify(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         qualified_name: Tpm2bName::from_slice(&object.qualified_name)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested)
+        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)
             .map_err(|e| if e.0 & 0xF00 == 0x100 { e.with_handle(2) } else { e })?;
     respond(move |w| {
         info.marshal(w);
@@ -209,7 +215,7 @@ pub fn certify_creation(state: &mut TpmState, request: &Request) -> TpmResult<Re
         creation_hash: creation_hash.clone(),
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested)?;
+        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 3)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -243,7 +249,7 @@ pub fn quote(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         pcr_digest: Tpm2bDigest::new(pcr_digest)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested)?;
+        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -267,7 +273,7 @@ pub fn get_time(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
         firmware_version: crate::tpm::config::FIRMWARE_VERSION_1 as u64,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested)?;
+        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -307,7 +313,7 @@ pub fn nv_certify(state: &mut TpmState, request: &Request) -> TpmResult<Response
         nv_contents: Tpm2bMaxNvBuffer::new(data)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested)?;
+        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -338,7 +344,7 @@ pub fn get_session_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
         session_digest: Tpm2bDigest::from_slice(&session.audit.digest)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested)?;
+        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -371,7 +377,7 @@ pub fn get_command_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
         command_digest: Tpm2bDigest::new(command_digest)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested)?;
+        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
     // Part 1 clause 32 ends the audit log when the command returns a
     // signature, so a report taken with TPM_RH_NULL leaves the log running.
     // The counter is not touched here; it moves when the next log starts.
@@ -525,6 +531,7 @@ mod tests {
                 time: TimeInfo::default(),
                 firmware_version: 1,
             },
+            2,
         )
         .unwrap();
         assert!(signature.is_null());

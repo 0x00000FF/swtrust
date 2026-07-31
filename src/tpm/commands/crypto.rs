@@ -168,6 +168,26 @@ pub fn check_signing_key(object: &Object) -> TpmResult<()> {
     Ok(())
 }
 
+/// Name the parameter a commit counter failure came from.
+///
+/// Part 2 clause 6.6.2 adds TPM_RC_P and the parameter number when an error
+/// belongs to a parameter, and allows zero only when the TPM cannot say which.
+/// sign_digest serves several commands that number their parameters
+/// differently, so it answers unqualified and each command says which of its
+/// own parameters carried the counter.
+pub fn with_counter_parameter(e: TpmRc, object: &Object, parameter: usize) -> TpmRc {
+    let uses_counter = object
+        .public
+        .scheme()
+        .map(|s| s.scheme == alg::ECDAA)
+        .unwrap_or(false);
+    if uses_counter && matches!(e.value(), v if v == rc::RANGE || v == rc::VALUE) {
+        e.with_parameter(parameter)
+    } else {
+        e
+    }
+}
+
 /// Sign a whole message, Part 3 Table 115.
 ///
 /// An HMAC key takes the message itself. Every other algorithm signs the
@@ -737,7 +757,8 @@ pub fn sign(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         }
         verify_hash_ticket(state, &validation, hash_alg, digest.as_slice(), 3)?;
     }
-    let signature = sign_digest(state, &object, &scheme, digest.as_slice())?;
+    let signature = sign_digest(state, &object, &scheme, digest.as_slice())
+        .map_err(|e| with_counter_parameter(e, &object, 2))?;
     respond(move |w| {
         signature.marshal(w);
         Ok(())

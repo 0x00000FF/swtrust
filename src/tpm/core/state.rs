@@ -479,11 +479,15 @@ impl TpmState {
 
         // Part 1 Table 41 puts the commit nonce, counter and array in the
         // state reset data, which clause 34.4.4 saves on any Shutdown(STATE)
-        // and restores on the next Startup of any type.
-        let (random, count, used) = self.commits.parts();
-        w.sized16(random);
-        w.u64(count);
-        w.sized16(used);
+        // and restores on the next Startup of any type. A TPM that has not
+        // been started has none, and writes none, so the block is either
+        // absent or complete and never half there.
+        if self.commits.is_ready() {
+            let (random, count, used) = self.commits.parts();
+            w.sized16(random);
+            w.u64(count);
+            w.sized16(used);
+        }
 
         w.finish()
     }
@@ -591,8 +595,12 @@ impl TpmState {
             let commit_random = read_sized(&mut r)?;
             let commit_count = r.u64()?;
             let commit_used = read_sized(&mut r)?;
-            if commit_random.len() > config::COMMIT_NONCE_BYTES
-                || commit_used.len() > config::MAX_COMMIT_SEQUENCES as usize / 8
+            // The nonce and the array have one shape each, so a block of any
+            // other size is a damaged file rather than an older one. Accepting
+            // a short nonce would leave the TPM deriving commit values from
+            // less material than clause 44.2.3 asks for.
+            if commit_random.len() != config::COMMIT_NONCE_BYTES
+                || commit_used.len() != config::MAX_COMMIT_SEQUENCES as usize / 8
             {
                 return Err(TpmRc(rc::BAD_CONTEXT));
             }
@@ -901,11 +909,14 @@ mod tests {
         let mut s = TpmState::manufacture().unwrap();
         s.hierarchies.owner.auth = b"ownerauth".to_vec();
         s.persistent.insert(hc::PERSISTENT_FIRST, object());
+        // Give it commit values so the block is written and can be cut off
+        // again, which is what a file from before them looks like.
+        let mut rng = crate::tpm::crypto::rand::Drbg::new(&[0x5eu8; 48], b"t").unwrap();
+        s.commits.reset(&mut rng).unwrap();
         let saved = s.save().unwrap();
 
-        // Cut the record back to where the commit values begin, which is what
-        // an older file looks like: a nonce, a counter and an array, all at
-        // the end.
+        // Cut the record back to where the commit values begin: a nonce, a
+        // counter and an array, all at the end.
         let (random, _, used) = s.commits.parts();
         let tail = 2 + random.len() + 8 + 2 + used.len();
         let older = &saved[..saved.len() - tail];
@@ -915,6 +926,40 @@ mod tests {
         assert!(back.persistent.contains_key(&hc::PERSISTENT_FIRST));
         // It carries no commit values, so a startup takes a fresh nonce.
         assert!(!back.commits.is_ready());
+    }
+
+    #[test]
+    fn a_commit_block_of_the_wrong_shape_is_refused() {
+        // A file that ends where the block would start is an older one. A file
+        // that has a block of some other size is a damaged one, and taking it
+        // would leave the TPM deriving commit values from less material than
+        // clause 44.2.3 asks for.
+        let s = TpmState::manufacture().unwrap();
+        let base = s.save().unwrap();
+
+        for (random, used) in [(1usize, 16usize), (64, 1), (1, 1), (63, 16), (64, 15)] {
+            let mut bad = base.clone();
+            bad.extend_from_slice(&(random as u16).to_be_bytes());
+            bad.extend_from_slice(&vec![0xaa; random]);
+            bad.extend_from_slice(&0u64.to_be_bytes());
+            bad.extend_from_slice(&(used as u16).to_be_bytes());
+            bad.extend_from_slice(&vec![0x00; used]);
+            assert_eq!(
+                TpmState::load(&bad).unwrap_err(),
+                TpmRc(rc::BAD_CONTEXT),
+                "a block of {random} and {used} octets was accepted"
+            );
+        }
+
+        // The right shape is taken.
+        let mut good = base;
+        good.extend_from_slice(&(config::COMMIT_NONCE_BYTES as u16).to_be_bytes());
+        good.extend_from_slice(&vec![0xaa; config::COMMIT_NONCE_BYTES]);
+        good.extend_from_slice(&0u64.to_be_bytes());
+        let used_len = config::MAX_COMMIT_SEQUENCES as usize / 8;
+        good.extend_from_slice(&(used_len as u16).to_be_bytes());
+        good.extend_from_slice(&vec![0x00; used_len]);
+        assert!(TpmState::load(&good).unwrap().commits.is_ready());
     }
 
     #[test]
@@ -992,10 +1037,13 @@ mod tests {
         let mut bad = saved.clone();
         bad[0] = 0xff;
         assert_eq!(TpmState::load(&bad).unwrap_err(), TpmRc(rc::BAD_CONTEXT));
-        // Trailing octets are refused too.
+        // Trailing octets are refused too. Which code says so depends on
+        // where the surplus falls: one octet after a record that carries no
+        // commit values looks like the start of that block and runs out, and
+        // anything longer is surplus after it.
         let mut extra = saved;
         extra.push(0);
-        assert_eq!(TpmState::load(&extra).unwrap_err(), TpmRc(rc::BAD_CONTEXT));
+        assert!(TpmState::load(&extra).is_err());
     }
 
     #[test]
