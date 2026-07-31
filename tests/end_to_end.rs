@@ -1820,6 +1820,73 @@ fn a_dup_role_handle_needs_a_policy_session() {
 }
 
 #[test]
+fn trailing_parameter_octets_are_refused_without_changing_anything() {
+    let h = Harness::started("trailing");
+
+    // Set ownerAuth so a successful TPM2_Clear would be visible.
+    let mut p = Writer::new();
+    p.u16(6);
+    p.bytes(b"secret");
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+
+    // TPM2_Clear has no parameters. Part 3 clause 5.8.2 refuses a buffer that
+    // carries more than the schematic defines.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Clear,
+        &[rh::LOCKOUT],
+        Some(&password(b"")),
+        &[0xde, 0xad, 0xbe, 0xef],
+    ));
+    assert_eq!(r.code, rc::SIZE, "trailing octets -> {:08x}", r.code);
+
+    // The refusal happened before the command ran, so ownerAuth is untouched.
+    let mut p = Writer::new();
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code & 0x03f,
+        rc::AUTH_FAIL & 0x03f,
+        "TPM2_Clear ran despite the error"
+    );
+
+    // The same command without the trailing octets is accepted.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Clear,
+        &[rh::LOCKOUT],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "TPM2_Clear -> {:08x}", r.code);
+
+    // And now the empty owner authorization works again.
+    let mut p = Writer::new();
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+}
+
+#[test]
 fn the_vendor_test_command_echoes_its_input() {
     let h = Harness::started("vendor");
     let mut p = Writer::new();

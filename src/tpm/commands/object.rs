@@ -580,9 +580,11 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
     }
-    // A sensitive area may only be supplied under the NULL hierarchy.
+    // A sensitive area may only be supplied under the NULL hierarchy. A
+    // sensitive area that is present but holds nothing is still present, so it
+    // is checked rather than read as absent.
     let sensitive = match in_private {
-        Some(s) if !s.sensitive_area.sensitive.as_slice().is_empty() => {
+        Some(s) => {
             if hierarchy != rh::NULL {
                 return Err(TpmRc(rc::HIERARCHY).with_parameter(3));
             }
@@ -593,7 +595,7 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
                 .map_err(|e| e.with_parameter(1))?;
             Some(s.sensitive_area)
         }
-        _ => None,
+        None => None,
     };
     if hierarchy != rh::NULL && !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(hierarchy)
     {

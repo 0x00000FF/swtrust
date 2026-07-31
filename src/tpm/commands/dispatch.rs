@@ -40,6 +40,11 @@ pub struct SessionInput {
 /// A parsed command, ready to run.
 #[derive(Debug)]
 pub struct Request {
+    /// How far into the parameter area the command has read.
+    ///
+    /// A command builds its own reader, so this records what that reader
+    /// reached and lets the dispatcher check that nothing was left over.
+    pub consumed: std::cell::Cell<usize>,
     pub info: &'static CommandInfo,
     pub tag: u16,
     pub code: u32,
@@ -52,8 +57,20 @@ pub struct Request {
 
 impl Request {
     /// A reader over the parameter area.
-    pub fn reader(&self) -> Reader<'_> {
-        Reader::new(&self.parameters)
+    pub fn reader(&self) -> TrackedReader<'_> {
+        TrackedReader {
+            inner: Reader::new(&self.parameters),
+            consumed: &self.consumed,
+        }
+    }
+
+    /// True when the command read every octet of its parameter area.
+    ///
+    /// Part 3 clause 5.8.2 refuses a command whose parameter area holds more
+    /// than the schematic defines, so trailing octets cannot ride along with
+    /// an otherwise valid command.
+    pub fn parameters_fully_read(&self) -> bool {
+        self.consumed.get() >= self.parameters.len()
     }
 
     /// The handle at `index`, or TPM_RC_VALUE when there are fewer.
@@ -108,6 +125,38 @@ pub struct Entity {
     /// hierarchy, and for an object only when TPMA_OBJECT.adminWithPolicy is
     /// SET.
     pub admin_with_policy: bool,
+}
+
+/// A reader over a command parameter area that records how far it got.
+///
+/// It behaves as a [`Reader`] in every way, so a command reads through it
+/// without knowing it is being watched.
+pub struct TrackedReader<'a> {
+    inner: Reader<'a>,
+    consumed: &'a std::cell::Cell<usize>,
+}
+
+impl<'a> std::ops::Deref for TrackedReader<'a> {
+    type Target = Reader<'a>;
+
+    fn deref(&self) -> &Reader<'a> {
+        &self.inner
+    }
+}
+
+impl<'a> std::ops::DerefMut for TrackedReader<'a> {
+    fn deref_mut(&mut self) -> &mut Reader<'a> {
+        &mut self.inner
+    }
+}
+
+impl Drop for TrackedReader<'_> {
+    fn drop(&mut self) {
+        let reached = self.inner.position();
+        if reached > self.consumed.get() {
+            self.consumed.set(reached);
+        }
+    }
 }
 
 /// Resolve the Name of a handle for the cpHash.
@@ -332,6 +381,7 @@ pub fn parse(state: &TpmState, buf: &[u8], locality: u8) -> TpmResult<Request> {
     let parameters = r.take_rest().to_vec();
     let _ = state;
     Ok(Request {
+        consumed: std::cell::Cell::new(0),
         info,
         tag: header.tag,
         code: header.code,

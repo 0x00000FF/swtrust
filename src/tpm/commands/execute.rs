@@ -45,6 +45,12 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         return Err(TpmRc(rc::PP));
     }
 
+    // A command whose schematic has no parameters is refused here rather than
+    // after it has run, so a malformed buffer cannot change anything.
+    if super::handles::takes_no_parameters(request.code) && !request.parameters.is_empty() {
+        return Err(TpmRc(rc::SIZE));
+    }
+
     // Part 3 clause 5.4 refuses a handle whose value the command syntax does
     // not allow, before anything is done with the entity it names.
     for (index, handle) in request.handles.iter().enumerate() {
@@ -111,6 +117,13 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
 
     state.command_audit_suppressed = false;
     let response = super::run_command(state, &request)?;
+
+    // Part 3 clause 5.8.2 refuses a command whose parameter area holds more
+    // than its schematic defines. The command has now read what it expects,
+    // so anything left over means the buffer was not the command it claimed.
+    if !request.parameters_fully_read() {
+        return Err(TpmRc(rc::SIZE));
+    }
 
     // The response nonces are rolled forward before the response parameter is
     // encrypted, because Part 1 clause 21.3 keys that encryption with the new

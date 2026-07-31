@@ -234,6 +234,43 @@ pub fn role(code: u32, index: usize) -> Role {
         .unwrap_or(Role::User)
 }
 
+/// True for a command whose schematic defines no parameters.
+///
+/// Part 3 clause 5.8.2 refuses a command that carries more than its schematic
+/// defines. For these the check needs nothing from the command itself, so it
+/// runs before the command does and no state changes on a malformed buffer.
+pub fn takes_no_parameters(code: u32) -> bool {
+    matches!(
+        code,
+        cc::ChangeEPS
+            | cc::ChangePPS
+            | cc::Clear
+            | cc::ContextSave
+            | cc::DictionaryAttackLockReset
+            | cc::ECDH_KeyGen
+            | cc::Encapsulate
+            | cc::GetTestResult
+            | cc::NV_GlobalWriteLock
+            | cc::NV_Increment
+            | cc::NV_ReadLock
+            | cc::NV_ReadPublic
+            | cc::NV_ReadPublic2
+            | cc::NV_UndefineSpace
+            | cc::NV_UndefineSpaceSpecial
+            | cc::NV_WriteLock
+            | cc::PCR_Reset
+            | cc::PolicyAuthValue
+            | cc::PolicyAuthorizeNV
+            | cc::PolicyGetDigest
+            | cc::PolicyPassword
+            | cc::PolicyPhysicalPresence
+            | cc::PolicyRestart
+            | cc::ReadClock
+            | cc::ReadPublic
+            | cc::Unseal
+    )
+}
+
 /// True when `handle` is a value the interface type allows.
 ///
 /// Only the shape of the handle is judged here. Whether the entity exists is
