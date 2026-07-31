@@ -610,6 +610,38 @@ impl SessionSlots {
         self.sessions.remove(&handle).ok_or(TpmRc(rc::HANDLE))
     }
 
+    /// Drop a session for TPM2_FlushContext.
+    ///
+    /// Part 3 clause 28.4.1 flushes a session whether it is loaded or only
+    /// saved, and ignores the upper octet of the handle, so a caller may name
+    /// a session by its index alone. A handle that references neither is
+    /// TPM_RC_HANDLE.
+    pub fn flush(&mut self, handle: u32) -> TpmResult<()> {
+        for candidate in self.flush_candidates(handle) {
+            let loaded = self.sessions.remove(&candidate).is_some();
+            let saved = self.saved.remove(&candidate).is_some();
+            if loaded || saved {
+                return Ok(());
+            }
+        }
+        Err(TpmRc(rc::HANDLE))
+    }
+
+    /// The handles a flush request could mean, most exact first.
+    fn flush_candidates(&self, handle: u32) -> Vec<u32> {
+        let index = handle & 0x00FF_FFFF;
+        let mut out = vec![handle];
+        for base in [hc::HMAC_SESSION_FIRST, hc::POLICY_SESSION_FIRST] {
+            let aliased = (base & 0xFF00_0000) | index;
+            if aliased != handle && (self.sessions.contains_key(&aliased)
+                || self.saved.contains_key(&aliased))
+            {
+                out.push(aliased);
+            }
+        }
+        out
+    }
+
     /// Move a session out of memory, keeping its handle reserved.
     pub fn save(&mut self, handle: u32) -> TpmResult<(Session, u64)> {
         let session = self.sessions.remove(&handle).ok_or(TpmRc(rc::HANDLE))?;
@@ -668,6 +700,24 @@ impl SessionSlots {
 pub fn is_session_handle(handle: u32) -> bool {
     (hc::HMAC_SESSION_FIRST..=hc::HMAC_SESSION_LAST).contains(&handle)
         || (hc::POLICY_SESSION_FIRST..=hc::POLICY_SESSION_LAST).contains(&handle)
+}
+
+/// True when `handle` could name a session for TPM2_FlushContext.
+///
+/// Part 3 clause 28.4.1 ignores the upper octet of a session handle there, so
+/// a handle whose lower three octets fall in the session index range counts,
+/// whatever the octet above them says. The example in that clause flushes
+/// session 0x03000000 through the handle 0x20000000.
+pub fn is_flushable_session(handle: u32) -> bool {
+    if is_session_handle(handle) {
+        return true;
+    }
+    // A transient object handle names an object, not a session.
+    if crate::tpm::core::object::ObjectSlots::is_transient(handle) {
+        return false;
+    }
+    let index = handle & 0x00FF_FFFF;
+    index < config::MAX_ACTIVE_SESSIONS as u32
 }
 
 /// True when `session_type` is one of the three defined values.
@@ -890,6 +940,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.policy.digest, expected);
+    }
+
+    #[test]
+    fn a_saved_session_can_be_flushed() {
+        // Part 3 clause 28.4.1: a session need not be loaded to be flushed,
+        // and its saved context is invalidated.
+        let mut slots = SessionSlots::new();
+        let handle = slots.allocate_handle(se::POLICY).unwrap();
+        slots.insert(session_with(handle, se::POLICY)).unwrap();
+        slots.save(handle).unwrap();
+        assert_eq!(slots.len(), 0, "the session is saved, not loaded");
+        assert_eq!(slots.active(), 1);
+
+        slots.flush(handle).unwrap();
+        assert_eq!(slots.active(), 0, "the saved context is gone");
+
+        // A handle that names neither a loaded nor a saved session is refused.
+        assert_eq!(slots.flush(handle).unwrap_err(), TpmRc(rc::HANDLE));
+    }
+
+    #[test]
+    fn the_upper_octet_of_a_flushed_session_handle_is_ignored() {
+        let mut slots = SessionSlots::new();
+        let handle = slots.allocate_handle(se::POLICY).unwrap();
+        slots.insert(session_with(handle, se::POLICY)).unwrap();
+
+        // The clause 28.4.1 example: 0x20000000 flushes 0x03000000.
+        let aliased = 0x2000_0000 | (handle & 0x00FF_FFFF);
+        assert!(is_flushable_session(aliased));
+        slots.flush(aliased).unwrap();
+        assert_eq!(slots.active(), 0);
+    }
+
+    /// A session with the given handle and type, for the flush tests.
+    fn session_with(handle: u32, session_type: u8) -> Session {
+        Session::new(
+            handle,
+            session_type,
+            alg::SHA256,
+            vec![0u8; 32],
+            vec![0u8; 32],
+            Vec::new(),
+            crate::tpm::constants::rh::NULL,
+            Vec::new(),
+            SymDef::null(),
+        )
+        .unwrap()
     }
 
     #[test]

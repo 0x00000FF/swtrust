@@ -1235,10 +1235,12 @@ pub fn flush_context(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let handle = r.u32()?;
     r.expect_end()?;
 
-    if session::is_session_handle(handle) {
+    // Part 3 clause 28.4.1 ignores the upper octet of a session handle, so a
+    // handle in any range that resolves to a session is taken as one.
+    if session::is_flushable_session(handle) {
         state
             .sessions
-            .remove(handle)
+            .flush(handle)
             .map_err(|e| e.with_parameter(1))?;
         // Part 1 clause 17.2 gives up exclusivity when the session that held
         // it is flushed.
