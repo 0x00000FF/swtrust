@@ -269,10 +269,10 @@ pub fn allows(handle_spec: Handle, handle: u32) -> bool {
         }
         Kind::Pcr => (hc::PCR_FIRST..=hc::PCR_LAST).contains(&handle),
         Kind::Context => session::is_session_handle(handle) || ObjectSlots::is_transient(handle),
-        Kind::PolicySession => {
-            (hc::POLICY_SESSION_FIRST..hc::POLICY_SESSION_FIRST + 0x0100_0000).contains(&handle)
-                && handle >> 24 == hc::POLICY_SESSION_FIRST >> 24
-        }
+        // A session handle is judged by its range alone. Whether that session
+        // is loaded, and whether it is of the type the command needs, is the
+        // business of the command, which has its own response code for it.
+        Kind::PolicySession => handle >> 24 == hc::POLICY_SESSION_FIRST >> 24,
         Kind::HmacSession => handle >> 24 == hc::HMAC_SESSION_FIRST >> 24,
         Kind::AuthSession => session::is_session_handle(handle) || handle == rh::RS_PW,
         Kind::NvIndex => NvStore::is_nv_handle(handle),
