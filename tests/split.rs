@@ -68,12 +68,16 @@ fn command(tag: u16, code: u32, handles: &[u32], auth: Option<&[u8]>, params: &[
     w.finish().unwrap()
 }
 
-fn send(h: &Harness, buf: &[u8]) -> Answer {
-    let out = h.tpm.execute(0, buf);
+fn send_to(tpm: &Tpm, buf: &[u8]) -> Answer {
+    let out = tpm.execute(0, buf);
     Answer {
         code: u32::from_be_bytes([out[6], out[7], out[8], out[9]]),
         body: out[10..].to_vec(),
     }
+}
+
+fn send(h: &Harness, buf: &[u8]) -> Answer {
+    send_to(&h.tpm, buf)
 }
 
 const PASSWORD: [u8; 9] = [0x40, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -84,8 +88,47 @@ const SIGNING: u32 = 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000;
 /// what Part 3 Table 54 calls an unrestricted ECC decryption key.
 const DECRYPTING: u32 = 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0002_0000;
 
+/// The template an ECDAA signing key uses, which several tests want.
+fn ecdaa_template() -> Vec<u8> {
+    template_for(SIGNING, 0x001A, Some(0))
+}
+
 /// A primary ECC key on P-256 with the given attributes and signing scheme.
 fn primary_with(h: &Harness, attrs: u32, scheme: u16, count: Option<u16>) -> (u32, Vec<u8>) {
+    create_primary(&h.tpm, &template_for(attrs, scheme, count))
+}
+
+/// Create a primary key from a marshalled template.
+fn create_primary(tpm: &Tpm, template: &[u8]) -> (u32, Vec<u8>) {
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(template);
+    p.u16(0);
+    p.u32(0);
+    let r = send_to(
+        tpm,
+        &command(
+            st::SESSIONS,
+            cc::CreatePrimary,
+            &[rh::OWNER],
+            Some(&PASSWORD),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let handle = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+    let mut rd = Reader::new(&r.body[4..]);
+    rd.u32().unwrap();
+    let public_size = rd.u16().unwrap() as usize;
+    let public = rd.take(public_size).unwrap().to_vec();
+    (handle, public)
+}
+
+/// The marshalled template for those attributes and scheme.
+fn template_for(attrs: u32, scheme: u16, count: Option<u16>) -> Vec<u8> {
     let mut t = Writer::new();
     t.u16(alg::ECC);
     t.u16(alg::SHA256);
@@ -103,35 +146,7 @@ fn primary_with(h: &Harness, attrs: u32, scheme: u16, count: Option<u16>) -> (u3
     t.u16(0x0010); // kdf NULL
     t.u16(0);
     t.u16(0);
-    let template = t.finish().unwrap();
-
-    let mut p = Writer::new();
-    p.u16(4);
-    p.u16(0);
-    p.u16(0);
-    p.u16(template.len() as u16);
-    p.bytes(&template);
-    p.u16(0);
-    p.u32(0);
-    let r = send(
-        h,
-        &command(
-            st::SESSIONS,
-            cc::CreatePrimary,
-            &[rh::OWNER],
-            Some(&PASSWORD),
-            &p.finish().unwrap(),
-        ),
-    );
-    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
-    let handle = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
-
-    // Read the public point back out of the response.
-    let mut rd = Reader::new(&r.body[4..]);
-    rd.u32().unwrap(); // parameterSize
-    let public_size = rd.u16().unwrap() as usize;
-    let public = rd.take(public_size).unwrap().to_vec();
-    (handle, public)
+    t.finish().unwrap()
 }
 
 /// A primary ECC signing key, which is what the commit tests want.
@@ -579,6 +594,89 @@ fn the_version_185_signing_commands_take_the_commit_counter() {
     let mut rd = Reader::new(&r.body);
     rd.u32().unwrap();
     assert_eq!(rd.u16().unwrap(), 0x001A, "the signature is an ECDAA one");
+}
+
+#[test]
+fn a_commit_survives_a_new_tpm_built_from_the_state_file() {
+    // Part 1 clause 34.4.4 saves the commit values to NV on Shutdown(STATE).
+    // The in process resume keeps them in memory, so this one throws the TPM
+    // away and builds another from the file, which is what a restarted daemon
+    // does.
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "swtrust-split-file-{}-{}",
+        std::process::id(),
+        swtrust::util::time::unix_millis_now()
+    ));
+    let logger = Arc::new(Logger::new(dir.join("logs"), false).unwrap());
+    let state_dir = dir.join("state");
+
+    let counter = {
+        // Not a Harness, because that removes the directory when it is
+        // dropped and the second TPM needs the file that is in it.
+        let tpm = Tpm::new(&state_dir, logger.clone()).unwrap();
+        tpm.power_on();
+        let r = send_to(&tpm, &command(st::NO_SESSIONS, cc::Startup, &[], None, &[0, 0]));
+        assert_eq!(r.code, rc::SUCCESS);
+        let template = ecdaa_template();
+        let (handle, _) = create_primary(&tpm, &template);
+        let r = send_to(
+            &tpm,
+            &command(
+                st::SESSIONS,
+                cc::Commit,
+                &[handle],
+                Some(&PASSWORD),
+                &empty_commit_params(),
+            ),
+        );
+        assert_eq!(r.code, rc::SUCCESS, "Commit -> {:08x}", r.code);
+        let (_, counter) = commit_response(&r.body);
+
+        // Shutdown(STATE) is what puts them in the file.
+        let r = send_to(
+            &tpm,
+            &command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]),
+        );
+        assert_eq!(r.code, rc::SUCCESS);
+        tpm.persist();
+        counter
+    };
+
+    // A second TPM over the same file, as a restarted daemon would build.
+    let tpm = Tpm::new(&state_dir, logger).unwrap();
+    tpm.power_on();
+    let h = Harness { tpm, dir };
+    let r = send(&h, &command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS, "Startup(STATE) -> {:08x}", r.code);
+
+    let (handle, _) = primary(&h, 0x001A, Some(0));
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&[0x5au8; 32]);
+    p.u16(0x001A);
+    p.u16(alg::SHA256);
+    p.u16(counter);
+    p.u16(st::HASHCHECK);
+    p.u32(rh::NULL);
+    p.u16(0);
+    let r = send(
+        &h,
+        &command(
+            st::SESSIONS,
+            cc::Sign,
+            &[handle],
+            Some(&PASSWORD),
+            &p.finish().unwrap(),
+        ),
+    );
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a commit did not survive the state file -> {:08x}",
+        r.code
+    );
+    // The Harness removes the directory when it goes.
 }
 
 #[test]
