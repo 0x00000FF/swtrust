@@ -92,6 +92,12 @@ pub struct ClockState {
     pub safe: bool,
     /// Resets over the life of the TPM, which never clears.
     pub total_reset_count: u32,
+    /// Identifies the run of Time the TPM is in.
+    ///
+    /// Time restarts from zero at every _TPM_Init, so a timeout expressed in
+    /// Time only means something within one epoch. Part 3 clause 23.2.2 uses
+    /// this to expire an authorization whose epoch has passed.
+    pub time_epoch: u64,
 }
 
 impl Marshal for ClockState {
@@ -101,6 +107,7 @@ impl Marshal for ClockState {
         w.u32(self.restart_count);
         w.u8(u8::from(self.safe));
         w.u32(self.total_reset_count);
+        w.u64(self.time_epoch);
     }
 }
 
@@ -113,6 +120,7 @@ impl Unmarshal for ClockState {
             restart_count: r.u32()?,
             safe: r.u8()? != 0,
             total_reset_count: r.u32()?,
+            time_epoch: r.u64()?,
         })
     }
 }
@@ -323,6 +331,9 @@ impl TpmState {
         self.startup_clear = StartupClearAttributes(attributes);
         self.started = true;
         self.shutdown_type = su::NONE;
+        // Time started again from zero, so this is a new epoch and any
+        // timeout recorded against the previous one has passed.
+        self.clock.time_epoch = self.clock.time_epoch.wrapping_add(1);
     }
 
     /// Record that RAM backed NV data has moved away from what NV holds.

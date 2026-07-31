@@ -17,7 +17,8 @@ use crate::tpm::structures::schemes::{EccPoint, Scheme, Tpm2bEccPoint};
 use crate::tpm::structures::signature::{Ticket, TpmtSignature, VerifiedTicket};
 
 use super::crypto::{
-    sign_digest, signing_scheme, verified_ticket_hmac, verify_digest_public, verify_hash_ticket,
+    sign_digest, sign_message, signing_scheme, signs_a_message, verified_ticket_hmac,
+    verify_digest_public, verify_hash_ticket, verify_message,
 };
 use super::dispatch::{Request, Response};
 use super::execute::{respond, respond_with_handle};
@@ -67,6 +68,11 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }
+    // Part 3 Table 115 leaves HMAC out of the digest commands, because an
+    // HMAC key signs a message.
+    if signs_a_message(&object) {
+        return Err(TpmRc(rc::SCHEME).with_handle(1));
+    }
     let scheme = signing_scheme(&object, &Scheme::null())?;
     let restricted = object
         .public
@@ -99,6 +105,10 @@ pub fn verify_digest_signature(state: &TpmState, request: &Request) -> TpmResult
     check_no_context(&context, 1)?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
+    // Part 3 Table 115 leaves HMAC out of the digest commands.
+    if signs_a_message(object) {
+        return Err(TpmRc(rc::SCHEME).with_handle(1));
+    }
     verify_digest_public(object, digest.as_slice(), &signature)?;
 
     let hierarchy = object.hierarchy;
@@ -212,13 +222,25 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
     }
     let mut data = message.to_vec();
     data.extend_from_slice(buffer.as_slice());
-    let digest = hash::digest(hash_alg, &data)?;
+    let _ = hash_alg;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(2))?
         .clone();
+    // Part 3 clause 20.6 has no validation parameter, so a restricted HMAC
+    // key, which signs only digests the TPM made, cannot be used here.
+    if signs_a_message(&object)
+        && object
+            .public
+            .object_attributes
+            .has(ObjectAttributes::RESTRICTED)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
+    }
     let scheme = signing_scheme(&object, &Scheme::null())?;
-    let signature = sign_digest(state, &object, &scheme, &digest)?;
+    // Part 3 Table 115: an HMAC key signs the message itself, everything else
+    // signs the digest of the message.
+    let signature = sign_message(state, &object, &scheme, &data)?;
     respond(move |w| {
         signature.marshal(w);
         Ok(())
@@ -277,10 +299,11 @@ pub fn verify_sequence_complete(state: &mut TpmState, request: &Request) -> TpmR
     if bound_handle != key_handle {
         return Err(TpmRc(rc::SIGN_CONTEXT_KEY).with_handle(2));
     }
-    let digest = hash::digest(hash_alg, message)?;
+    let _ = hash_alg;
+    let message = message.to_vec();
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(2))?;
-    verify_digest_public(object, &digest, &signature)?;
+    verify_message(object, &message, &signature)?;
 
     let hierarchy = object.hierarchy;
     let ticket = if hierarchy == rh::NULL {
@@ -292,10 +315,13 @@ pub fn verify_sequence_complete(state: &mut TpmState, request: &Request) -> TpmR
         }
     } else {
         let proof = state.hierarchy_proof(hierarchy)?.to_vec();
+        // Part 3 clause 20.3 verifies a message, so the ticket commits to the
+        // message itself and TPM2_PolicyAuthorize can recompute it from the
+        // approved policy and the policy reference.
         let hmac = verified_ticket_hmac(
             &proof,
             st::MESSAGE_VERIFIED,
-            &digest,
+            &message,
             &object.name,
             None,
         )?;

@@ -124,6 +124,73 @@ pub fn verify_hash_ticket(
     Ok(())
 }
 
+/// True when the object signs with HMAC.
+///
+/// Part 3 Table 115 splits the signing commands by whether the algorithm signs
+/// a message or a digest, and HMAC is the one message algorithm this TPM
+/// implements.
+pub fn signs_a_message(object: &Object) -> bool {
+    object.public.object_type == alg::KEYEDHASH
+}
+
+/// Sign a whole message, Part 3 Table 115.
+///
+/// An HMAC key takes the message itself. Every other algorithm signs the
+/// digest of the message under the hash of its scheme.
+pub fn sign_message(
+    state: &mut TpmState,
+    object: &Object,
+    scheme: &Scheme,
+    message: &[u8],
+) -> TpmResult<TpmtSignature> {
+    if !signs_a_message(object) {
+        let hash_alg = scheme.hash_alg().ok_or(TpmRc(rc::SCHEME))?;
+        let digest = hash::digest(hash_alg, message)?;
+        return sign_digest(state, object, scheme, &digest);
+    }
+    let Some(sensitive) = &object.sensitive else {
+        return Err(TpmRc(rc::HANDLE).with_handle(1));
+    };
+    let hash_alg = scheme.hash_alg().ok_or(TpmRc(rc::SCHEME))?;
+    Ok(TpmtSignature {
+        sig_alg: alg::HMAC,
+        signature: SignatureValue::Hmac(TpmtHa::new(
+            hash_alg,
+            mac::hmac(hash_alg, sensitive.sensitive.as_slice(), message)?,
+        )?),
+    })
+}
+
+/// Check a signature over a whole message, Part 3 Table 115.
+pub fn verify_message(
+    object: &Object,
+    message: &[u8],
+    signature: &TpmtSignature,
+) -> TpmResult<()> {
+    if !signs_a_message(object) {
+        let hash_alg = signature
+            .hash_alg()
+            .ok_or(TpmRc(rc::SCHEME).with_parameter(1))?;
+        let digest = hash::digest(hash_alg, message)?;
+        return verify_digest(object, &digest, signature);
+    }
+    let Some(sensitive) = &object.sensitive else {
+        return Err(TpmRc(rc::HANDLE).with_handle(1));
+    };
+    let SignatureValue::Hmac(mac_value) = &signature.signature else {
+        return Err(TpmRc(rc::SIGNATURE).with_parameter(1));
+    };
+    let expected = mac::hmac(
+        mac_value.hash_alg,
+        sensitive.sensitive.as_slice(),
+        message,
+    )?;
+    if !crate::tpm::core::protect::constant_time_eq(&expected, &mac_value.digest) {
+        return Err(TpmRc(rc::SIGNATURE).with_parameter(1));
+    }
+    Ok(())
+}
+
 /// The HMAC of a signature verification ticket.
 ///
 /// Every TPMT_TK_VERIFIED commits to its tag, the digest that was verified and
@@ -133,16 +200,20 @@ pub fn verify_hash_ticket(
 pub fn verified_ticket_hmac(
     proof: &[u8],
     tag: u16,
-    digest: &[u8],
+    signed: &[u8],
     name: &[u8],
     digest_alg: Option<u16>,
 ) -> TpmResult<Vec<u8>> {
-    let alg_field = digest_alg.unwrap_or(alg::NULL).to_be_bytes();
-    mac::hmac_parts(
-        config::CONTEXT_INTEGRITY_HASH_ALG,
-        proof,
-        &[&tag.to_be_bytes(), digest, name, &alg_field],
-    )
+    let tag_field = tag.to_be_bytes();
+    let mut parts: Vec<&[u8]> = vec![&tag_field, signed, name];
+    // Part 2 Table 111 gives metadata only to TPM_ST_DIGEST_VERIFIED, so
+    // nothing is added for the other two tags.
+    let alg_field;
+    if let Some(a) = digest_alg {
+        alg_field = a.to_be_bytes();
+        parts.push(&alg_field);
+    }
+    mac::hmac_parts(config::CONTEXT_INTEGRITY_HASH_ALG, proof, &parts)
 }
 
 /// TPM2_HMAC, Part 3 clause 15.5.

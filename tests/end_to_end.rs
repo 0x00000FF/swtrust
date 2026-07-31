@@ -1450,6 +1450,149 @@ fn the_version_185_signing_commands_follow_their_command_tables() {
     );
 }
 
+/// A keyed hash template that signs with HMAC-SHA256.
+fn hmac_signing_template() -> Vec<u8> {
+    let mut t = Writer::new();
+    t.u16(0x0008); // TPM_ALG_KEYEDHASH
+    t.u16(alg::SHA256);
+    // fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth | sign
+    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000);
+    t.u16(0); // authPolicy
+    t.u16(0x0005); // scheme TPM_ALG_HMAC
+    t.u16(alg::SHA256);
+    t.u16(0); // unique
+    t.finish().unwrap()
+}
+
+#[test]
+fn an_hmac_key_signs_the_message_and_not_a_digest() {
+    let h = Harness::started("hmacsign");
+
+    let template = hmac_signing_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let key = Reader::new(&r.body).u32().unwrap();
+
+    // Part 3 Table 115 marks HMAC unsupported for the digest commands.
+    let digest = swtrust::tpm::crypto::hash::digest(alg::SHA256, b"message").unwrap();
+    let mut p = Writer::new();
+    p.u16(0); // context
+    p.u16(32);
+    p.bytes(&digest);
+    p.u16(0x8024); // TPM_ST_HASHCHECK
+    p.u32(rh::NULL);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SignDigest,
+        &[key],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code & 0x03f, rc::SCHEME & 0x03f, "SignDigest -> {:08x}", r.code);
+
+    // The sequence commands do take an HMAC key, and Table 115 has them sign
+    // the message itself.
+    let mut p = Writer::new();
+    p.u16(0); // auth
+    p.u16(0); // context
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::SignSequenceStart,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "SignSequenceStart -> {:08x}", r.code);
+    let sequence = Reader::new(&r.body).u32().unwrap();
+
+    let mut auth = password(b"");
+    auth.extend_from_slice(&password(b""));
+    let mut p = Writer::new();
+    p.u16(7);
+    p.bytes(b"message");
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SignSequenceComplete,
+        &[sequence, key],
+        Some(&auth),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "SignSequenceComplete -> {:08x}",
+        r.code
+    );
+    let mut reader = Reader::new(&r.body);
+    let _param_size = reader.u32().unwrap();
+    let rest = reader.take_rest();
+    let signature = &rest[..rest.len() - 10];
+
+    // The signature is TPM_ALG_HMAC over the message, so it round trips
+    // through TPM2_VerifySequenceComplete.
+    assert_eq!(
+        u16::from_be_bytes([signature[0], signature[1]]),
+        0x0005,
+        "TPM_ALG_HMAC"
+    );
+    let signature = signature.to_vec();
+
+    let mut p = Writer::new();
+    p.u16(0);
+    p.u16(0);
+    p.u16(0);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::VerifySequenceStart,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "VerifySequenceStart -> {:08x}", r.code);
+    let verify_sequence = Reader::new(&r.body).u32().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(7);
+    p.bytes(b"message");
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SequenceUpdate,
+        &[verify_sequence],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "SequenceUpdate -> {:08x}", r.code);
+
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::VerifySequenceComplete,
+        &[verify_sequence, key],
+        Some(&password(b"")),
+        &signature,
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "VerifySequenceComplete -> {:08x}",
+        r.code
+    );
+}
+
 #[test]
 fn the_vendor_test_command_echoes_its_input() {
     let h = Harness::started("vendor");

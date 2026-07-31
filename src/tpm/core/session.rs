@@ -106,6 +106,15 @@ pub struct Session {
     /// counter, which Part 1 clause 16.8.7 carries into every use of the
     /// session because the session key holds that entity's authValue.
     pub bind_uses_lockout: bool,
+    /// The value of Time when the session was created.
+    ///
+    /// Part 3 clause 23.2.2 measures a bound authorization from here rather
+    /// than from when the authorization arrives, so a caller cannot extend the
+    /// limit the signer set by delaying the command.
+    pub start_time: u64,
+    /// The run of Time the session belongs to, so a timeout recorded against
+    /// an earlier one is seen as expired.
+    pub time_epoch: u64,
     /// The symmetric definition used for parameter encryption.
     pub symmetric: SymDef,
     /// Policy state, unused by an HMAC session.
@@ -140,6 +149,8 @@ impl Session {
             bind,
             bind_name,
             bind_uses_lockout: false,
+            start_time: 0,
+            time_epoch: 0,
             symmetric,
             policy: PolicyState {
                 digest: vec![0u8; digest_len],

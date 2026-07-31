@@ -204,6 +204,8 @@ fn marshal_session(session: &Session) -> TpmResult<Vec<u8>> {
     w.u32(session.bind);
     w.sized16(&session.bind_name);
     w.u8(u8::from(session.bind_uses_lockout));
+    w.u64(session.start_time);
+    w.u64(session.time_epoch);
     session.symmetric.marshal(&mut w);
     w.sized16(&session.policy.digest);
     // A saved audit session keeps auditing when it comes back, so its digest
@@ -229,6 +231,8 @@ fn unmarshal_session(body: &[u8]) -> TpmResult<Session> {
     let bind = r.u32()?;
     let bind_name = read(&mut r)?;
     let bind_uses_lockout = r.u8()? != 0;
+    let start_time = r.u64()?;
+    let time_epoch = r.u64()?;
     let symmetric = crate::tpm::structures::schemes::SymDef::unmarshal_sym_def(&mut r)?;
     let digest = read(&mut r)?;
     let is_audit = r.u8()? != 0;
@@ -246,6 +250,8 @@ fn unmarshal_session(body: &[u8]) -> TpmResult<Session> {
         symmetric,
     )?;
     session.bind_uses_lockout = bind_uses_lockout;
+    session.start_time = start_time;
+    session.time_epoch = time_epoch;
     session.policy.digest = digest;
     session.audit.is_audit = is_audit;
     session.audit.digest = audit_digest;
