@@ -199,15 +199,19 @@ pub fn dictionary_attack_parameters(
     request: &Request,
 ) -> TpmResult<Response> {
     let mut r = request.reader();
-    state.lockout.max_tries = r.u32()?;
-    state.lockout.recovery_time = r.u32()?;
-    state.lockout.lockout_recovery = r.u32()?;
-    if state.lockout.max_tries == 0 {
-        return Err(TpmRc(rc::VALUE).with_parameter(1));
-    }
+    let max_tries = r.u32()?;
+    let recovery_time = r.u32()?;
+    let lockout_recovery = r.u32()?;
+
+    state.lockout.max_tries = max_tries;
+    state.lockout.recovery_time = recovery_time;
+    state.lockout.lockout_recovery = lockout_recovery;
     // Setting the parameters also clears the counter.
     state.lockout.failed_tries = 0;
-    state.lockout.in_lockout = false;
+    // Part 3 clause 25.3.1 makes a maximum of zero a way to put the TPM in
+    // lockout outright, so no DA protected entity can be used until the
+    // parameters are set again.
+    state.lockout.in_lockout = max_tries == 0;
     respond(|_| Ok(()))
 }
 
@@ -217,9 +221,12 @@ pub fn pp_commands(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     let set = TpmlCc::unmarshal(&mut r)?;
     let clear = TpmlCc::unmarshal(&mut r)?;
 
+    // Part 3 clause 26.2.1 discards a command that cannot be gated rather than
+    // failing, and processes setList first so a command in both lists ends up
+    // not requiring physical presence.
     for code in &set.items {
         if !is_pp_eligible(*code) {
-            return Err(TpmRc(rc::VALUE).with_parameter(1));
+            continue;
         }
         if !state.pp_commands.contains(code) {
             state.pp_commands.push(*code);
@@ -252,11 +259,121 @@ pub fn read_only_control(state: &mut TpmState, request: &Request) -> TpmResult<R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tpm::constants::cc;
+    use crate::tpm::marshal::Writer;
 
     #[test]
     fn yes_no_only_accepts_zero_and_one() {
         assert!(!yes_no(0).unwrap());
         assert!(yes_no(1).unwrap());
         assert_eq!(yes_no(2).unwrap_err(), TpmRc(rc::VALUE));
+    }
+
+    /// A command buffer with a password authorization and these parameters.
+    fn authorized(code: u32, handle: u32, parameters: &[u8]) -> Vec<u8> {
+        let mut auth = Writer::new();
+        auth.u32(rh::RS_PW);
+        auth.u16(0);
+        auth.u8(0x01);
+        auth.u16(0);
+        let auth = auth.finish().unwrap();
+
+        let mut body = Writer::new();
+        body.u32(handle);
+        body.u32(auth.len() as u32);
+        body.bytes(&auth);
+        body.bytes(parameters);
+        let body = body.finish().unwrap();
+
+        let mut w = Writer::new();
+        w.u16(crate::tpm::constants::st::SESSIONS);
+        w.u32((10 + body.len()) as u32);
+        w.u32(code);
+        w.bytes(&body);
+        w.finish().unwrap()
+    }
+
+    fn response_code(buf: &[u8]) -> u32 {
+        u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]])
+    }
+
+    #[test]
+    fn a_maximum_of_zero_tries_puts_the_tpm_in_lockout() {
+        let mut state = TpmState::manufacture().unwrap();
+        state.on_startup_clear().unwrap();
+
+        // Part 3 clause 25.3.1 accepts zero and reads it as lockout, rather
+        // than refusing it.
+        let mut p = Writer::new();
+        p.u32(0); // newMaxTries
+        p.u32(100); // newRecoveryTime
+        p.u32(200); // lockoutRecovery
+        let buf = authorized(
+            cc::DictionaryAttackParameters,
+            rh::LOCKOUT,
+            &p.finish().unwrap(),
+        );
+        let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
+        assert_eq!(response_code(&r), rc::SUCCESS);
+        assert!(state.lockout.in_lockout);
+        assert_eq!(state.lockout.max_tries, 0);
+        assert_eq!(state.lockout.recovery_time, 100);
+        assert_eq!(state.lockout.lockout_recovery, 200);
+
+        // Being in lockout, the TPM now refuses this command itself, because
+        // Part 1 clause 16.8.3 exempts only TPM2_DictionaryAttackLockReset.
+        let mut p = Writer::new();
+        p.u32(5);
+        p.u32(100);
+        p.u32(200);
+        let buf = authorized(
+            cc::DictionaryAttackParameters,
+            rh::LOCKOUT,
+            &p.finish().unwrap(),
+        );
+        let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
+        assert_eq!(response_code(&r), rc::LOCKOUT);
+
+        // That reset is the way back out, and the parameters can be set again.
+        let reset = authorized(cc::DictionaryAttackLockReset, rh::LOCKOUT, &[]);
+        let r = crate::tpm::commands::execute::run(&mut state, 0, &reset);
+        assert_eq!(response_code(&r), rc::SUCCESS);
+        assert!(!state.lockout.in_lockout);
+
+        let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
+        assert_eq!(response_code(&r), rc::SUCCESS);
+        assert!(!state.lockout.in_lockout);
+        assert_eq!(state.lockout.max_tries, 5);
+    }
+
+    #[test]
+    fn physical_presence_discards_a_command_it_cannot_gate() {
+        let mut state = TpmState::manufacture().unwrap();
+        state.on_startup_clear().unwrap();
+        state.physical_presence = true;
+
+        // TPM2_Clear can be gated, TPM2_GetRandom cannot. Part 3 clause
+        // 26.2.1 discards the second rather than failing the command.
+        let mut p = Writer::new();
+        p.u32(2);
+        p.u32(cc::Clear);
+        p.u32(cc::GetRandom);
+        p.u32(0); // empty clearList
+        let buf = authorized(cc::PP_Commands, rh::PLATFORM, &p.finish().unwrap());
+        let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
+        assert_eq!(response_code(&r), rc::SUCCESS);
+        assert_eq!(state.pp_commands, vec![cc::Clear]);
+
+        // A command in both lists ends up not requiring physical presence,
+        // because setList is processed first.
+        let mut p = Writer::new();
+        p.u32(1);
+        p.u32(cc::ClearControl);
+        p.u32(1);
+        p.u32(cc::ClearControl);
+        let buf = authorized(cc::PP_Commands, rh::PLATFORM, &p.finish().unwrap());
+        let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
+        assert_eq!(response_code(&r), rc::SUCCESS);
+        assert_eq!(state.pp_commands, vec![cc::Clear]);
     }
 }

@@ -62,13 +62,6 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
         .clone();
-    if !object
-        .public
-        .object_attributes
-        .has(ObjectAttributes::SIGN_ENCRYPT)
-    {
-        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
-    }
     check_signing_key(&object).map_err(|e| e.with_handle(1))?;
     // Part 3 Table 115 leaves HMAC out of the digest commands, because an
     // HMAC key signs a message. No other keyed hash scheme signs at all.
