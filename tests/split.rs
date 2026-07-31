@@ -390,6 +390,33 @@ fn a_commit_completes_an_ecdaa_signature_and_is_then_spent() {
 }
 
 #[test]
+fn a_commit_still_works_after_a_resume() {
+    // The commit nonce is not written to the state file, so a resumed TPM has
+    // to take a new one. Without that it would have none at all and every
+    // TPM2_Commit would fail for the life of the process.
+    let h = harness("resume");
+    let (handle, _) = primary(&h, 0x001A, Some(0));
+
+    let r = commit(&h, handle, &empty_commit_params());
+    assert_eq!(r.code, rc::SUCCESS);
+    let (_, before) = commit_response(&r.body);
+
+    // Shutdown(STATE) then Startup(STATE) is a TPM Resume.
+    let r = send(&h, &command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS, "Shutdown -> {:08x}", r.code);
+    let r = send(&h, &command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS, "Startup(STATE) -> {:08x}", r.code);
+
+    // A key has to be reloaded after the resume, and committing works again.
+    let (handle, _) = primary(&h, 0x001A, Some(0));
+    let r = commit(&h, handle, &empty_commit_params());
+    assert_eq!(r.code, rc::SUCCESS, "Commit after a resume -> {:08x}", r.code);
+    let (_, after) = commit_response(&r.body);
+    assert_eq!(after, 0, "the counter starts again");
+    let _ = before;
+}
+
+#[test]
 fn an_ephemeral_key_completes_a_two_phase_exchange() {
     // Part 1 clause 44.8.4.2, the Full Unified Model: outZ1 is [ds]QsB and
     // outZ2 is [de]QeB, where de is the value the counter names.

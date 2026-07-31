@@ -328,6 +328,14 @@ impl TpmState {
         self.pcr.on_resume();
         self.clock.restart_count = self.clock.restart_count.wrapping_add(1);
         self.clock.time = 0;
+        // The commit nonce is never written to the state file, so a resumed
+        // TPM has none to carry forward and takes a new one. A split operation
+        // therefore does not survive a power cycle, and the caller commits
+        // again. Part 1 clause 44.2.2 requires the value to be unknown outside
+        // the TPM and used once, both of which dropping it keeps; what it
+        // costs is a commit made before the shutdown, which is why the nonce
+        // is replaced here rather than left empty.
+        self.commits.reset(&mut self.rng)?;
         self.begin_operation(true);
         Ok(())
     }
