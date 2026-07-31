@@ -9,13 +9,14 @@ use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Unmarshal};
 use crate::tpm::structures::attributes::ObjectAttributes;
 use crate::tpm::structures::base::{
-    Tpm2bDigest, Tpm2bEccParameter, Tpm2bMaxBuffer, Tpm2bSensitiveData,
+    Tpm2bDigest, Tpm2bEccParameter, Tpm2bMaxBuffer, Tpm2bSensitiveData, Tpm2bSignatureCtx,
+    Tpm2bSignatureHint,
 };
 use crate::tpm::structures::keys::{PublicId, PublicParms};
 use crate::tpm::structures::schemes::{EccPoint, Scheme, Tpm2bEccPoint};
-use crate::tpm::structures::signature::{TpmtSignature, VerifiedTicket};
+use crate::tpm::structures::signature::{Ticket, TpmtSignature, VerifiedTicket};
 
-use super::crypto::{sign_digest, signing_scheme, verify_digest_public};
+use super::crypto::{sign_digest, signing_scheme, verify_digest_public, verify_hash_ticket};
 use super::dispatch::{Request, Response};
 use super::execute::{respond, respond_with_handle};
 
@@ -28,15 +29,31 @@ fn object_of(state: &TpmState, handle: u32) -> TpmResult<&Object> {
     }
 }
 
-/// TPM2_SignDigest, Part 3 clause 20.4.
+/// Reject a signature context for a scheme that has none.
 ///
-/// The same operation as TPM2_Sign without the hash check ticket, because the
-/// caller states outright that the input is a digest it produced.
+/// Part 2 Table 220 gives a context only to ECDAA, SM2 and ML-DSA. None of
+/// those are implemented here, so a caller that supplies one is asking for
+/// something the TPM cannot do.
+fn check_no_context(context: &Tpm2bSignatureCtx, parameter: usize) -> TpmResult<()> {
+    if context.is_empty() {
+        Ok(())
+    } else {
+        Err(TpmRc(rc::VALUE).with_parameter(parameter))
+    }
+}
+
+/// TPM2_SignDigest, Part 3 clause 20.7.
+///
+/// The digest is signed as it stands. A restricted key needs the hash check
+/// ticket to show the TPM produced the digest and that it did not start with
+/// TPM_GENERATED_VALUE.
 pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
+    let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
     let digest = Tpm2bDigest::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
+    let validation = Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK])?;
+    check_no_context(&context, 1)?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
@@ -48,16 +65,21 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }
-    // A restricted key may only sign what the TPM produced, and a bare digest
-    // carries no such proof.
-    if object
+    let scheme = signing_scheme(&object, &Scheme::null())?;
+    let restricted = object
         .public
         .object_attributes
-        .has(ObjectAttributes::RESTRICTED)
-    {
-        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
+        .has(ObjectAttributes::RESTRICTED);
+    // A restricted key signs only what the TPM hashed itself, and the ticket
+    // is the proof of that. Part 3 clause 20.5.1 also checks a ticket that is
+    // supplied when the key does not require one.
+    if restricted || !validation.digest.is_empty() {
+        let hash_alg = scheme.hash_alg().unwrap_or(object.public.name_alg);
+        if hash::digest_size(hash_alg)? != digest.len() {
+            return Err(TpmRc(rc::TICKET).with_parameter(3));
+        }
+        verify_hash_ticket(state, &validation, hash_alg, digest.as_slice(), 3)?;
     }
-    let scheme = signing_scheme(&object, &in_scheme)?;
     let signature = sign_digest(state, &object, &scheme, digest.as_slice())?;
     respond(move |w| {
         signature.marshal(w);
@@ -65,12 +87,14 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
     })
 }
 
-/// TPM2_VerifyDigestSignature, Part 3 clause 20.5.
+/// TPM2_VerifyDigestSignature, Part 3 clause 20.4.
 pub fn verify_digest_signature(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
+    let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
     let digest = Tpm2bDigest::unmarshal(&mut r)?;
     let signature = TpmtSignature::unmarshal(&mut r)?;
+    check_no_context(&context, 1)?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
     verify_digest_public(object, digest.as_slice(), &signature)?;
@@ -119,7 +143,8 @@ pub fn sign_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
     let auth = Tpm2bDigest::unmarshal(&mut r)?;
-    let hash_alg = r.u16()?;
+    let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
+    check_no_context(&context, 2)?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
@@ -131,16 +156,12 @@ pub fn sign_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }
-    let scheme = signing_scheme(&object, &Scheme::null())
-        .or_else(|_| signing_scheme(&object, &Scheme::hash(alg::NULL, hash_alg)))?;
-    let hash_alg = match (scheme.hash_alg(), hash_alg) {
-        (Some(h), r) if r == alg::NULL || r == h => h,
-        (Some(_), _) => return Err(TpmRc(rc::VALUE).with_parameter(2)),
-        (None, r) if r != alg::NULL => r,
-        (None, _) => return Err(TpmRc(rc::VALUE).with_parameter(2)),
-    };
+    // The sequence hashes with the algorithm of the key's signing scheme,
+    // because that is the algorithm the signature will use.
+    let scheme = signing_scheme(&object, &Scheme::null())?;
+    let hash_alg = scheme.hash_alg().ok_or(TpmRc(rc::SCHEME).with_handle(1))?;
     if !hash::is_supported(hash_alg) {
-        return Err(TpmRc(rc::HASH).with_parameter(2));
+        return Err(TpmRc(rc::HASH).with_handle(1));
     }
 
     // The key handle is recorded in the sequence so the completion can check
@@ -170,29 +191,32 @@ fn sequence_binding(sequence: &Sequence) -> TpmResult<(u32, u16, &[u8])> {
     Ok((handle, hash_alg, &sequence.buffer[6..]))
 }
 
-/// TPM2_SignSequenceComplete, Part 3 clause 20.7.
+/// TPM2_SignSequenceComplete, Part 3 clause 20.6.
+///
+/// The handle area is the sequence first and the key second, as Table 124
+/// defines it.
 pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
-    let key_handle = request.handle(0)?;
-    let sequence_handle = request.handle(1)?;
+    let sequence_handle = request.handle(0)?;
+    let key_handle = request.handle(1)?;
     let mut r = request.reader();
     let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
 
     let sequence = state
         .objects
         .get(sequence_handle)
-        .map_err(|e| e.with_handle(2))?
+        .map_err(|e| e.with_handle(1))?
         .as_sequence()?
         .clone();
     let (bound_handle, hash_alg, message) = sequence_binding(&sequence)?;
     if bound_handle != key_handle {
-        return Err(TpmRc(rc::SIGN_CONTEXT_KEY).with_handle(1));
+        return Err(TpmRc(rc::SIGN_CONTEXT_KEY).with_handle(2));
     }
     let mut data = message.to_vec();
     data.extend_from_slice(buffer.as_slice());
     let digest = hash::digest(hash_alg, &data)?;
 
     let object = object_of(state, key_handle)
-        .map_err(|e| e.with_handle(1))?
+        .map_err(|e| e.with_handle(2))?
         .clone();
     let scheme = signing_scheme(&object, &Scheme::null())?;
     let signature = sign_digest(state, &object, &scheme, &digest)?;
@@ -202,25 +226,26 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
     })
 }
 
-/// TPM2_VerifySequenceStart, Part 3 clause 20.8.
+/// TPM2_VerifySequenceStart, Part 3 clause 17.6.
 pub fn verify_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
     let auth = Tpm2bDigest::unmarshal(&mut r)?;
-    let hash_alg = r.u16()?;
+    let hint = Tpm2bSignatureHint::unmarshal(&mut r)?;
+    let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
+    // Part 2 Table 222 gives a hint only to EdDSA, which is not implemented.
+    if !hint.is_empty() {
+        return Err(TpmRc(rc::VALUE).with_parameter(2));
+    }
+    check_no_context(&context, 3)?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
         .clone();
     let scheme = object.public.scheme().copied().unwrap_or_default();
-    let hash_alg = match (scheme.hash_alg(), hash_alg) {
-        (Some(h), r) if r == alg::NULL || r == h => h,
-        (Some(_), _) => return Err(TpmRc(rc::VALUE).with_parameter(2)),
-        (None, r) if r != alg::NULL => r,
-        (None, _) => return Err(TpmRc(rc::VALUE).with_parameter(2)),
-    };
+    let hash_alg = scheme.hash_alg().ok_or(TpmRc(rc::SCHEME).with_handle(1))?;
     if !hash::is_supported(hash_alg) {
-        return Err(TpmRc(rc::HASH).with_parameter(2));
+        return Err(TpmRc(rc::HASH).with_handle(1));
     }
 
     let mut buffer = key_handle.to_be_bytes().to_vec();
@@ -233,29 +258,29 @@ pub fn verify_sequence_start(state: &mut TpmState, request: &Request) -> TpmResu
     respond_with_handle(handle, |_| Ok(()))
 }
 
-/// TPM2_VerifySequenceComplete, Part 3 clause 20.9.
+/// TPM2_VerifySequenceComplete, Part 3 clause 20.3.
+///
+/// The handle area is the sequence first and the key second, as Table 118
+/// defines it, and the message arrived through TPM2_SequenceUpdate.
 pub fn verify_sequence_complete(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
-    let key_handle = request.handle(0)?;
-    let sequence_handle = request.handle(1)?;
+    let sequence_handle = request.handle(0)?;
+    let key_handle = request.handle(1)?;
     let mut r = request.reader();
-    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
     let signature = TpmtSignature::unmarshal(&mut r)?;
 
     let sequence = state
         .objects
         .get(sequence_handle)
-        .map_err(|e| e.with_handle(2))?
+        .map_err(|e| e.with_handle(1))?
         .as_sequence()?
         .clone();
     let (bound_handle, hash_alg, message) = sequence_binding(&sequence)?;
     if bound_handle != key_handle {
-        return Err(TpmRc(rc::SIGN_CONTEXT_KEY).with_handle(1));
+        return Err(TpmRc(rc::SIGN_CONTEXT_KEY).with_handle(2));
     }
-    let mut data = message.to_vec();
-    data.extend_from_slice(buffer.as_slice());
-    let digest = hash::digest(hash_alg, &data)?;
+    let digest = hash::digest(hash_alg, message)?;
 
-    let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
+    let object = object_of(state, key_handle).map_err(|e| e.with_handle(2))?;
     verify_digest_public(object, &digest, &signature)?;
 
     let hierarchy = object.hierarchy;

@@ -1281,6 +1281,176 @@ fn a_signature_from_a_created_key_verifies() {
 }
 
 #[test]
+fn the_version_185_signing_commands_follow_their_command_tables() {
+    let h = Harness::started("sign185");
+
+    let template = signing_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let key = Reader::new(&r.body).u32().unwrap();
+
+    let message = b"a message signed in pieces";
+    let digest = swtrust::tpm::crypto::hash::digest(alg::SHA256, message).unwrap();
+
+    // Part 3 Table 126: context, digest, validation. The key is unrestricted,
+    // so a null hash check ticket is accepted.
+    let mut p = Writer::new();
+    p.u16(0); // context
+    p.u16(32);
+    p.bytes(&digest);
+    p.u16(0x8024); // TPM_ST_HASHCHECK
+    p.u32(rh::NULL);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SignDigest,
+        &[key],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "SignDigest -> {:08x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let _param_size = reader.u32().unwrap();
+    let rest = reader.take_rest();
+    let signature = &rest[..rest.len() - 5].to_vec();
+
+    // Part 3 Table 120: context, digest, signature.
+    let mut p = Writer::new();
+    p.u16(0); // context
+    p.u16(32);
+    p.bytes(&digest);
+    p.bytes(signature);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::VerifyDigestSignature,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "VerifyDigestSignature -> {:08x}", r.code);
+
+    // A supplied context is refused, because no implemented scheme takes one.
+    let mut p = Writer::new();
+    p.u16(1);
+    p.u8(0);
+    p.u16(32);
+    p.bytes(&digest);
+    p.bytes(signature);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::VerifyDigestSignature,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code & 0x03f, rc::VALUE & 0x03f);
+
+    // Part 3 Table 89: auth, context. The key handle carries no authorization.
+    let mut p = Writer::new();
+    p.u16(0); // auth
+    p.u16(0); // context
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::SignSequenceStart,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "SignSequenceStart -> {:08x}", r.code);
+    let sequence = Reader::new(&r.body).u32().unwrap();
+
+    // The message is fed in, then Part 3 Table 124 completes with the sequence
+    // handle first and the key second.
+    let mut p = Writer::new();
+    p.u16(6);
+    p.bytes(&message[..6]);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SequenceUpdate,
+        &[sequence],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "SequenceUpdate -> {:08x}", r.code);
+
+    let mut auth = password(b"");
+    auth.extend_from_slice(&password(b""));
+    let mut p = Writer::new();
+    p.u16((message.len() - 6) as u16);
+    p.bytes(&message[6..]);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SignSequenceComplete,
+        &[sequence, key],
+        Some(&auth),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "SignSequenceComplete -> {:08x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let _param_size = reader.u32().unwrap();
+    let rest = reader.take_rest();
+    // Two response sessions follow the signature.
+    let sequence_signature = rest[..rest.len() - 10].to_vec();
+
+    // Part 3 Table 87: auth, hint, context.
+    let mut p = Writer::new();
+    p.u16(0); // auth
+    p.u16(0); // hint
+    p.u16(0); // context
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::VerifySequenceStart,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "VerifySequenceStart -> {:08x}", r.code);
+    let verify_sequence = Reader::new(&r.body).u32().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(message.len() as u16);
+    p.bytes(message);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SequenceUpdate,
+        &[verify_sequence],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "SequenceUpdate -> {:08x}", r.code);
+
+    // Part 3 Table 118: the sequence handle is authorized, the key is not, and
+    // the only parameter is the signature.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::VerifySequenceComplete,
+        &[verify_sequence, key],
+        Some(&password(b"")),
+        &sequence_signature,
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "VerifySequenceComplete -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
 fn the_vendor_test_command_echoes_its_input() {
     let h = Harness::started("vendor");
     let mut p = Writer::new();

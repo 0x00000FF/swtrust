@@ -158,6 +158,20 @@ tpm2b! {
     Tpm2bTimeout, 8
 }
 tpm2b! {
+    /// TPM2B_SIGNATURE_CTX, Part 2 Table 221.
+    ///
+    /// The bound is the largest TPMU_SIGNATURE_CTX of Table 220, which is the
+    /// 255 octet ML-DSA context.
+    Tpm2bSignatureCtx, 255
+}
+tpm2b! {
+    /// TPM2B_SIGNATURE_HINT, Part 2 Table 222.
+    ///
+    /// The only scheme that uses a hint is EdDSA, whose encoded R value fits
+    /// in the largest ECC parameter.
+    Tpm2bSignatureHint, config::MAX_ECC_KEY_BYTES
+}
+tpm2b! {
     /// TPM2B_IV, Part 2 Table 99.
     Tpm2bIv, config::MAX_SYM_BLOCK_SIZE
 }

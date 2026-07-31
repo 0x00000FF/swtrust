@@ -146,14 +146,21 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     w.finish()
 }
 
-/// Drop the handle a command with the flushed attribute was given.
+/// Drop the sequence a command with the flushed attribute was given.
+///
+/// Every command that carries TPMA_CC.flushed completes a sequence, so the
+/// context that goes away is the sequence object. Where its handle sits in the
+/// handle area differs by command.
 fn flush_if_needed(state: &mut TpmState, request: &Request) {
     if !request.info.flushed {
         return;
     }
-    // The flushed handle is the sequence or object handle, which is the last
-    // handle in the handle area for every command with the attribute.
-    if let Some(handle) = request.handles.last() {
+    let index = match request.code {
+        // TPM2_EventSequenceComplete names the PCR first.
+        cc::EventSequenceComplete => 1,
+        _ => 0,
+    };
+    if let Some(handle) = request.handles.get(index) {
         let _ = state.objects.remove(*handle);
     }
 }

@@ -523,7 +523,7 @@ pub fn check_authorization(
     let position = index + 1;
     let protected = da_protected(state, request, index, entity);
 
-    check_lockout(state, request, index, entity, protected)?;
+    check_lockout(state, request, index, protected)?;
 
     // A password session carries the authorization value in the clear.
     if input.handle == rh::RS_PW {
@@ -610,7 +610,6 @@ fn check_lockout(
     state: &TpmState,
     request: &Request,
     index: usize,
-    entity: &Entity,
     protected: bool,
 ) -> TpmResult<()> {
     if !state.lockout.in_lockout || !protected {

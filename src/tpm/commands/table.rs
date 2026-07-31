@@ -214,14 +214,17 @@ pub const COMMANDS: &[CommandInfo] = &[
     nv(cc::SetCapability, 1, 1),
     nv(cc::ReadOnlyControl, 1, 1),
     plain(cc::PolicyTransportSPDM, 1, 0),
-    CommandInfo::new(cc::VerifySequenceComplete, 2, 2, false, false, false, true),
+    // Part 3 Table 118 authorizes the sequence but not the verification key.
+    CommandInfo::new(cc::VerifySequenceComplete, 2, 1, false, false, false, true),
     CommandInfo::new(cc::SignSequenceComplete, 2, 2, false, false, false, true),
     plain(cc::VerifyDigestSignature, 1, 0),
     plain(cc::SignDigest, 1, 1),
     plain(cc::Encapsulate, 1, 0),
     plain(cc::Decapsulate, 1, 1),
+    // Part 3 Tables 87 and 89 give the key handle no authorization; the
+    // sequence takes its own value from the auth parameter.
     rhandle(cc::VerifySequenceStart, 1, 0),
-    rhandle(cc::SignSequenceStart, 1, 1),
+    rhandle(cc::SignSequenceStart, 1, 0),
     plain(cc::Vendor_TCG_Test, 0, 0),
 ];
 

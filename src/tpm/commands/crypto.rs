@@ -89,6 +89,41 @@ fn hash_ticket(
     })
 }
 
+/// Check a TPMT_TK_HASHCHECK against the digest it is meant to cover.
+///
+/// Part 3 clause 20.5.1 uses the ticket as proof that the TPM produced the
+/// digest with `hash_alg` and that the hashed data did not start with
+/// TPM_GENERATED_VALUE. `parameter` names the ticket in an error.
+pub fn verify_hash_ticket(
+    state: &TpmState,
+    validation: &Ticket,
+    hash_alg: u16,
+    digest: &[u8],
+    parameter: usize,
+) -> TpmResult<()> {
+    let reject = || TpmRc(rc::TICKET).with_parameter(parameter);
+    if validation.digest.is_empty() {
+        return Err(reject());
+    }
+    let proof = state
+        .hierarchy_proof(validation.hierarchy)
+        .map_err(|_| reject())?
+        .to_vec();
+    let expected = mac::hmac_parts(
+        config::CONTEXT_INTEGRITY_HASH_ALG,
+        &proof,
+        &[
+            &st::HASHCHECK.to_be_bytes(),
+            &hash_alg.to_be_bytes(),
+            digest,
+        ],
+    )?;
+    if !crate::tpm::core::protect::constant_time_eq(&expected, validation.digest.as_slice()) {
+        return Err(reject());
+    }
+    Ok(())
+}
+
 /// TPM2_HMAC, Part 3 clause 15.5.
 pub fn hmac_command(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
@@ -471,7 +506,7 @@ pub fn sign(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let digest = Tpm2bDigest::unmarshal(&mut r)?;
     let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
-    let _validation = Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK])?;
+    let validation = Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK])?;
 
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
@@ -484,6 +519,19 @@ pub fn sign(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }
     let scheme = signing_scheme(&object, &in_scheme)?;
+    // Part 3 clause 20.5.1 requires the ticket for a restricted key, and
+    // checks one that is supplied even when the key does not require it.
+    let restricted = object
+        .public
+        .object_attributes
+        .has(ObjectAttributes::RESTRICTED);
+    if restricted || !validation.digest.is_empty() {
+        let hash_alg = scheme.hash_alg().unwrap_or(object.public.name_alg);
+        if hash::digest_size(hash_alg)? != digest.len() {
+            return Err(TpmRc(rc::TICKET).with_parameter(3));
+        }
+        verify_hash_ticket(state, &validation, hash_alg, digest.as_slice(), 3)?;
+    }
     let signature = sign_digest(state, &object, &scheme, digest.as_slice())?;
     respond(move |w| {
         signature.marshal(w);
