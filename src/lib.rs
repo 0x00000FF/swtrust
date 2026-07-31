@@ -5,6 +5,7 @@
 //! command line, the command log and small utilities.
 
 pub mod cli;
+pub mod console;
 pub mod logging;
 pub mod server;
 pub mod tpm;

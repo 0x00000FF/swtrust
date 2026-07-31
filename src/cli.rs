@@ -39,6 +39,8 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub log_dir: PathBuf,
     pub verbose: bool,
+    /// Run the debug console on stdin alongside the transport.
+    pub console: bool,
 }
 
 impl Default for Config {
@@ -51,6 +53,7 @@ impl Default for Config {
             state_dir: PathBuf::from("state"),
             log_dir: PathBuf::from("."),
             verbose: false,
+            console: false,
         }
     }
 }
@@ -81,6 +84,8 @@ pub const HELP: &str = concat!(
     "    -s, --state <dir>              Directory holding the TPM state file. Default: ./state\n",
     "    -l, --log-dir <dir>            Directory for YYYY-MM-DD.log files. Default: .\n",
     "    -v, --verbose                  Also print command logs to stdout\n",
+    "    -c, --console                  Run the debug console on stdin
+",
     "    -h, --help                     Print this help\n",
     "    -V, --version                  Print version\n",
 );
@@ -122,6 +127,7 @@ where
             "-h" | "--help" => return Ok(ParseOutcome::Help),
             "-V" | "--version" => return Ok(ParseOutcome::Version),
             "-v" | "--verbose" => cfg.verbose = true,
+            "-c" | "--console" => cfg.console = true,
             "-i" | "--interface" => {
                 let v = value(&args, &mut idx, inline, "--interface")?;
                 cfg.interface = match v.to_ascii_lowercase().as_str() {
@@ -182,6 +188,17 @@ mod tests {
         assert_eq!(c.state_dir, PathBuf::from("state"));
         assert_eq!(c.log_dir, PathBuf::from("."));
         assert!(!c.verbose);
+        assert!(!c.console);
+    }
+
+    #[test]
+    fn the_console_is_asked_for_by_name_or_letter() {
+        assert!(run(&["--console"]).console);
+        assert!(run(&["-c"]).console);
+        // It does not come on by itself, and it is separate from verbose.
+        let c = run(&["--verbose"]);
+        assert!(c.verbose);
+        assert!(!c.console);
     }
 
     #[test]

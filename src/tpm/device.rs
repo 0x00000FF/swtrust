@@ -143,6 +143,19 @@ impl Tpm {
         }
     }
 
+    /// Read the state while no command is running.
+    ///
+    /// The debug console needs to look at values the command interface does
+    /// not report, so it borrows the state the same way a command does.
+    pub fn with_state<T>(&self, f: impl FnOnce(&TpmState) -> T) -> T {
+        f(&self.locked())
+    }
+
+    /// Change the state while no command is running.
+    pub fn with_state_mut<T>(&self, f: impl FnOnce(&mut TpmState) -> T) -> T {
+        f(&mut self.locked())
+    }
+
     /// Write the non-volatile state out.
     pub fn persist(&self) {
         let state = self.locked();

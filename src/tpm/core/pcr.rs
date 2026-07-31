@@ -262,6 +262,29 @@ impl PcrBanks {
             .ok_or(TpmRc(rc::VALUE))
     }
 
+    /// Put a digest straight into a register.
+    ///
+    /// No TPM command does this. The debug console uses it to place a register
+    /// in a state that extending cannot reach, so a policy or a quote can be
+    /// tried against a known value. The update counter advances as it would
+    /// for an extend, because a reader has to be able to tell that the
+    /// register changed.
+    pub fn set(&mut self, hash_alg: u16, index: u16, digest: &[u8]) -> TpmResult<()> {
+        if !is_implemented(index) {
+            return Err(TpmRc(rc::VALUE));
+        }
+        let size = digest_size(hash_alg).ok_or(TpmRc(rc::HASH))?;
+        if digest.len() != size {
+            return Err(TpmRc(rc::SIZE));
+        }
+        let bank = self.banks.get_mut(&hash_alg).ok_or(TpmRc(rc::VALUE))?;
+        bank[index as usize] = digest.to_vec();
+        if !no_increment(index) {
+            self.update_counter = self.update_counter.wrapping_add(1);
+        }
+        Ok(())
+    }
+
     /// Set every register in every bank to its reset value.
     ///
     /// This is what TPM2_Startup(CLEAR) does.

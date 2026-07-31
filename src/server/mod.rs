@@ -67,6 +67,12 @@ pub fn run(config: Config) -> io::Result<()> {
         config.log_dir.display()
     ));
 
+    // The console reads stdin on its own thread, so the transport keeps the
+    // main one and the two share the TPM through its lock.
+    if config.console {
+        crate::console::spawn(tpm.clone(), logger.clone());
+    }
+
     match config.interface {
         Interface::Socket => socket::serve(&config, tpm, logger),
         Interface::Pipe => pipe::serve(&config, tpm, logger),

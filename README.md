@@ -29,6 +29,7 @@ swtrust [OPTIONS]
   -s, --state <dir>              Directory holding the state file. Default: ./state
   -l, --log-dir <dir>            Directory for YYYY-MM-DD.log files. Default: .
   -v, --verbose                  Also print command logs to stdout
+  -c, --console                  Run the debug console on stdin
 ```
 
 ### Transports
@@ -60,11 +61,36 @@ Every command and response pair is appended to `<log-dir>/YYYY-MM-DD.log`,
 named by the UTC date, with the header decoded and the full buffer in hex.
 With `--verbose` the same records also go to stdout.
 
+### Debug console
+
+`--console` runs a console on stdin alongside the transport. It reads and
+writes the state the command interface does not report: the PCR banks, the
+NV indexes, the working state of the random number generator, and the
+public and private halves of loaded and persistent keys.
+
+```
+> pcr read 0
+0000000000000000000000000000000000000000000000000000000000000000
+> pcr extend 0 abababababababababababababababababababababababababababababababab
+0 now debb3e7acfff6dd18d501042273629f0b79cb206bb8c24f59f62ddb80849403b
+> rng show
+key            14e4e589cf40977f013c9878a4f89751f91e49eb27c2812d9628652bfb6fefa7
+value          68af31597b0915d5a02b3dd56bcb152c68d40bfa22cbdfb65d36daca1695cb0f
+reseed counter 9
+needs reseed   false
+```
+
+`help` lists every console command. Nothing the console does is a TPM
+command: it checks no authorization, records no audit, and can put the TPM
+in a state no sequence of commands could reach. It is a debugging aid, and
+it is off unless asked for.
+
 ## Layout
 
 ```
 src/
   cli.rs                 command line parsing
+  console.rs             the debug console
   logging.rs             the daily command log
   server/                transports: simulator protocol, TCP, named pipe
   tpm/

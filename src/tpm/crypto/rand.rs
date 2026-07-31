@@ -155,6 +155,20 @@ impl Drbg {
         self.reseed_counter
     }
 
+    /// The Key of the SP800-90A CTR_DRBG working state.
+    ///
+    /// This is secret while the TPM is running. It is exposed so the debug
+    /// console can report the working state, which is the only way to see
+    /// that a reseed changed it.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// The V of the SP800-90A CTR_DRBG working state.
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
     /// True when the instantiation has reached its reseed interval.
     pub fn needs_reseed(&self) -> bool {
         self.reseed_counter >= RESEED_INTERVAL
