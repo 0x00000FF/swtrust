@@ -266,6 +266,88 @@ fn the_loop_reads_lines_and_stops_on_quit() {
 }
 
 #[test]
+fn a_console_extend_invalidates_a_policy_bound_to_the_register() {
+    // Part 1 clause 16.7.7.6 makes a recorded PCR update counter the thing a
+    // policy checks, so a change made from the console has to advance it or a
+    // stale policy would still pass.
+    let h = harness("counter");
+    let before = h.tpm.with_state(|s| s.pcr.update_counter());
+    run(&h, &format!("pcr extend 0 {}", "ab".repeat(32)));
+    assert_eq!(h.tpm.with_state(|s| s.pcr.update_counter()), before + 1);
+
+    // PCR 23 does not increment it, matching TPM_PT_PCR_NO_INCREMENT.
+    let before = h.tpm.with_state(|s| s.pcr.update_counter());
+    run(&h, &format!("pcr extend 17 {}", "cd".repeat(32)));
+    assert_eq!(h.tpm.with_state(|s| s.pcr.update_counter()), before + 1);
+}
+
+#[test]
+fn an_argument_that_does_not_fit_is_refused_rather_than_truncated() {
+    let h = harness("range");
+    // A PCR index past a u16 would become a different register if it were
+    // simply cast, so it is refused.
+    assert!(run(&h, "pcr read 65536").contains("too large"));
+    assert!(run(&h, "pcr read 70000").contains("too large"));
+    // The same for an NV offset and size.
+    assert!(run(&h, "nv read 0x01000000 65536").contains("too large"));
+    assert!(run(&h, "nv read 0x01000000 0 65536").contains("too large"));
+}
+
+#[test]
+fn an_oversized_argument_is_refused_before_it_is_decoded() {
+    let h = harness("bounds");
+    // A digest longer than the largest this TPM implements.
+    let huge = "ab".repeat(200);
+    assert!(run(&h, &format!("pcr write 0 {huge}")).contains("at most"));
+    assert!(run(&h, &format!("pcr extend 0 {huge}")).contains("at most"));
+    // Entropy fed to the generator is bounded too.
+    let very_long = "cd".repeat(4096);
+    assert!(run(&h, &format!("rng seed {very_long}")).contains("at most"));
+    assert!(run(&h, &format!("rng stir {very_long}")).contains("at most"));
+}
+
+#[test]
+fn a_line_longer_than_the_limit_is_refused_and_the_next_one_still_runs() {
+    let h = harness("longline");
+    let mut input = Vec::new();
+    input.extend_from_slice(&vec![b'x'; swtrust::console::MAX_LINE + 100]);
+    input.extend_from_slice(b"
+banks
+quit
+");
+    let mut output = Vec::new();
+    let logger = Logger::new(h.dir.join("logs3"), false).unwrap();
+    serve(&h.tpm, &logger, &input[..], &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("at most"), "{text}");
+    // The line after the long one is acted on, so the reader resynchronised.
+    assert!(text.contains("allocated banks"), "{text}");
+    assert!(text.contains("leaving the console"));
+}
+
+#[test]
+fn a_line_with_no_trailing_newline_is_still_read() {
+    let h = harness("noeol");
+    let mut output = Vec::new();
+    let logger = Logger::new(h.dir.join("logs4"), false).unwrap();
+    serve(&h.tpm, &logger, &b"banks"[..], &mut output).unwrap();
+    assert!(String::from_utf8(output).unwrap().contains("allocated banks"));
+}
+
+#[test]
+fn carriage_returns_are_not_part_of_a_command() {
+    let h = harness("crlf");
+    let mut output = Vec::new();
+    let logger = Logger::new(h.dir.join("logs5"), false).unwrap();
+    serve(&h.tpm, &logger, &b"banks
+quit
+"[..], &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("allocated banks"), "{text}");
+    assert!(text.contains("leaving the console"), "{text}");
+}
+
+#[test]
 fn save_writes_the_state_file() {
     let h = harness("save");
     run(&h, &format!("pcr write 0 {}", "77".repeat(32)));

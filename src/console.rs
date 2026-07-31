@@ -62,17 +62,97 @@ commands:
   quit                                  leave the console
 ";
 
+/// Longest console line accepted, in octets.
+///
+/// A line is read into memory before anything looks at it, so it needs a bound
+/// of its own. This is far more than any command below needs: the longest is a
+/// 4096 bit RSA modulus written as hex, which is 1024 characters.
+pub const MAX_LINE: usize = 8 * 1024;
+
+/// Largest digest this TPM implements, which bounds every digest argument.
+const MAX_DIGEST: usize = crate::tpm::structures::base::MAX_DIGEST_SIZE;
+
+/// Largest amount of entropy a console line may feed the generator.
+const MAX_STIR: usize = 1024;
+
+/// Read one line, refusing one longer than [`MAX_LINE`].
+///
+/// Returns `None` at end of input. A line that is too long is dropped and the
+/// rest of it is discarded, so the next read starts at the following line
+/// rather than part way through the one that was refused.
+fn read_line<R: BufRead>(input: &mut R) -> std::io::Result<Option<Result<String, ()>>> {
+    let mut buf = Vec::new();
+    // Set once the line has passed the limit. The rest of it is still read, so
+    // the next line starts where it should, but none of it is kept.
+    let mut too_long = false;
+    let mut any = false;
+
+    loop {
+        // What the reader already holds is examined first, then consumed, so
+        // the borrow of the buffer ends before the reader is advanced.
+        let (upto, used, done) = {
+            let available = match input.fill_buf() {
+                Ok(b) => b,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if available.is_empty() {
+                break;
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(i) => (i, i + 1, true),
+                None => (available.len(), available.len(), false),
+            }
+        };
+        any = true;
+        if !too_long {
+            if buf.len() + upto > MAX_LINE {
+                too_long = true;
+                buf = Vec::new();
+            } else {
+                let available = input.fill_buf()?;
+                buf.extend_from_slice(&available[..upto]);
+            }
+        }
+        input.consume(used);
+        if done {
+            break;
+        }
+    }
+
+    if !any {
+        return Ok(None);
+    }
+    if too_long {
+        return Ok(Some(Err(())));
+    }
+    // A line ending may be either form, and the carriage return is not part of
+    // the text.
+    while buf.ends_with(b"\r") {
+        buf.pop();
+    }
+    Ok(Some(Ok(String::from_utf8_lossy(&buf).into_owned())))
+}
+
 /// Read lines from `input` and act on them until it ends or `quit` is given.
 pub fn serve<R: BufRead, W: Write>(
     tpm: &Tpm,
     logger: &Logger,
-    input: R,
+    mut input: R,
     mut output: W,
 ) -> std::io::Result<()> {
     write!(output, "swtrust console. Type help for the command list.\n> ")?;
     output.flush()?;
-    for line in input.lines() {
-        let line = line?;
+    while let Some(line) = read_line(&mut input)? {
+        let line = match line {
+            Ok(line) => line,
+            Err(()) => {
+                writeln!(output, "error: a line may be at most {MAX_LINE} characters")?;
+                write!(output, "> ")?;
+                output.flush()?;
+                continue;
+            }
+        };
         logger.line(&format!("console: {line}"));
         match execute(tpm, &line) {
             Outcome::Quit => {
@@ -92,11 +172,15 @@ pub fn serve<R: BufRead, W: Write>(
 }
 
 /// Start the console on its own thread.
+///
+/// The handle is passed rather than a lock on it. A lock held across the read
+/// of the next line would be held while the console sits idle, and with
+/// --verbose the transport writes its log to the same stream, so a command
+/// arriving while nobody is typing would wait for a person.
 pub fn spawn(tpm: Arc<Tpm>, logger: Arc<Logger>) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        if let Err(e) = serve(&tpm, &logger, stdin.lock(), stdout.lock()) {
+        if let Err(e) = serve(&tpm, &logger, stdin.lock(), std::io::stdout()) {
             logger.line(&format!("console ended: {e}"));
         }
     });
@@ -196,7 +280,7 @@ fn pcr(tpm: &Tpm, args: &[&str]) -> Result<String, String> {
             Ok(out)
         }),
         Some("read") => {
-            let index = number(args.get(1).copied(), "index")? as u16;
+            let index = number_u16(args.get(1).copied(), "index")?;
             tpm.with_state(|s| {
                 let bank = bank_of(s, args.get(2).copied())?;
                 let value = s.pcr.read(bank, index).map_err(|e| code(e))?;
@@ -204,20 +288,20 @@ fn pcr(tpm: &Tpm, args: &[&str]) -> Result<String, String> {
             })
         }
         Some("extend") => {
-            let index = number(args.get(1).copied(), "index")? as u16;
-            let digest = bytes(args.get(2).copied(), "digest")?;
+            let index = number_u16(args.get(1).copied(), "index")?;
+            let digest = bytes(args.get(2).copied(), "digest", MAX_DIGEST)?;
             tpm.with_state_mut(|s| {
                 let bank = bank_of(s, args.get(3).copied())?;
                 s.pcr
-                    .extend_digest(bank, index, &digest)
+                    .extend_one(bank, index, &digest)
                     .map_err(|e| code(e))?;
                 let value = s.pcr.read(bank, index).map_err(|e| code(e))?;
                 Ok(format!("{index} now {}", hex::encode(value)))
             })
         }
         Some("write") => {
-            let index = number(args.get(1).copied(), "index")? as u16;
-            let digest = bytes(args.get(2).copied(), "digest")?;
+            let index = number_u16(args.get(1).copied(), "index")?;
+            let digest = bytes(args.get(2).copied(), "digest", MAX_DIGEST)?;
             tpm.with_state_mut(|s| {
                 let bank = bank_of(s, args.get(3).copied())?;
                 s.pcr.set(bank, index, &digest).map_err(|e| code(e))?;
@@ -225,7 +309,7 @@ fn pcr(tpm: &Tpm, args: &[&str]) -> Result<String, String> {
             })
         }
         Some("reset") => {
-            let index = number(args.get(1).copied(), "index")? as u16;
+            let index = number_u16(args.get(1).copied(), "index")?;
             tpm.with_state_mut(|s| {
                 // The console is not bound by the locality a command would
                 // need, so the reset is made from the locality the register
@@ -269,13 +353,20 @@ fn nv(tpm: &Tpm, args: &[&str]) -> Result<String, String> {
         Some("read") => {
             let handle = number(args.get(1).copied(), "handle")?;
             let offset = match args.get(2) {
-                Some(v) => number(Some(v), "offset")? as u16,
+                Some(v) => number_u16(Some(v), "offset")?,
                 None => 0,
+            };
+            // Every argument is checked before the state is looked at, so a
+            // line reports what is wrong with itself rather than reporting the
+            // first thing the TPM happens to object to.
+            let given_size = match args.get(3) {
+                Some(v) => Some(number_u16(Some(v), "size")?),
+                None => None,
             };
             tpm.with_state(|s| {
                 let index = s.nv.get(handle).map_err(|e| code(e))?;
-                let size = match args.get(3) {
-                    Some(v) => number(Some(v), "size")? as u16,
+                let size = match given_size {
+                    Some(v) => v,
                     None => index.public.data_size.saturating_sub(offset),
                 };
                 let data = index.read(offset, size).map_err(|e| code(e))?;
@@ -284,8 +375,8 @@ fn nv(tpm: &Tpm, args: &[&str]) -> Result<String, String> {
         }
         Some("write") => {
             let handle = number(args.get(1).copied(), "handle")?;
-            let offset = number(args.get(2).copied(), "offset")? as u16;
-            let data = bytes(args.get(3).copied(), "data")?;
+            let offset = number_u16(args.get(2).copied(), "offset")?;
+            let data = bytes(args.get(3).copied(), "data", crate::tpm::config::MAX_NV_INDEX_SIZE)?;
             tpm.with_state_mut(|s| {
                 let index = s.nv.get_mut(handle).map_err(|e| code(e))?;
                 index.write(offset, &data).map_err(|e| code(e))?;
@@ -315,14 +406,14 @@ fn rng(tpm: &Tpm, args: &[&str]) -> Result<String, String> {
             ))
         }),
         Some("seed") => {
-            let entropy = bytes(args.get(1).copied(), "entropy")?;
+            let entropy = bytes(args.get(1).copied(), "entropy", MAX_STIR)?;
             tpm.with_state_mut(|s| {
                 s.rng.reseed(&entropy).map_err(|e| code(e))?;
                 Ok(format!("reseeded, counter {}", s.rng.reseed_counter()))
             })
         }
         Some("stir") => {
-            let data = bytes(args.get(1).copied(), "data")?;
+            let data = bytes(args.get(1).copied(), "data", MAX_STIR)?;
             tpm.with_state_mut(|s| {
                 s.rng.stir(&data).map_err(|e| code(e))?;
                 Ok("stirred".to_string())
@@ -386,7 +477,7 @@ fn key(tpm: &Tpm, args: &[&str]) -> Result<String, String> {
         }
         Some("auth") => {
             let handle = number(args.get(1).copied(), "handle")?;
-            let value = bytes(args.get(2).copied(), "auth")?;
+            let value = bytes(args.get(2).copied(), "auth", MAX_DIGEST)?;
             let limit = crate::tpm::crypto::hash::digest_size(alg::SHA512).unwrap_or(64);
             if value.len() > limit {
                 return Err(format!("an authorization value is at most {limit} octets"));
@@ -516,9 +607,22 @@ fn number(text: Option<&str>, what: &str) -> Result<u32, String> {
     parsed.map_err(|_| format!("{what} {text} is not a number"))
 }
 
-/// Octets given as hex.
-fn bytes(text: Option<&str>, what: &str) -> Result<Vec<u8>, String> {
+/// A number that has to fit in a u16, so a cast cannot change which register
+/// or offset the line meant.
+fn number_u16(text: Option<&str>, what: &str) -> Result<u16, String> {
+    let value = number(text, what)?;
+    u16::try_from(value).map_err(|_| format!("{what} {value} is too large"))
+}
+
+/// Octets given as hex, at most `max` of them.
+///
+/// The length is checked before decoding, so a long argument is refused rather
+/// than allocated and then rejected.
+fn bytes(text: Option<&str>, what: &str, max: usize) -> Result<Vec<u8>, String> {
     let text = text.ok_or(format!("{what} is needed"))?;
+    if text.len() > max * 2 {
+        return Err(format!("{what} is at most {max} octets"));
+    }
     hex::decode(text).map_err(|_| format!("{what} is not hex"))
 }
 

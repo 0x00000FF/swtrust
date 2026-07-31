@@ -262,6 +262,21 @@ impl PcrBanks {
             .ok_or(TpmRc(rc::VALUE))
     }
 
+    /// Extend one register in one bank and advance the update counter.
+    ///
+    /// TPM2_PCR_Extend goes through [`PcrBanks::extend`], which checks the
+    /// locality first and counts the whole command once. The debug console is
+    /// not bound by locality but must still leave the counter right: a policy
+    /// that recorded the counter has to stop matching once the register it
+    /// covers has changed, which is Part 1 clause 16.7.7.6.
+    pub fn extend_one(&mut self, hash_alg: u16, index: u16, digest: &[u8]) -> TpmResult<()> {
+        self.extend_digest(hash_alg, index, digest)?;
+        if !no_increment(index) {
+            self.update_counter = self.update_counter.wrapping_add(1);
+        }
+        Ok(())
+    }
+
     /// Put a digest straight into a register.
     ///
     /// No TPM command does this. The debug console uses it to place a register
