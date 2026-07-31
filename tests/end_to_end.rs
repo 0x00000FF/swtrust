@@ -2122,4 +2122,36 @@ fn an_rsa_key_whose_modulus_disagrees_with_key_bits_is_refused() {
         &p.finish().unwrap(),
     ));
     assert_eq!(r.code, rc::SUCCESS, "got {:08x}", r.code);
+
+    // A 2047 bit modulus fits in the same 256 octets, so a check that counted
+    // octets would let it through as a 2048 bit key.
+    let mut short = [0xabu8; 256];
+    short[0] = 0x7f;
+    let mut t = Writer::new();
+    t.u16(alg::RSA);
+    t.u16(alg::SHA256);
+    t.u32(0x0040 | 0x0004_0000);
+    t.u16(0);
+    t.u16(0x0010);
+    t.u16(0x0016);
+    t.u16(alg::SHA256);
+    t.u16(2048);
+    t.u32(0);
+    t.u16(256);
+    t.bytes(&short);
+    let template = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u32(rh::NULL);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::LoadExternal,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, expected, "a 2047 bit modulus -> {:08x}", r.code);
 }

@@ -526,11 +526,13 @@ pub fn sign_digest(
             let block = match scheme.scheme {
                 alg::RSASSA => rsa::pkcs1v15_sign_encode(hash_alg, digest, size)?,
                 alg::RSAPSS => {
-                    // emBits comes from the modulus the key actually has. A
+                    // emBits is one less than the bit length of the modulus the
+                    // key actually has, which is what the verifier uses too. A
                     // public area whose keyBits disagrees is refused when the
-                    // object is loaded, and sizing the padding here from the
-                    // key keeps that disagreement from running off the block.
-                    let em = rsa::pss_encode(hash_alg, digest, size * 8, &mut state.rng)?;
+                    // object is loaded, and taking the length from the key here
+                    // keeps that disagreement from running off the block.
+                    let em =
+                        rsa::pss_encode(hash_alg, digest, key.public.bits(), &mut state.rng)?;
                     let mut b = vec![0u8; size - em.len()];
                     b.extend_from_slice(&em);
                     b

@@ -362,19 +362,34 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
 
     // Part 2 Table 195 defines keyBits as the number of bits in the public
     // modulus, and Part 3 clause 12.2 requires the key size to agree with the
-    // public area or the answer is TPM_RC_KEY_SIZE. A creation template names
-    // no modulus yet, so only a public area that carries one is checked.
+    // public area or the answer is TPM_RC_KEY_SIZE. The count is of the bits
+    // the modulus actually has, not of the octets it was sent in, so a 2047
+    // bit modulus does not pass as a 2048 bit one just by being padded. A
+    // creation template names no modulus yet, so only a public area that
+    // carries one is checked.
     if let (
         crate::tpm::structures::keys::PublicId::Rsa(modulus),
         crate::tpm::structures::keys::PublicParms::Rsa { key_bits, .. },
     ) = (&public.unique, &public.parameters)
     {
-        if !modulus.is_empty() && modulus.as_slice().len() * 8 != *key_bits as usize {
+        if !modulus.is_empty() && significant_bits(modulus.as_slice()) != *key_bits as usize {
             return Err(TpmRc(rc::KEY_SIZE));
         }
     }
 
     Ok(())
+}
+
+/// The number of bits in a big endian integer, ignoring leading zero octets.
+pub fn significant_bits(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == 0 {
+        i += 1;
+    }
+    if i == bytes.len() {
+        return 0;
+    }
+    (bytes.len() - i - 1) * 8 + (8 - bytes[i].leading_zeros() as usize)
 }
 
 #[cfg(test)]
@@ -654,6 +669,49 @@ mod tests {
         let mut template = rsa_public(2048, 256);
         template.unique = PublicId::Rsa(Default::default());
         assert!(validate_public(&template).is_ok());
+    }
+
+    #[test]
+    fn an_rsa_modulus_is_counted_in_bits_not_octets() {
+        use crate::tpm::structures::base::Tpm2bPublicKeyRsa;
+        // A 2047 bit modulus fits in 256 octets, so counting octets would let
+        // it pass as a 2048 bit key. Counting bits refuses it.
+        let mut short = vec![0xabu8; 256];
+        short[0] = 0x7f;
+        let mut p = rsa_public(2048, 256);
+        p.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&short).unwrap());
+        assert_eq!(significant_bits(&short), 2047);
+        assert_eq!(validate_public(&p).unwrap_err(), TpmRc(rc::KEY_SIZE));
+
+        // Leading zero octets do not make a modulus longer either.
+        let mut padded = vec![0u8; 256];
+        padded[128] = 0x80;
+        let mut p = rsa_public(2048, 256);
+        p.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&padded).unwrap());
+        assert_eq!(significant_bits(&padded), 1024);
+        assert_eq!(validate_public(&p).unwrap_err(), TpmRc(rc::KEY_SIZE));
+
+        // A modulus with its top bit set is the stated length.
+        let mut full = vec![0xabu8; 256];
+        full[0] = 0x80;
+        let mut p = rsa_public(2048, 256);
+        p.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&full).unwrap());
+        assert_eq!(significant_bits(&full), 2048);
+        assert!(validate_public(&p).is_ok());
+    }
+
+    #[test]
+    fn significant_bits_counts_what_is_there() {
+        assert_eq!(significant_bits(&[]), 0);
+        assert_eq!(significant_bits(&[0x00]), 0);
+        assert_eq!(significant_bits(&[0x00, 0x00]), 0);
+        assert_eq!(significant_bits(&[0x01]), 1);
+        assert_eq!(significant_bits(&[0x7f]), 7);
+        assert_eq!(significant_bits(&[0x80]), 8);
+        assert_eq!(significant_bits(&[0xff]), 8);
+        assert_eq!(significant_bits(&[0x01, 0x00]), 9);
+        assert_eq!(significant_bits(&[0x00, 0x80]), 8);
+        assert_eq!(significant_bits(&[0xff, 0xff]), 16);
     }
 }
 
