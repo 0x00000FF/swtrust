@@ -377,6 +377,26 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
         }
     }
 
+    // An ECC public area names a point, and a point that is not on the curve is
+    // not a public key. Every use of it fails later anyway, because the point
+    // is validated whenever it is loaded into the library, but a key the TPM
+    // accepted has a Name that stands for nothing, so it is refused here. A
+    // creation template carries no point yet, so only one that does is checked.
+    if let (
+        crate::tpm::structures::keys::PublicId::Ecc(point),
+        crate::tpm::structures::keys::PublicParms::Ecc { curve_id, .. },
+    ) = (&public.unique, &public.parameters)
+    {
+        if !point.x.is_empty() || !point.y.is_empty() {
+            let curve = crate::tpm::crypto::ecc::Curve::new(*curve_id)?;
+            crate::tpm::crypto::ecc::Point::from_coordinates(
+                &curve,
+                point.x.as_slice(),
+                point.y.as_slice(),
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -698,6 +718,40 @@ mod tests {
         p.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&full).unwrap());
         assert_eq!(significant_bits(&full), 2048);
         assert!(validate_public(&p).is_ok());
+    }
+
+    #[test]
+    fn an_ecc_public_point_must_be_on_its_curve() {
+        use crate::tpm::structures::base::Tpm2bEccParameter;
+        use crate::tpm::structures::schemes::EccPoint;
+
+        let with_point = |x: Vec<u8>, y: Vec<u8>| {
+            let mut p = public(ObjectAttributes::SIGN_ENCRYPT);
+            p.unique = PublicId::Ecc(EccPoint {
+                x: Tpm2bEccParameter::new(x).unwrap(),
+                y: Tpm2bEccParameter::new(y).unwrap(),
+            });
+            p
+        };
+
+        // A point that does not satisfy the curve equation is refused.
+        let bad = with_point(vec![0x11; 32], vec![0x22; 32]);
+        assert_eq!(
+            validate_public(&bad).unwrap_err(),
+            TpmRc(rc::ECC_POINT),
+            "an off curve point was accepted"
+        );
+
+        // So is one whose coordinates are not the right size for the curve.
+        assert!(validate_public(&with_point(vec![0x01; 8], vec![0x02; 8])).is_err());
+
+        // A real point on P-256 is accepted.
+        let mut rng = crate::tpm::crypto::rand::Drbg::new(&[0x77u8; 48], b"t").unwrap();
+        let key = crate::tpm::crypto::ecc::generate(curve::NIST_P256, &mut rng).unwrap();
+        assert!(validate_public(&with_point(key.public_x.clone(), key.public_y.clone())).is_ok());
+
+        // A creation template names no point yet, so it is left alone.
+        assert!(validate_public(&public(ObjectAttributes::SIGN_ENCRYPT)).is_ok());
     }
 
     #[test]
