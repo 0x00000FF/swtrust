@@ -11,6 +11,7 @@ pub mod hierarchy;
 pub mod management;
 pub mod nv;
 pub mod object;
+pub mod parameter_check;
 pub mod pcr;
 pub mod policy;
 pub mod signing;
