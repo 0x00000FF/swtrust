@@ -124,7 +124,9 @@ pub const COMMANDS: &[CommandInfo] = &[
     nv(cc::FieldUpgradeData, 0, 0),
     plain(cc::IncrementalSelfTest, 0, 0),
     plain(cc::SelfTest, 0, 0),
-    plain(cc::Startup, 0, 0),
+    // Part 3 Table 8 marks TPM2_Startup {NV}: it records that the TPM is
+    // running, so a later power loss is seen as the disorderly shutdown it is.
+    nv(cc::Startup, 0, 0),
     nv(cc::Shutdown, 0, 0),
     plain(cc::StirRandom, 0, 0),
     plain(cc::ActivateCredential, 2, 2),

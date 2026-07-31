@@ -278,9 +278,11 @@ impl TpmState {
             self.clock.restart_count = 0;
         }
         self.clock.time = 0;
-        // Part 1 clause 32 keeps the command audit digest across an orderly
-        // shutdown and drops it when power was lost without one.
-        if disorderly {
+        // Part 1 clause 34.4 lists the command audit digest among the values a
+        // TPM Reset returns to their initialization value. A TPM Restart keeps
+        // it, which is what clause 32 means by preserving it over an orderly
+        // shutdown.
+        if !restart {
             self.audit.digest.clear();
         }
         self.audit.exclusive_session = rh::UNASSIGNED;
@@ -294,10 +296,10 @@ impl TpmState {
     /// Resume still discards are cleared.
     pub fn on_startup_state(&mut self) -> TpmResult<()> {
         self.objects.flush_st_clear();
-        // The lock bits that a Startup(CLEAR) drops are dropped here too,
-        // because TPMA_NV_READ_STCLEAR and TPMA_NV_WRITE_STCLEAR are cleared
-        // by every _TPM_Init, not by the startup type.
-        self.nv.on_startup_clear_with(false);
+        // Part 1 clause 8.6.2 keeps the Resume PCR and puts every other
+        // register back to its initial value. The NV STCLEAR locks are not
+        // touched, because they go away on a TPM Reset or a TPM Restart only.
+        self.pcr.on_resume();
         self.clock.restart_count = self.clock.restart_count.wrapping_add(1);
         self.clock.time = 0;
         self.begin_operation(true);
@@ -396,6 +398,10 @@ impl TpmState {
         for a in &self.pcr_allocation {
             w.u16(*a);
         }
+        // A TPM Resume restores the Resume PCR, so their values have to come
+        // back with the rest of the state.
+        self.pcr.marshal_values(&mut w);
+        w.u32(self.pcr.update_counter());
 
         w.u32(self.pp_commands.len() as u32);
         for c in &self.pp_commands {
@@ -479,6 +485,11 @@ impl TpmState {
 
         let count = bounded_count(&mut r, config::HASH_COUNT)?;
         state.pcr_allocation = (0..count).map(|_| r.u16()).collect::<TpmResult<_>>()?;
+        // The banks the saved allocation names are what the TPM comes up with,
+        // then the saved register values go back into them.
+        state.pcr = PcrBanks::new(&state.pcr_allocation)?;
+        state.pcr.unmarshal_values(&mut r)?;
+        let saved_update_counter = r.u32()?;
 
         let count = bounded_count(&mut r, 512)?;
         state.pp_commands = (0..count).map(|_| r.u32()).collect::<TpmResult<_>>()?;
@@ -530,8 +541,7 @@ impl TpmState {
         if !r.is_empty() {
             return Err(TpmRc(rc::BAD_CONTEXT));
         }
-        // The banks the saved allocation names are what the TPM comes up with.
-        state.pcr = PcrBanks::new(&state.pcr_allocation)?;
+        state.pcr.set_update_counter(saved_update_counter);
         Ok(state)
     }
 }
@@ -665,6 +675,108 @@ mod tests {
         // A write to RAM backed NV data puts the bit back down.
         s.nv_is_no_longer_orderly();
         assert!(!s.startup_clear.has(StartupClearAttributes::ORDERLY));
+    }
+
+    #[test]
+    fn a_resume_keeps_the_resume_pcr_and_resets_the_rest() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        s.pcr
+            .extend(0, 0, &[(alg::SHA256, vec![1u8; 32])])
+            .unwrap();
+        s.pcr
+            .extend(23, 3, &[(alg::SHA256, vec![2u8; 32])])
+            .unwrap();
+        let saved = s.pcr.read(alg::SHA256, 0).unwrap().to_vec();
+        assert!(s.pcr.read(alg::SHA256, 23).unwrap().iter().any(|v| *v != 0));
+
+        s.shutdown_type = su::STATE;
+        s.on_startup_state().unwrap();
+        // PCR 0 is a Resume PCR, so it keeps its value.
+        assert_eq!(s.pcr.read(alg::SHA256, 0).unwrap(), saved);
+        // PCR 23 is not, so it goes back to its initial value.
+        assert!(s.pcr.read(alg::SHA256, 23).unwrap().iter().all(|v| *v == 0));
+        // PCR 17 starts at ones, so that is where it returns to.
+        assert!(s
+            .pcr
+            .read(alg::SHA256, 17)
+            .unwrap()
+            .iter()
+            .all(|v| *v == 0xff));
+    }
+
+    #[test]
+    fn a_resume_keeps_the_nv_locks_that_a_reset_would_drop() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+
+        let mut public = crate::tpm::structures::nv::NvPublic {
+            nv_index: hc::NV_INDEX_FIRST,
+            name_alg: alg::SHA256,
+            attributes: crate::tpm::structures::attributes::NvAttributes(
+                crate::tpm::structures::attributes::NvAttributes::AUTHREAD
+                    | crate::tpm::structures::attributes::NvAttributes::AUTHWRITE
+                    | crate::tpm::structures::attributes::NvAttributes::READ_STCLEAR,
+            ),
+            auth_policy: crate::tpm::structures::base::Tpm2bDigest::empty(),
+            data_size: 8,
+        };
+        public.attributes = public.attributes.with(
+            crate::tpm::structures::attributes::NvAttributes::WRITE_STCLEAR,
+        );
+        s.nv
+            .define(crate::tpm::core::nv::NvIndex {
+                public,
+                auth: Vec::new(),
+                data: Vec::new(),
+                read_locked: false,
+                write_locked: false,
+            })
+            .unwrap();
+        s.nv.get_mut(hc::NV_INDEX_FIRST)
+            .unwrap()
+            .set_read_lock(true);
+
+        // A TPM Resume leaves the lock alone.
+        s.shutdown_type = su::STATE;
+        s.on_startup_state().unwrap();
+        assert!(s.nv.get(hc::NV_INDEX_FIRST).unwrap().read_locked);
+
+        // A TPM Reset drops it.
+        s.shutdown_type = su::CLEAR;
+        s.on_startup_clear().unwrap();
+        assert!(!s.nv.get(hc::NV_INDEX_FIRST).unwrap().read_locked);
+    }
+
+    #[test]
+    fn the_command_audit_digest_survives_a_restart_but_not_a_reset() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        s.audit.digest = vec![7u8; 32];
+
+        s.shutdown_type = su::STATE;
+        s.on_startup_clear().unwrap();
+        assert_eq!(s.audit.digest, vec![7u8; 32], "a TPM Restart keeps it");
+
+        s.shutdown_type = su::CLEAR;
+        s.on_startup_clear().unwrap();
+        assert!(s.audit.digest.is_empty(), "a TPM Reset drops it");
+    }
+
+    #[test]
+    fn the_pcr_values_survive_a_save_and_load() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        s.pcr
+            .extend(0, 0, &[(alg::SHA256, vec![3u8; 32])])
+            .unwrap();
+        let expected = s.pcr.read(alg::SHA256, 0).unwrap().to_vec();
+        let counter = s.pcr.update_counter();
+
+        let saved = s.save().unwrap();
+        let loaded = TpmState::load(&saved).unwrap();
+        assert_eq!(loaded.pcr.read(alg::SHA256, 0).unwrap(), expected);
+        assert_eq!(loaded.pcr.update_counter(), counter);
     }
 
     #[test]

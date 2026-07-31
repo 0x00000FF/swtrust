@@ -12,6 +12,7 @@ use crate::tpm::config;
 use crate::tpm::constants::rc;
 use crate::tpm::crypto::hash;
 use crate::tpm::error::{TpmRc, TpmResult};
+use crate::tpm::marshal::{Reader, Writer};
 use crate::tpm::structures::base::{digest_size, PcrSelect, PcrSelection};
 use crate::tpm::structures::lists::TpmlPcrSelection;
 
@@ -180,11 +181,77 @@ impl PcrBanks {
 
     /// Put the update counter back to zero.
     ///
-    /// Part 1 clause 17.8 keeps the counter across a TPM Resume, and starts it
+    /// Part 1 clause 34.4 keeps the counter across a TPM Resume, and starts it
     /// again from zero on a TPM Reset or a TPM Restart, because the registers
     /// go back to their reset values at the same time.
     pub fn reset_update_counter(&mut self) {
         self.update_counter = 0;
+    }
+
+    /// Put the counter back to a value that came from the state file.
+    pub fn set_update_counter(&mut self, value: u32) {
+        self.update_counter = value;
+    }
+
+    /// Apply a TPM Resume to the registers.
+    ///
+    /// Part 1 clause 8.6.2 keeps the value of a Resume PCR across a TPM Resume
+    /// and puts every other register back to its default initial value.
+    pub fn on_resume(&mut self) {
+        for (hash_alg, bank) in self.banks.iter_mut() {
+            let Some(size) = digest_size(*hash_alg) else {
+                continue;
+            };
+            for (index, value) in bank.iter_mut().enumerate() {
+                if is_saved(index as u16) {
+                    continue;
+                }
+                let fill = if attributes(index as u16).starts_at_ones {
+                    0xffu8
+                } else {
+                    0x00
+                };
+                *value = vec![fill; size];
+            }
+        }
+    }
+
+    /// Marshal every bank, so the values a TPM Resume restores survive a
+    /// reload of the state file.
+    pub fn marshal_values(&self, w: &mut Writer) {
+        w.u32(self.banks.len() as u32);
+        for (hash_alg, bank) in &self.banks {
+            w.u16(*hash_alg);
+            w.u32(bank.len() as u32);
+            for value in bank {
+                w.sized16(value);
+            }
+        }
+    }
+
+    /// Restore the values [`PcrBanks::marshal_values`] wrote.
+    ///
+    /// A bank or register that the current allocation does not have is
+    /// discarded, so a state file written under a different allocation still
+    /// loads.
+    pub fn unmarshal_values(&mut self, r: &mut Reader<'_>) -> TpmResult<()> {
+        let banks = r.u32()?;
+        for _ in 0..banks {
+            let hash_alg = r.u16()?;
+            let count = r.u32()? as usize;
+            for index in 0..count {
+                let size = r.u16()? as usize;
+                let value = r.take(size)?.to_vec();
+                if let Some(bank) = self.banks.get_mut(&hash_alg) {
+                    if let Some(slot) = bank.get_mut(index) {
+                        if slot.len() == value.len() {
+                            *slot = value;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read one register.
