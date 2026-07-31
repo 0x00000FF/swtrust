@@ -390,6 +390,90 @@ fn a_commit_completes_an_ecdaa_signature_and_is_then_spent() {
 }
 
 #[test]
+fn full_mqv_returns_one_point_computed_from_both_keys() {
+    // Part 1 clause 44.8.4.3. The scheme produces a single value in outZ1,
+    // built from the static and ephemeral private keys and both peer points,
+    // so it has to differ from what the Full Unified Model gives and it has
+    // to be a real point.
+    let h = harness("mqv");
+    let (handle, _) = primary(&h, 0x0010, None);
+    let group = ecc::Curve::new(curve::NIST_P256).unwrap();
+
+    let mut rng = swtrust::tpm::crypto::rand::Drbg::new(&[0x71u8; 48], b"peer").unwrap();
+    let qs_b = ecc::generate(curve::NIST_P256, &mut rng).unwrap();
+    let qe_b = ecc::generate(curve::NIST_P256, &mut rng).unwrap();
+
+    let two_phase = |scheme: u16| {
+        let mut p = Writer::new();
+        p.u16(curve::NIST_P256);
+        let r = send(
+            &h,
+            &command(st::NO_SESSIONS, cc::EC_Ephemeral, &[], None, &p.finish().unwrap()),
+        );
+        assert_eq!(r.code, rc::SUCCESS, "EC_Ephemeral -> {:08x}", r.code);
+        let mut rd = Reader::new(&r.body);
+        let n = rd.u16().unwrap() as usize;
+        rd.take(n).unwrap();
+        let counter = rd.u16().unwrap();
+
+        let mut p = Writer::new();
+        for k in [&qs_b, &qe_b] {
+            let mut inner = Writer::new();
+            inner.u16(k.public_x.len() as u16);
+            inner.bytes(&k.public_x);
+            inner.u16(k.public_y.len() as u16);
+            inner.bytes(&k.public_y);
+            let inner = inner.finish().unwrap();
+            p.u16(inner.len() as u16);
+            p.bytes(&inner);
+        }
+        p.u16(scheme);
+        p.u16(counter);
+        let r = send(
+            &h,
+            &command(
+                st::SESSIONS,
+                cc::ZGen_2Phase,
+                &[handle],
+                Some(&PASSWORD),
+                &p.finish().unwrap(),
+            ),
+        );
+        assert_eq!(r.code, rc::SUCCESS, "ZGen_2Phase -> {:08x}", r.code);
+        let mut rd = Reader::new(&r.body);
+        rd.u32().unwrap();
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let n = rd.u16().unwrap() as usize;
+            let inner = rd.take(n).unwrap().to_vec();
+            let mut ir = Reader::new(&inner);
+            let xn = ir.u16().unwrap() as usize;
+            let x = ir.take(xn).unwrap().to_vec();
+            let yn = ir.u16().unwrap() as usize;
+            let y = ir.take(yn).unwrap().to_vec();
+            out.push((x, y));
+        }
+        out
+    };
+
+    let mqv = two_phase(alg::ECMQV);
+    assert!(!mqv[0].0.is_empty(), "outZ1 should be a point");
+    assert!(
+        mqv[1].0.is_empty(),
+        "Full MQV produces one value, so outZ2 is the point at infinity"
+    );
+    assert!(
+        ecc::Point::from_coordinates(&group, &mqv[0].0, &mqv[0].1).is_ok(),
+        "outZ1 is not on the curve"
+    );
+
+    // The two schemes cannot give the same answer, or one of them is wrong.
+    let unified = two_phase(alg::ECDH);
+    assert_ne!(mqv[0].0, unified[0].0);
+    assert_ne!(mqv[0].0, unified[1].0);
+}
+
+#[test]
 fn a_commit_still_works_after_a_resume() {
     // The commit nonce is not written to the state file, so a resumed TPM has
     // to take a new one. Without that it would have none at all and every
