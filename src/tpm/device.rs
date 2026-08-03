@@ -86,6 +86,14 @@ pub struct Tpm {
     state: Mutex<TpmState>,
     powered: AtomicBool,
     cancel: AtomicBool,
+    /// The platform establishment flag, set by _TPM_Hash_Start.
+    ///
+    /// It is kept here rather than in the state file because it belongs to the
+    /// register interface a platform presents, not to the TPM state the Library
+    /// specification defines. The document that fixes how long it survives is
+    /// the PC Client Platform TPM Profile, which is not among the references, so
+    /// nothing is claimed about it here beyond what Part 1 clause 34.3 settles.
+    established: AtomicBool,
     store: StateStore,
     logger: Arc<Logger>,
 }
@@ -144,6 +152,7 @@ impl Tpm {
             state: Mutex::new(state),
             powered: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
+            established: AtomicBool::new(false),
             store,
             logger,
         })
@@ -275,8 +284,10 @@ impl Device for Tpm {
         self.cancel.store(asserted, Ordering::SeqCst);
     }
 
-    /// _TPM_Hash_Start begins an H-CRTM event sequence, Part 1 clause 34.3.
+    /// _TPM_Hash_Start begins an H-CRTM event sequence, Part 1 clause 34.3, and
+    /// records that one has begun.
     fn hash_start(&self) {
+        self.established.store(true, Ordering::SeqCst);
         let mut state = self.locked();
         state.hcrtm_buffer = Some(Vec::new());
     }
@@ -309,6 +320,14 @@ impl Device for Tpm {
                 .pcr
                 .extend(crate::tpm::config::HCRTM_PCR, 4, &[(a, digest)]);
         }
+    }
+
+    fn established(&self) -> bool {
+        self.established.load(Ordering::SeqCst)
+    }
+
+    fn reset_established(&self, _locality: u8) {
+        self.established.store(false, Ordering::SeqCst);
     }
 
     fn act_get_signaled(&self, _act: u32) -> bool {

@@ -6,8 +6,12 @@
 //!   platform control port, which is what existing TPM tooling expects.
 //! * `pipe` exposes a Windows named pipe that carries bare TPM command and
 //!   response buffers.
+//! * `qemu` splits the two apart the way a virtual machine monitor expects: a
+//!   data channel carrying bare command and response buffers, and a control
+//!   channel carrying the platform requests.
 
 pub mod pipe;
+pub mod qemu;
 pub mod simulator;
 pub mod socket;
 
@@ -49,6 +53,23 @@ pub trait Device: Send + Sync {
     fn hash_data(&self, data: &[u8]);
     fn hash_end(&self);
 
+    /// The platform establishment flag.
+    ///
+    /// The flag records that an H-CRTM event sequence has begun. Part 1 clause
+    /// 34.3 defines the sequence, but the flag itself is read and cleared
+    /// through the register interface rather than through a command, and that
+    /// interface is defined by the PC Client Platform TPM Profile, which is not
+    /// among the references. What is implemented here is therefore the part the
+    /// Library specification settles: _TPM_Hash_Start sets it.
+    fn established(&self) -> bool;
+
+    /// Clear the establishment flag on behalf of `locality`.
+    ///
+    /// Which localities may clear it is a property of that same register
+    /// interface, so the platform is trusted to have made that decision before
+    /// asking.
+    fn reset_established(&self, locality: u8);
+
     /// True when the authenticated timer `act` has signaled.
     fn act_get_signaled(&self, act: u32) -> bool;
 }
@@ -76,5 +97,6 @@ pub fn run(config: Config) -> io::Result<()> {
     match config.interface {
         Interface::Socket => socket::serve(&config, tpm, logger),
         Interface::Pipe => pipe::serve(&config, tpm, logger),
+        Interface::Qemu => qemu::serve(&config, tpm, logger),
     }
 }

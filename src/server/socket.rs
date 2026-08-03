@@ -371,6 +371,12 @@ mod tests {
         fn hash_end(&self) {
             self.log("hash_end");
         }
+        fn established(&self) -> bool {
+            false
+        }
+        fn reset_established(&self, locality: u8) {
+            self.log(&format!("reset_established loc={locality}"));
+        }
         fn act_get_signaled(&self, act: u32) -> bool {
             act == 0
         }

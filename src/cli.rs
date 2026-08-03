@@ -10,6 +10,9 @@ pub enum Interface {
     Socket,
     /// Windows named pipe.
     Pipe,
+    /// TCP sockets carrying a data channel and a control channel, which is what
+    /// a virtual machine monitor attaches to.
+    Qemu,
 }
 
 impl fmt::Display for Interface {
@@ -17,6 +20,7 @@ impl fmt::Display for Interface {
         match self {
             Interface::Socket => f.write_str("socket"),
             Interface::Pipe => f.write_str("pipe"),
+            Interface::Qemu => f.write_str("qemu"),
         }
     }
 }
@@ -76,10 +80,13 @@ pub const HELP: &str = concat!(
     "    swtrust [OPTIONS]\n",
     "\n",
     "OPTIONS:\n",
-    "    -i, --interface <socket|pipe>  Transport to listen on. Default: socket\n",
-    "    -a, --address <addr>           Bind address for the socket interface. Default: 127.0.0.1\n",
-    "    -p, --port <port>              Command port for the socket interface. Default: 2321\n",
-    "                                   The platform control port is <port> + 1.\n",
+    "    -i, --interface <socket|pipe|qemu>\n",
+    "                                   Transport to listen on. Default: socket\n",
+    "    -a, --address <addr>           Bind address for the socket interfaces. Default: 127.0.0.1\n",
+    "    -p, --port <port>              Command port for the socket interfaces. Default: 2321\n",
+    "                                   socket: the platform control port is <port> + 1.\n",
+    "                                   qemu:   <port> carries commands and <port> + 1 the\n",
+    "                                           control channel.\n",
     "    -n, --pipe-name <name>         Named pipe path. Default: \\\\.\\pipe\\swtrust\n",
     "    -s, --state <dir>              Directory holding the TPM state file. Default: ./state\n",
     "    -l, --log-dir <dir>            Directory for YYYY-MM-DD.log files. Default: .\n",
@@ -133,9 +140,10 @@ where
                 cfg.interface = match v.to_ascii_lowercase().as_str() {
                     "socket" | "tcp" => Interface::Socket,
                     "pipe" | "named-pipe" | "namedpipe" => Interface::Pipe,
+                    "qemu" | "vmm" => Interface::Qemu,
                     other => {
                         return Err(format!(
-                            "unknown interface '{other}', expected 'socket' or 'pipe'"
+                            "unknown interface '{other}', expected 'socket', 'pipe' or 'qemu'"
                         ))
                     }
                 };
