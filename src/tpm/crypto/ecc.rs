@@ -326,6 +326,35 @@ pub fn private_key_from_rng(curve: &Curve, rng: &mut dyn Rng) -> TpmResult<BigNu
     Err(TpmRc(rc::NO_RESULT))
 }
 
+/// Draw a private scalar by the extra random bits method of FIPS 186-5 A.2.1.
+///
+/// Part 1 clause 25.4.1 names this method for object derivation and gives the
+/// count: "For a 256-bit ECC key, the most-significant 40 bytes are used to
+/// generate the private key". That is the order's length plus 64 bits, reduced
+/// modulo one less than the order, with one added. Unlike testing candidates it
+/// takes a fixed number of octets and rejects none of them, which is what lets
+/// clause 25.4.1 say the octets after it are the seedValue.
+pub fn private_key_extra_bits(curve: &Curve, rng: &mut dyn Rng) -> TpmResult<BigNum> {
+    let order = curve.order()?;
+    let bytes = rng.bytes(curve.coordinate_size() + 8)?;
+    let candidate = BigNum::from_bytes(&bytes)?;
+    let ctx = BnCtx::new()?;
+    let reduced = candidate.modulo(&order.sub_word(1)?, &ctx)?;
+    reduced.add_word(1)
+}
+
+/// Build a key pair from a private scalar that was drawn elsewhere.
+pub fn key_from_private(curve: Curve, private: BigNum) -> TpmResult<EccKey> {
+    let point = multiply_generator(&curve, &private)?;
+    let (public_x, public_y) = point.coordinates(&curve)?;
+    Ok(EccKey {
+        curve,
+        private,
+        public_x,
+        public_y,
+    })
+}
+
 /// Generate a key pair, taking every octet from `rng`.
 pub fn generate(curve_id: u16, rng: &mut dyn Rng) -> TpmResult<EccKey> {
     let curve = Curve::new(curve_id)?;

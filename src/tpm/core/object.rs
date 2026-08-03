@@ -404,6 +404,31 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
     Ok(())
 }
 
+/// Check a template the TPM is about to make an object from.
+///
+/// TPM2_Create, TPM2_CreatePrimary and TPM2_CreateLoaded share the rules of
+/// Part 3 clause 12.1, which are stricter than the ones an already made object
+/// has to satisfy when it is loaded.
+pub fn validate_creation_template(public: &TpmtPublic) -> TpmResult<()> {
+    validate_public(public)?;
+
+    // Part 3 clause 12.1: "If the Object is a not a keyedHash object, and the
+    // sign and encrypt attributes are CLEAR, the TPM shall return
+    // TPM_RC_ATTRIBUTES." A key that can neither sign nor decrypt can do
+    // nothing, and only a keyed hash object is allowed to be inert, because
+    // that is what a sealed data object is.
+    if public.object_type != alg::KEYEDHASH
+        && !public
+            .object_attributes
+            .has(ObjectAttributes::SIGN_ENCRYPT)
+        && !public.object_attributes.has(ObjectAttributes::DECRYPT)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES));
+    }
+
+    Ok(())
+}
+
 /// Check a public area that carries a key, for TPM2_Load and TPM2_LoadExternal.
 ///
 /// These are the checks of the unique field that a creation template is exempt

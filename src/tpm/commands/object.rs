@@ -1,4 +1,4 @@
-//! Object management, Part 3 clause 12, and Part 1 clauses 25 to 27.
+﻿//! Object management, Part 3 clause 12, and Part 1 clauses 25 to 27.
 
 use crate::tpm::constants::{alg, rc, rh, st};
 use crate::tpm::core::names;
@@ -41,13 +41,18 @@ const LABEL_PRIMARY: &str = "PRIMARY";
 /// sentences mean by the template, not the modulus or point the TPM is about to
 /// put in its place, so leaving it out would let two templates the caller wrote
 /// differently produce one key.
+///
+/// The same sentence names inSensitive.data and not the rest of inSensitive.
+/// The authorization value is copied into the object afterwards, Part 1 clause
+/// 24.7.3, so a caller that asks for the same key under a new authorization has
+/// to get the same key.
 fn primary_context(
     template: &TpmtPublic,
     sensitive: &Tpm2bSensitiveCreate,
 ) -> TpmResult<Vec<u8>> {
     let mut w = Writer::new();
     template.marshal(&mut w);
-    sensitive.marshal(&mut w);
+    sensitive.sensitive.data.marshal(&mut w);
     let body = w.finish()?;
     hash::digest(
         if template.name_alg == alg::NULL {
@@ -248,7 +253,7 @@ pub fn create_primary(state: &mut TpmState, request: &Request) -> TpmResult<Resp
         return Err(TpmRc(rc::HIERARCHY).with_handle(1));
     }
     let template = in_public.public_area;
-    object::validate_public(&template).map_err(|e| e.with_parameter(2))?;
+    object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
 
     let seed = state.hierarchies.get(primary_handle)?.seed.clone();
     let context = primary_context(&template, &in_sensitive)?;
@@ -380,7 +385,7 @@ pub fn create(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 
     let parent = parent_of(state, parent_handle).map_err(|e| e.with_handle(1))?;
     let template = in_public.public_area;
-    object::validate_public(&template).map_err(|e| e.with_parameter(2))?;
+    object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
     // A child that is fixedTPM must be created by the TPM it will live in.
     if template
         .object_attributes
@@ -474,37 +479,31 @@ fn derivation_parent(state: &TpmState, handle: u32) -> TpmResult<Option<Derivati
     if !object.is_derivation_parent() {
         return Ok(None);
     }
+    derivation_parent_of(object).map(Some)
+}
 
-    // Part 1 clause 25.2: "The KDF that is to be used in Object derivation is a
-    // property of the Derivation Parent and can include the hash algorithm to
-    // use in the derivation process." A keyed hash parent carries that in its
-    // scheme, and KDF1_SP800_108 is the only derivation KDF the specification
-    // defines, so a parent that names anything else can derive nothing.
-    let hash_alg = match &object.public.parameters {
-        crate::tpm::structures::keys::PublicParms::KeyedHash { scheme } => match scheme.detail {
-            crate::tpm::structures::schemes::SchemeDetail::Xor(x)
-                if scheme.scheme == alg::XOR
-                    && x.kdf == alg::KDF1_SP800_108
-                    && x.hash_alg != alg::NULL =>
-            {
-                x.hash_alg
-            }
-            _ => return Err(TpmRc(rc::TYPE).with_handle(1)),
-        },
-        _ => return Err(TpmRc(rc::TYPE).with_handle(1)),
-    };
+/// Read what a loaded object offers as a Derivation Parent.
+fn derivation_parent_of(object: &Object) -> TpmResult<DerivationParent> {
+    // Part 1 clause 25.4.1 spells out the KDF parameters and says plainly that
+    // hashAlg is "the nameAlg of the derivation parent". Clause 25.2 calls the
+    // KDF a property of the parent, but it is this clause that says which of
+    // the parent's properties, so the scheme is not consulted.
+    let hash_alg = object.public.name_alg;
+    if hash_alg == alg::NULL {
+        return Err(TpmRc(rc::TYPE).with_handle(1));
+    }
 
     let sensitive = match object.sensitive.as_ref().map(|s| &s.sensitive) {
-        Some(crate::tpm::structures::keys::SensitiveComposite::Bits(b)) => b.as_slice().to_vec(),
+        Some(SensitiveComposite::Bits(b)) => b.as_slice().to_vec(),
         _ => return Err(TpmRc(rc::TYPE).with_handle(1)),
     };
 
-    Ok(Some(DerivationParent {
+    Ok(DerivationParent {
         hash_alg,
         sensitive,
         hierarchy: object.hierarchy,
         qualified_name: object.qualified_name.clone(),
-    }))
+    })
 }
 
 /// Generate a Derived Object, Part 3 clause 12.9.1 and Part 1 clause 25.
@@ -520,7 +519,7 @@ fn derive_object(
     let mut r = crate::tpm::marshal::Reader::new(template_blob.as_slice());
     let template = TpmtPublic::unmarshal_with(&mut r, true).map_err(|e| e.with_parameter(2))?;
     r.expect_end().map_err(|e| e.with_parameter(2))?;
-    object::validate_public(&template).map_err(|e| e.with_parameter(2))?;
+    object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
 
     // Clause 12.9.1: "If parentHandle references a Derivation Parent, then the
     // TPM may return TPM_RC_TYPE if the key type to be generated is an RSA
@@ -548,12 +547,7 @@ fn derive_object(
         e.with_parameter(1)
     })?;
     let mut octets = DerivedOctets::new(parent.hash_alg, &parent.sensitive, &label, &context)?;
-
-    // The caller gives no sensitive data of its own, so the authorization value
-    // is all that is taken from the sensitive area.
-    let mut without_data = in_sensitive.clone();
-    without_data.sensitive.data = Default::default();
-    let (sensitive, unique) = create_sensitive(&mut octets, &template, &without_data)?;
+    let (sensitive, unique) = derived_sensitive(&mut octets, &template, in_sensitive)?;
 
     let mut public = template;
     public.unique = unique;
@@ -619,6 +613,124 @@ impl Rng for DerivedOctets {
     }
 }
 
+/// Build the sensitive area of a Derived Object, Part 1 clause 25.4.1.
+///
+/// The ordinary creation path cannot serve here. It draws the obfuscation value
+/// before the key, it takes the sensitive value from the caller or from the
+/// system generator depending on sensitiveDataOrigin, and it draws an ECC
+/// scalar by rejection. Clause 25.4.1 fixes all three: "Those derived values
+/// are the sensitive and seedValues", in that order, taken "from most
+/// significant byte to least significant byte with no bytes skipped", with the
+/// scalar drawn by the extra random bits method so that no octet is rejected
+/// and the seedValue starts where the key ends.
+fn derived_sensitive(
+    octets: &mut DerivedOctets,
+    template: &TpmtPublic,
+    supplied: &Tpm2bSensitiveCreate,
+) -> TpmResult<(TpmtSensitive, PublicId)> {
+    let name_alg = if template.name_alg == alg::NULL {
+        alg::SHA256
+    } else {
+        template.name_alg
+    };
+    let digest_size = hash::digest_size(name_alg)?;
+    let auth_value = supplied.sensitive.user_auth.as_slice().to_vec();
+    if auth_value.len() > digest_size {
+        return Err(TpmRc(rc::SIZE).with_parameter(1));
+    }
+
+    let (composite, unique) = match template.object_type {
+        alg::ECC => {
+            let PublicParms::Ecc { curve_id, .. } = template.parameters else {
+                return Err(TpmRc(rc::TYPE));
+            };
+            let curve = ecc::Curve::new(curve_id)?;
+            let size = curve.coordinate_size();
+            let private = ecc::private_key_extra_bits(&curve, octets)?;
+            let key = ecc::key_from_private(curve, private)?;
+            crate::tpm::fips::pairwise_ecc(
+                curve_id,
+                &key.private.to_bytes_padded(size)?,
+                &key.public_x,
+                &key.public_y,
+                template
+                    .object_attributes
+                    .has(ObjectAttributes::SIGN_ENCRYPT),
+            )?;
+            (
+                SensitiveComposite::Ecc(Tpm2bEccParameter::new(
+                    key.private.to_bytes_padded(size)?,
+                )?),
+                PublicId::Ecc(EccPoint {
+                    x: Tpm2bEccParameter::new(key.public_x)?,
+                    y: Tpm2bEccParameter::new(key.public_y)?,
+                }),
+            )
+        }
+        alg::SYMCIPHER => {
+            let PublicParms::SymCipher { sym } = &template.parameters else {
+                return Err(TpmRc(rc::TYPE));
+            };
+            let key = octets.bytes(sym.key_bits as usize / 8)?;
+            (SensitiveComposite::Sym(Tpm2bSymKey::new(key)?), PublicId::Sym(Tpm2bDigest::empty()))
+        }
+        alg::KEYEDHASH => {
+            // Part 3 clause 12.1 sizes a generated keyed hash value at "the
+            // digest produced by the nameAlg in inPublic", and a derived object
+            // never takes one from the caller.
+            let bits = octets.bytes(digest_size)?;
+            (
+                SensitiveComposite::Bits(Tpm2bSensitiveData::new(bits)?),
+                PublicId::KeyedHash(Tpm2bDigest::empty()),
+            )
+        }
+        // RSA was refused before the octets were drawn.
+        _ => return Err(TpmRc(rc::TYPE).with_parameter(2)),
+    };
+
+    // Part 3 clause 12.1 gives an asymmetric key a seedValue only when it is a
+    // Storage Key, and gives every symmetric or keyed hash object one. The
+    // octets come after the key, which is what clause 25.4.1's examples show.
+    let is_parent = template
+        .object_attributes
+        .has(ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT);
+    let seed_value = if is_parent || matches!(template.object_type, alg::KEYEDHASH | alg::SYMCIPHER)
+    {
+        octets.bytes(digest_size)?
+    } else {
+        Vec::new()
+    };
+
+    // Equation 1 of clause 12.1 computes the unique value of a symmetric or
+    // keyed hash object from the two values that were just derived.
+    let unique = match unique {
+        PublicId::Sym(_) | PublicId::KeyedHash(_) => {
+            let secret = match &composite {
+                SensitiveComposite::Sym(s) => s.as_slice(),
+                SensitiveComposite::Bits(b) => b.as_slice(),
+                _ => unreachable!("the composite was built beside the identifier"),
+            };
+            let digest = hash::digest_parts(name_alg, &[&seed_value, secret])?;
+            if template.object_type == alg::SYMCIPHER {
+                PublicId::Sym(Tpm2bDigest::new(digest)?)
+            } else {
+                PublicId::KeyedHash(Tpm2bDigest::new(digest)?)
+            }
+        }
+        other => other,
+    };
+
+    Ok((
+        TpmtSensitive {
+            sensitive_type: template.object_type,
+            auth_value: Tpm2bDigest::new(auth_value)?,
+            seed_value: Tpm2bDigest::new(seed_value)?,
+            sensitive: composite,
+        },
+        unique,
+    ))
+}
+
 /// The label and context a Derived Object is derived with.
 ///
 /// Part 2 clause 11.1.11 says "the values in the unique field of inPublic area
@@ -675,7 +787,7 @@ pub fn create_loaded(state: &mut TpmState, request: &Request) -> TpmResult<Respo
 
     let template = TpmtPublic::from_bytes(template_blob.as_slice())
         .map_err(|e| e.with_parameter(2))?;
-    object::validate_public(&template).map_err(|e| e.with_parameter(2))?;
+    object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
 
     // A hierarchy handle makes this a Primary Object; anything else makes it
     // an ordinary child that is created and loaded in one step.
@@ -1142,6 +1254,209 @@ mod tests {
             .0
                 & 0x03F,
             rc::SIZE & 0x03F
+        );
+    }
+
+    /// A loaded keyed hash Derivation Parent with the given hashes and secret.
+    fn derivation_parent_object(name_alg: u16, scheme_hash: u16, secret: &[u8]) -> Object {
+        use crate::tpm::structures::base::Tpm2bSensitiveData;
+        use crate::tpm::structures::schemes::{Scheme, SchemeDetail, SchemeXor};
+
+        let public = TpmtPublic {
+            object_type: alg::KEYEDHASH,
+            name_alg,
+            object_attributes: ObjectAttributes(
+                ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT,
+            ),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::KeyedHash {
+                scheme: Scheme {
+                    scheme: alg::XOR,
+                    detail: SchemeDetail::Xor(SchemeXor {
+                        hash_alg: scheme_hash,
+                        kdf: alg::KDF1_SP800_108,
+                    }),
+                },
+            },
+            unique: PublicId::KeyedHash(Tpm2bDigest::empty()),
+        };
+        let sensitive = TpmtSensitive {
+            sensitive_type: alg::KEYEDHASH,
+            auth_value: Tpm2bDigest::empty(),
+            seed_value: Tpm2bDigest::empty(),
+            sensitive: SensitiveComposite::Bits(Tpm2bSensitiveData::new(secret.to_vec()).unwrap()),
+        };
+        Object::new(public, Some(sensitive), rh::OWNER, &[], true).unwrap()
+    }
+
+    #[test]
+    fn the_derivation_hash_is_the_parent_name_algorithm() {
+        // Part 1 clause 25.4.1 lists the KDF parameters and says hashAlg is
+        // "the nameAlg of the derivation parent". Clause 25.2 says only that
+        // the KDF is a property of the parent, which is why the scheme is a
+        // plausible but wrong place to read the hash from.
+        let secret = b"a derivation parent secret";
+
+        let a = derivation_parent_of(&derivation_parent_object(alg::SHA256, alg::SHA256, secret))
+            .unwrap();
+        let b = derivation_parent_of(&derivation_parent_object(alg::SHA256, alg::SHA384, secret))
+            .unwrap();
+        let c = derivation_parent_of(&derivation_parent_object(alg::SHA384, alg::SHA256, secret))
+            .unwrap();
+
+        assert_eq!(a.hash_alg, alg::SHA256);
+        assert_eq!(
+            b.hash_alg,
+            alg::SHA256,
+            "the scheme hash was taken for the KDF hash"
+        );
+        assert_eq!(c.hash_alg, alg::SHA384, "the nameAlg was not taken");
+
+        // The octets follow the hash, so two parents that share a nameAlg and a
+        // secret derive the same stream whatever their schemes say.
+        let stream = |p: &DerivationParent| {
+            let mut o = DerivedOctets::new(p.hash_alg, &p.sensitive, b"label", b"context").unwrap();
+            o.bytes(64).unwrap()
+        };
+        assert_eq!(stream(&a), stream(&b), "the scheme reached the KDF");
+        assert_ne!(stream(&a), stream(&c));
+    }
+
+    #[test]
+    fn the_derived_octets_are_one_kdfa_call_read_from_the_front() {
+        // Part 1 clause 25.4.1: KDFa(hashAlg, sensitive, label, context, 0,
+        // 8192), whose 1024 octets are used "from most significant byte to
+        // least significant byte with no bytes skipped". The buffer is compared
+        // against KDFa computed here, so the label termination, the context and
+        // the bit count are all pinned down.
+        let secret = b"a derivation parent secret";
+        let expected = crate::tpm::crypto::hmac::kdfa_bytes(
+            alg::SHA256,
+            secret,
+            b"label",
+            b"context",
+            &[],
+            8192,
+        )
+        .unwrap();
+        assert_eq!(expected.len(), 1024, "clause 25.4.1 asks for 1024 octets");
+
+        let mut octets = DerivedOctets::new(alg::SHA256, secret, b"label", b"context").unwrap();
+        // Read in uneven pieces: nothing may be skipped between them.
+        let mut got = octets.bytes(7).unwrap();
+        got.extend(octets.bytes(40).unwrap());
+        got.extend(octets.bytes(32).unwrap());
+        assert_eq!(got, expected[..79]);
+
+        // The buffer ends after 1024 octets rather than generating more.
+        let mut octets = DerivedOctets::new(alg::SHA256, secret, b"label", b"context").unwrap();
+        assert!(octets.bytes(1024).is_ok());
+        assert_eq!(octets.bytes(1).unwrap_err(), TpmRc(rc::NO_RESULT));
+    }
+
+    #[test]
+    fn a_derived_symmetric_key_matches_the_clause_25_4_1_example() {
+        // Part 1 clause 25.4.1: "For a 128-bit AES key in a SYMCIPHER object
+        // having SHA-256 as its nameAlg, the most significant 16 bytes of the
+        // KDF data are used for the AES key and the next-most-significant 32
+        // bytes are used for the seedValue."
+        let secret = b"a derivation parent secret";
+        let stream =
+            crate::tpm::crypto::hmac::kdfa_bytes(alg::SHA256, secret, b"l", b"c", &[], 8192)
+                .unwrap();
+
+        let template = TpmtPublic {
+            object_type: alg::SYMCIPHER,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(ObjectAttributes::DECRYPT),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::SymCipher {
+                sym: SymDef::new(alg::AES, 128, alg::CFB),
+            },
+            unique: PublicId::Sym(Tpm2bDigest::empty()),
+        };
+
+        let mut octets = DerivedOctets::new(alg::SHA256, secret, b"l", b"c").unwrap();
+        let (sensitive, unique) =
+            derived_sensitive(&mut octets, &template, &Tpm2bSensitiveCreate::default()).unwrap();
+
+        let SensitiveComposite::Sym(key) = &sensitive.sensitive else {
+            panic!("a symmetric object must hold a symmetric key");
+        };
+        assert_eq!(key.as_slice(), &stream[..16], "the key is not the first 16");
+        assert_eq!(
+            sensitive.seed_value.as_slice(),
+            &stream[16..48],
+            "the seedValue does not follow the key"
+        );
+
+        // Equation 1 of Part 3 clause 12.1 builds the unique value from the two.
+        let PublicId::Sym(digest) = &unique else {
+            panic!("a symmetric object names a digest");
+        };
+        assert_eq!(
+            digest.as_slice(),
+            crate::tpm::crypto::hash::digest_parts(
+                alg::SHA256,
+                &[&stream[16..48], &stream[..16]]
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_derived_ecc_key_takes_the_octets_clause_25_4_1_names() {
+        // Part 1 clause 25.4.1: "For a 256-bit ECC key, the most-significant 40
+        // bytes are used to generate the private key and, if the nameAlg of the
+        // derived object is SHA-256, the next-most-significant 32 bytes will be
+        // used for the seedValue." The scalar comes from FIPS 186-5 A.2.1,
+        // which reduces those 40 octets rather than rejecting any of them.
+        use crate::tpm::crypto::bn::{BigNum, BnCtx};
+        use crate::tpm::structures::schemes::{Scheme, SymDef};
+
+        let secret = b"a derivation parent secret";
+        let stream =
+            crate::tpm::crypto::hmac::kdfa_bytes(alg::SHA256, secret, b"l", b"c", &[], 8192)
+                .unwrap();
+
+        let template = TpmtPublic {
+            object_type: alg::ECC,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(ObjectAttributes::SIGN_ENCRYPT),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::Ecc {
+                symmetric: SymDef::null(),
+                scheme: Scheme::hash(alg::ECDSA, alg::SHA256),
+                curve_id: curve::NIST_P256,
+                kdf: Scheme::null(),
+            },
+            unique: PublicId::Ecc(EccPoint::default()),
+        };
+
+        let mut octets = DerivedOctets::new(alg::SHA256, secret, b"l", b"c").unwrap();
+        let (sensitive, _unique) =
+            derived_sensitive(&mut octets, &template, &Tpm2bSensitiveCreate::default()).unwrap();
+
+        // The scalar is the first 40 octets reduced modulo one less than the
+        // order, with one added.
+        let curve = crate::tpm::crypto::ecc::Curve::new(curve::NIST_P256).unwrap();
+        let ctx = BnCtx::new().unwrap();
+        let expected = BigNum::from_bytes(&stream[..40])
+            .unwrap()
+            .modulo(&curve.order().unwrap().sub_word(1).unwrap(), &ctx)
+            .unwrap()
+            .add_word(1)
+            .unwrap();
+        let SensitiveComposite::Ecc(private) = &sensitive.sensitive else {
+            panic!("an ECC object holds a scalar");
+        };
+        assert_eq!(private.as_slice(), expected.to_bytes_padded(32).unwrap());
+
+        // Part 3 clause 12.1 gives a seedValue only to a Storage Key, and this
+        // key signs, so none of the octets after the scalar are taken.
+        assert!(
+            sensitive.seed_value.is_empty(),
+            "a signing key is not a Storage Key, so it has no seedValue"
         );
     }
 }

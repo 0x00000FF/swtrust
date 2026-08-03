@@ -2830,3 +2830,265 @@ fn a_storage_parent_still_creates_an_ordinary_object() {
     );
 }
 
+
+/// A Derivation Parent whose nameAlg and scheme hash disagree.
+///
+/// Part 1 clause 25.4.1 names the nameAlg of the parent as the KDF hash, so a
+/// parent built this way tells the two apart.
+fn derivation_parent_template_with(name_alg: u16, scheme_hash: u16) -> Vec<u8> {
+    let mut t = Writer::new();
+    t.u16(0x0008); // TPM_ALG_KEYEDHASH
+    t.u16(name_alg);
+    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0001_0000 | 0x0002_0000);
+    t.u16(0); // authPolicy
+    t.u16(0x000A); // scheme TPM_ALG_XOR
+    t.u16(scheme_hash);
+    t.u16(0x0022); // TPM_ALG_KDF1_SP800_108
+    t.u16(0); // unique
+    t.finish().unwrap()
+}
+
+/// Create a primary from a raw template and return its handle and public area.
+fn primary_from(h: &Harness, template: &[u8]) -> (u32, Vec<u8>) {
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(template);
+    p.u16(0); // outsideInfo
+    p.u32(0); // creationPCR
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:#x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let handle = reader.u32().unwrap();
+    let _param = reader.u32().unwrap();
+    let size = reader.u16().unwrap() as usize;
+    (handle, reader.take(size).unwrap().to_vec())
+}
+
+#[test]
+fn parents_that_differ_derive_different_objects() {
+    // Part 1 clause 25.4.1 keys the derivation on the parent's own sensitive
+    // value, so no two parents share a derived object. Which of the parent's
+    // hashes drives the KDF is settled in a unit test, because two parents
+    // built through TPM2_CreatePrimary never share a sensitive value and so
+    // cannot show it from out here.
+    let h = Harness::started("derive-parents");
+
+    let (a, _) = primary_from(&h, &derivation_parent_template_with(alg::SHA256, alg::SHA256));
+    let (b, _) = primary_from(&h, &derivation_parent_template_with(alg::SHA256, alg::SHA384));
+    let (c, _) = primary_from(&h, &derivation_parent_template_with(alg::SHA384, alg::SHA256));
+
+    let derive = |parent: u32| {
+        let r = h.send(&create_loaded(
+            parent,
+            &[],
+            &derived_template(DERIVED_SIGNING, b"label", b"context"),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "derivation failed: {:#x}", r.code);
+        let (_, _, public) = split_created(&r.body);
+        public
+    };
+
+    assert_eq!(derive(a), derive(a), "the derivation is not repeatable");
+    assert_ne!(derive(a), derive(b));
+    assert_ne!(derive(a), derive(c));
+    assert_ne!(derive(b), derive(c));
+
+    // A parent whose nameAlg is SHA-384 derives just as well as one whose
+    // nameAlg is SHA-256, so the KDF is not tied to a single hash.
+    let r = h.send(&create_loaded(
+        c,
+        &[],
+        &derived_template(DERIVED_SIGNING, b"label", b"context"),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "a SHA-384 parent could not derive");
+}
+
+#[test]
+fn a_symmetric_and_a_keyed_hash_object_can_be_derived() {
+    // Part 1 clause 25.4.1 gives the symmetric case outright: "For a 128-bit
+    // AES key in a SYMCIPHER object having SHA-256 as its nameAlg, the most
+    // significant 16 bytes of the KDF data are used for the AES key and the
+    // next-most-significant 32 bytes are used for the seedValue." A derived
+    // object never takes its sensitive value from the caller, clause 25.3, so
+    // the ordinary rule that sensitiveDataOrigin decides where it comes from
+    // must not be applied here.
+    let h = Harness::started("derive-sym");
+    let parent = load_derivation_parent(&h);
+
+    // A SYMCIPHER template: decrypt, sensitiveDataOrigin CLEAR.
+    let mut t = Writer::new();
+    t.u16(0x0025); // TPM_ALG_SYMCIPHER
+    t.u16(alg::SHA256);
+    t.u32(0x0002 | 0x0010 | 0x0040 | 0x0002_0000);
+    t.u16(0); // authPolicy
+    t.u16(0x0006); // AES
+    t.u16(128);
+    t.u16(0x0043); // CFB
+    t.u16(5);
+    t.bytes(b"label");
+    t.u16(0);
+    let sym = t.finish().unwrap();
+
+    let r = h.send(&create_loaded(parent, &[], &sym));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a symmetric object could not be derived: {:#x}",
+        r.code
+    );
+    let (_, private, public_sym) = split_created(&r.body);
+    assert!(private.is_empty());
+
+    // Deriving it again gives the same key.
+    let again = h.send(&create_loaded(parent, &[], &sym));
+    assert_eq!(again.code, rc::SUCCESS);
+    let (_, _, public_again) = split_created(&again.body);
+    assert_eq!(public_sym, public_again);
+
+    // A keyed hash object, which is what a derived HMAC key is.
+    let mut t = Writer::new();
+    t.u16(0x0008); // TPM_ALG_KEYEDHASH
+    t.u16(alg::SHA256);
+    t.u32(0x0002 | 0x0010 | 0x0040 | 0x0004_0000); // sign
+    t.u16(0); // authPolicy
+    t.u16(0x0005); // scheme TPM_ALG_HMAC
+    t.u16(alg::SHA256);
+    t.u16(5);
+    t.bytes(b"label");
+    t.u16(0);
+    let keyed = t.finish().unwrap();
+
+    let r = h.send(&create_loaded(parent, &[], &keyed));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a keyed hash object could not be derived: {:#x}",
+        r.code
+    );
+    let (_, private, _) = split_created(&r.body);
+    assert!(private.is_empty());
+}
+
+#[test]
+fn a_primary_key_does_not_depend_on_its_authorization_value() {
+    // Part 3 clause 24.1.1: "If this command is called multiple times with the
+    // same inPublic parameter, inSensitive.data, and Primary Seed, the TPM
+    // shall produce the same Primary Object." The authorization value is not
+    // among them; Part 1 clause 24.7.3 has it copied from userAuth into the
+    // object after the key is made.
+    let h = Harness::started("primary-auth");
+    let template = storage_template();
+
+    let with_auth = |auth: &[u8]| {
+        let mut p = Writer::new();
+        p.u16((4 + auth.len()) as u16); // inSensitive
+        p.u16(auth.len() as u16);
+        p.bytes(auth);
+        p.u16(0); // data
+        p.u16(template.len() as u16);
+        p.bytes(&template);
+        p.u16(0); // outsideInfo
+        p.u32(0); // creationPCR
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::CreatePrimary,
+            &[rh::OWNER],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:#x}", r.code);
+        let mut reader = Reader::new(&r.body);
+        let _handle = reader.u32().unwrap();
+        let _param = reader.u32().unwrap();
+        let size = reader.u16().unwrap() as usize;
+        reader.take(size).unwrap().to_vec()
+    };
+
+    let none = with_auth(b"");
+    let some = with_auth(b"secret");
+    assert_eq!(
+        none, some,
+        "the authorization value changed the primary key"
+    );
+}
+
+#[test]
+fn a_template_that_can_neither_sign_nor_decrypt_is_refused() {
+    // Part 3 clause 12.1: "If the Object is a not a keyedHash object, and the
+    // sign and encrypt attributes are CLEAR, the TPM shall return
+    // TPM_RC_ATTRIBUTES." The rule belongs to creation, so it reaches
+    // TPM2_Create, TPM2_CreatePrimary and TPM2_CreateLoaded alike.
+    let h = Harness::started("inert-template");
+
+    // An ECC template with neither sign nor decrypt.
+    let mut t = Writer::new();
+    t.u16(0x0023); // TPM_ALG_ECC
+    t.u16(alg::SHA256);
+    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040); // no sign, no decrypt
+    t.u16(0); // authPolicy
+    t.u16(0x0010); // symmetric TPM_ALG_NULL
+    t.u16(0x0010); // scheme TPM_ALG_NULL
+    t.u16(0x0003); // curve NIST P-256
+    t.u16(0x0010); // kdf TPM_ALG_NULL
+    t.u16(0);
+    t.u16(0);
+    let inert = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(inert.len() as u16);
+    p.bytes(&inert);
+    p.u16(0); // outsideInfo
+    p.u32(0); // creationPCR
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
+        "an object that can do nothing was created: {:#x}",
+        r.code
+    );
+
+    // A sealed data object is a keyed hash and is exempt, which is the whole
+    // point of the exception.
+    let mut p = Writer::new();
+    p.u16(4 + 6);
+    p.u16(0);
+    p.u16(6);
+    p.bytes(b"sealed");
+    let sealed = sealed_template();
+    p.u16(sealed.len() as u16);
+    p.bytes(&sealed);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a sealed data object was refused: {:#x}",
+        r.code
+    );
+}
+
