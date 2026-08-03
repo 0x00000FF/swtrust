@@ -90,9 +90,11 @@ pub struct Tpm {
     ///
     /// It is kept here rather than in the state file because it belongs to the
     /// register interface a platform presents, not to the TPM state the Library
-    /// specification defines. The document that fixes how long it survives is
-    /// the PC Client Platform TPM Profile, which is not among the references, so
-    /// nothing is claimed about it here beyond what Part 1 clause 34.3 settles.
+    /// specification defines. Part 1 clause 31 defines the H-CRTM sequence but
+    /// not this flag; the document that fixes how long it survives is the PC
+    /// Client Platform TPM Profile, which is not among the references. It
+    /// therefore lasts as long as the process does and no claim is made that it
+    /// survives a restart.
     established: AtomicBool,
     store: StateStore,
     logger: Arc<Logger>,
@@ -284,7 +286,7 @@ impl Device for Tpm {
         self.cancel.store(asserted, Ordering::SeqCst);
     }
 
-    /// _TPM_Hash_Start begins an H-CRTM event sequence, Part 1 clause 34.3, and
+    /// _TPM_Hash_Start begins an H-CRTM event sequence, Part 1 clause 31, and
     /// records that one has begun.
     fn hash_start(&self) {
         self.established.store(true, Ordering::SeqCst);

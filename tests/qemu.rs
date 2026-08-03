@@ -447,6 +447,48 @@ fn state_survives_a_stop_and_initialise() {
     s.finish();
 }
 
+/// The establishment flag follows the H-CRTM sequence on a real TPM.
+///
+/// The unit tests drive a stand-in whose own implementation decides what the
+/// flag does, so they cannot tell whether the TPM behind the transport agrees.
+/// This drives the real one: it starts clear, beginning an H-CRTM sequence sets
+/// it, and clearing it on request puts it back.
+#[test]
+fn the_establishment_flag_follows_the_hcrtm_sequence() {
+    let mut s = Server::start("established");
+    s.attach();
+
+    let read = |s: &mut Server| {
+        assert_eq!(s.result(request::GET_ESTABLISHED, &[]), 0);
+        let rest = s.rest(4);
+        // The reply is always four further octets: the flag and three of
+        // padding, whatever the flag says.
+        assert_eq!(&rest[1..], &[0, 0, 0]);
+        rest[0]
+    };
+
+    assert_eq!(read(&mut s), 0, "a TPM that has seen no H-CRTM starts clear");
+
+    assert_eq!(s.result(request::HASH_START, &[]), 0);
+    assert_eq!(read(&mut s), 1, "_TPM_Hash_Start must set the flag");
+
+    // Finish the sequence rather than leaving the TPM part way through one.
+    let mut data = request::HASH_DATA.to_be_bytes().to_vec();
+    data.extend_from_slice(&4u32.to_be_bytes());
+    data.extend_from_slice(&[1, 2, 3, 4]);
+    s.control.write_all(&data).unwrap();
+    let mut word = [0u8; 4];
+    s.control.read_exact(&mut word).unwrap();
+    assert_eq!(word, [0, 0, 0, 0]);
+    assert_eq!(s.result(request::HASH_END, &[]), 0);
+    assert_eq!(read(&mut s), 1, "ending the sequence must not clear the flag");
+
+    assert_eq!(s.result(request::RESET_ESTABLISHED, &[3, 0, 0, 0]), 0);
+    assert_eq!(read(&mut s), 0, "clearing it must take effect");
+
+    s.finish();
+}
+
 /// Shutting down on the control channel makes the whole transport return.
 #[test]
 fn shutdown_returns_from_serve() {

@@ -55,12 +55,15 @@ pub trait Device: Send + Sync {
 
     /// The platform establishment flag.
     ///
-    /// The flag records that an H-CRTM event sequence has begun. Part 1 clause
-    /// 34.3 defines the sequence, but the flag itself is read and cleared
-    /// through the register interface rather than through a command, and that
-    /// interface is defined by the PC Client Platform TPM Profile, which is not
-    /// among the references. What is implemented here is therefore the part the
-    /// Library specification settles: _TPM_Hash_Start sets it.
+    /// The flag records that an H-CRTM event sequence has begun.
+    ///
+    /// Part 1 clause 31 defines that sequence and the _TPM_Hash_Start
+    /// indication that opens it, but it does not define this flag. The flag is
+    /// read and cleared through the register interface, which the PC Client
+    /// Platform TPM Profile defines, and that document is not among the
+    /// references. So what the flag means here is taken from the one thing the
+    /// Library does settle, that _TPM_Hash_Start marks the start of an H-CRTM
+    /// sequence, and the register semantics are left to the platform.
     fn established(&self) -> bool;
 
     /// Clear the establishment flag on behalf of `locality`.
