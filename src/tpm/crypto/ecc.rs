@@ -336,7 +336,17 @@ pub fn private_key_from_rng(curve: &Curve, rng: &mut dyn Rng) -> TpmResult<BigNu
 /// clause 25.4.1 say the octets after it are the seedValue.
 pub fn private_key_extra_bits(curve: &Curve, rng: &mut dyn Rng) -> TpmResult<BigNum> {
     let order = curve.order()?;
-    let bytes = rng.bytes(curve.coordinate_size() + 8)?;
+    // FIPS 186-5 A.2.1 takes N + 64 bits, where N is the length of the order.
+    // P-521 has an order of 521 bits, so 585 bits are wanted and the 7 bits
+    // above them in the last whole octet are not part of the candidate. The
+    // octet count is what clause 25.4.1 counts, so a whole number of octets is
+    // still taken and the seedValue still starts where they end.
+    let wanted = order.bits() + 64;
+    let mut bytes = rng.bytes(wanted.div_ceil(8))?;
+    let spare = bytes.len() * 8 - wanted;
+    if spare > 0 {
+        bytes[0] &= 0xffu8 >> spare;
+    }
     let candidate = BigNum::from_bytes(&bytes)?;
     let ctx = BnCtx::new()?;
     let reduced = candidate.modulo(&order.sub_word(1)?, &ctx)?;

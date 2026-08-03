@@ -521,24 +521,28 @@ fn derive_object(
     r.expect_end().map_err(|e| e.with_parameter(2))?;
     object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
 
+    // Clause 12.9.1 names the one input check that is specific to derivation:
+    // "when parentHandle references a Derivation Parent, then
+    // sensitiveDataOrigin in inPublic is required to be CLEAR." Part 1 clause
+    // 25.3 gives the reason: the caller supplies values that steer the
+    // derivation but never sets the sensitive value itself.
+    //
+    // It comes before the check below because the clause requires this one and
+    // only permits that one, so a template that breaks both has to be answered
+    // with the required error.
+    if template
+        .object_attributes
+        .has(ObjectAttributes::SENSITIVE_DATA_ORIGIN)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+    }
+
     // Clause 12.9.1: "If parentHandle references a Derivation Parent, then the
     // TPM may return TPM_RC_TYPE if the key type to be generated is an RSA
     // key." Deriving an RSA key means searching for primes in the KDF stream,
     // which this TPM does not do.
     if template.object_type == alg::RSA {
         return Err(TpmRc(rc::TYPE).with_parameter(2));
-    }
-
-    // Clause 12.9.1 names the one input check that is specific to derivation:
-    // "when parentHandle references a Derivation Parent, then
-    // sensitiveDataOrigin in inPublic is required to be CLEAR." Part 1 clause
-    // 25.3 gives the reason: the caller supplies values that steer the
-    // derivation but never sets the sensitive value itself.
-    if template
-        .object_attributes
-        .has(ObjectAttributes::SENSITIVE_DATA_ORIGIN)
-    {
-        return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
     }
 
     let (label, context) = label_and_context(&template, in_sensitive).map_err(|e| {
@@ -751,9 +755,11 @@ fn label_and_context(
     let mut context = from_template.context.as_slice().to_vec();
 
     // The sensitive area of a Derived Object holds a TPMS_DERIVE too, and
-    // supplies whichever of the two the template left empty.
+    // supplies whichever of the two the template left empty. When the template
+    // gave both there is nothing left to take, and Part 1 clause 25.2 says the
+    // field "is ignored" rather than checked, so it is not even read.
     let data = sensitive.sensitive.data.as_slice();
-    if !data.is_empty() {
+    if !data.is_empty() && (label.is_empty() || context.is_empty()) {
         let mut r = crate::tpm::marshal::Reader::new(data);
         let from_sensitive = Derive::unmarshal(&mut r)?;
         r.expect_end()?;
@@ -873,6 +879,9 @@ pub fn load(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let parent = parent_of(state, parent_handle).map_err(|e| e.with_handle(1))?;
     let public = in_public.public_area;
     object::validate_loaded_public(&public).map_err(|e| e.with_parameter(2))?;
+    // Clause 12.2.1 repeats the creation rule for this command alone, so an
+    // object that can do nothing is refused here as well as when it was made.
+    object::validate_not_inert(&public).map_err(|e| e.with_parameter(2))?;
     let object_name = names::object_name(&public)?;
 
     let plain = protect::unwrap_private(
@@ -1458,5 +1467,91 @@ mod tests {
             sensitive.seed_value.is_empty(),
             "a signing key is not a Storage Key, so it has no seedValue"
         );
+    }
+
+    #[test]
+    fn an_extra_random_bits_scalar_takes_the_bits_the_order_needs() {
+        // FIPS 186-5 A.2.1, which Part 1 clause 25.4.1 names for derivation,
+        // takes N + 64 bits where N is the length of the order. P-256 gives 320
+        // bits, a whole 40 octets. P-521 gives 585, which is 74 octets with the
+        // top 7 bits not part of the candidate; taking all 592 would derive a
+        // key no other TPM produces.
+        use crate::tpm::crypto::bn::{BigNum, BnCtx};
+        use crate::tpm::crypto::ecc::{private_key_extra_bits, Curve};
+
+        /// Hands out a fixed stream so the scalar can be predicted.
+        struct Fixed(Vec<u8>, usize);
+        impl Rng for Fixed {
+            fn fill(&mut self, out: &mut [u8]) -> TpmResult<()> {
+                out.copy_from_slice(&self.0[self.1..self.1 + out.len()]);
+                self.1 += out.len();
+                Ok(())
+            }
+        }
+
+        let ctx = BnCtx::new().unwrap();
+        for (curve_id, octets, order_bits) in [
+            (curve::NIST_P256, 40usize, 256usize),
+            (curve::NIST_P384, 56, 384),
+            (curve::NIST_P521, 74, 521),
+        ] {
+            let curve = Curve::new(curve_id).unwrap();
+            assert_eq!(curve.order().unwrap().bits(), order_bits);
+
+            // A stream of set bits shows the masking, and what follows the
+            // scalar shows how many octets were taken.
+            let stream = vec![0xffu8; 256];
+            let mut rng = Fixed(stream.clone(), 0);
+            let got = private_key_extra_bits(&curve, &mut rng).unwrap();
+            assert_eq!(rng.1, octets, "the wrong number of octets was taken");
+
+            let wanted = order_bits + 64;
+            let mut bytes = stream[..octets].to_vec();
+            let spare = octets * 8 - wanted;
+            if spare > 0 {
+                bytes[0] &= 0xffu8 >> spare;
+            }
+            let expected = BigNum::from_bytes(&bytes)
+                .unwrap()
+                .modulo(&curve.order().unwrap().sub_word(1).unwrap(), &ctx)
+                .unwrap()
+                .add_word(1)
+                .unwrap();
+            assert_eq!(
+                got.to_bytes().unwrap(),
+                expected.to_bytes().unwrap(),
+                "the candidate was not reduced to {wanted} bits"
+            );
+        }
+    }
+
+    #[test]
+    fn a_template_that_gives_both_values_ignores_the_sensitive_area() {
+        // Part 1 clause 25.2: "If provided in the unique field, the
+        // corresponding value in the inSensitive.data field is ignored." A
+        // buffer that is ignored is not read, so one that could not be a
+        // TPMS_DERIVE does not turn into an error.
+        use crate::tpm::structures::base::{Tpm2bLabel, Tpm2bSensitiveData};
+
+        let mut template = ecc_template(ObjectAttributes::SIGN_ENCRYPT);
+        template.unique = PublicId::Derive(Derive {
+            label: Tpm2bLabel::new(b"label".to_vec()).unwrap(),
+            context: Tpm2bLabel::new(b"context".to_vec()).unwrap(),
+        });
+
+        let mut junk = Tpm2bSensitiveCreate::default();
+        junk.sensitive.data = Tpm2bSensitiveData::new(vec![0xff; 3]).unwrap();
+        let (label, context) = label_and_context(&template, &junk).unwrap();
+        assert_eq!(label, b"label");
+        assert_eq!(context, b"context");
+
+        // With one of them missing the buffer is read after all, and a buffer
+        // that is not a TPMS_DERIVE is then an error rather than a silent zero.
+        let mut half = template.clone();
+        half.unique = PublicId::Derive(Derive {
+            label: Tpm2bLabel::new(b"label".to_vec()).unwrap(),
+            context: Tpm2bLabel::empty(),
+        });
+        assert!(label_and_context(&half, &junk).is_err());
     }
 }

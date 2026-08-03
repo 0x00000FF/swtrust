@@ -60,7 +60,18 @@ impl Object {
     /// attributes are Derivation Parents." A Derivation Parent protects
     /// nothing, it only supplies entropy, so it is not one of these.
     pub fn is_storage_key(&self) -> bool {
-        self.is_parent_key() && self.public.object_type != alg::KEYEDHASH
+        self.is_storage_public() && !self.is_public_only()
+    }
+
+    /// True when the public area alone describes a Storage Key.
+    ///
+    /// TPM2_MakeCredential protects a credential with a key it only has the
+    /// public half of, so it asks this rather than [`Object::is_storage_key`].
+    pub fn is_storage_public(&self) -> bool {
+        self.public
+            .object_attributes
+            .has(ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT)
+            && self.public.object_type != alg::KEYEDHASH
     }
 
     /// True when the object derives children rather than protecting them.
@@ -69,14 +80,10 @@ impl Object {
     /// that "if parentHandle references a Derivation Parent, then a Derived
     /// Object is generated".
     pub fn is_derivation_parent(&self) -> bool {
-        self.is_parent_key() && self.public.object_type == alg::KEYEDHASH
-    }
-
-    /// The attributes Part 1 clause 20.2 calls a Parent Key, on a loaded object.
-    fn is_parent_key(&self) -> bool {
         self.public
             .object_attributes
             .has(ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT)
+            && self.public.object_type == alg::KEYEDHASH
             && !self.is_public_only()
     }
 
@@ -411,21 +418,25 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
 /// has to satisfy when it is loaded.
 pub fn validate_creation_template(public: &TpmtPublic) -> TpmResult<()> {
     validate_public(public)?;
+    validate_not_inert(public)
+}
 
-    // Part 3 clause 12.1: "If the Object is a not a keyedHash object, and the
-    // sign and encrypt attributes are CLEAR, the TPM shall return
-    // TPM_RC_ATTRIBUTES." A key that can neither sign nor decrypt can do
-    // nothing, and only a keyed hash object is allowed to be inert, because
-    // that is what a sealed data object is.
+/// Refuse an object that can neither sign nor decrypt.
+///
+/// Part 3 states this twice in the same words, in clause 12.1.1 for
+/// TPM2_Create and TPM2_CreatePrimary and in clause 12.2.1 for TPM2_Load: "If
+/// the Object is a not a keyedHash object, and the sign and encrypt attributes
+/// are CLEAR, the TPM shall return TPM_RC_ATTRIBUTES." Only a keyed hash object
+/// is allowed to be inert, because that is what a sealed data object is.
+///
+/// TPM2_LoadExternal does not say it, so it is not applied there.
+pub fn validate_not_inert(public: &TpmtPublic) -> TpmResult<()> {
     if public.object_type != alg::KEYEDHASH
-        && !public
-            .object_attributes
-            .has(ObjectAttributes::SIGN_ENCRYPT)
+        && !public.object_attributes.has(ObjectAttributes::SIGN_ENCRYPT)
         && !public.object_attributes.has(ObjectAttributes::DECRYPT)
     {
         return Err(TpmRc(rc::ATTRIBUTES));
     }
-
     Ok(())
 }
 

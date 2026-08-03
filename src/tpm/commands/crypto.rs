@@ -1098,9 +1098,12 @@ pub fn make_credential(state: &mut TpmState, request: &Request) -> TpmResult<Res
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
         .clone();
-    if !object.is_storage_key() && !object.public.object_attributes.has(
-        ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT,
-    ) {
+    // Part 3 clause 12.6.1: "The loaded public area referenced by handle is
+    // required to be the public area of a Storage key." Only the public half is
+    // needed, so a key loaded by TPM2_LoadExternal will do, but a Derivation
+    // Parent will not: Part 1 clause 20.2 makes those a different kind of
+    // parent, and they carry no symmetric algorithm to protect anything with.
+    if !object.is_storage_public() {
         return Err(TpmRc(rc::TYPE).with_handle(1));
     }
     let symmetric = object

@@ -3092,3 +3092,159 @@ fn a_template_that_can_neither_sign_nor_decrypt_is_refused() {
     );
 }
 
+
+#[test]
+fn a_derived_rsa_template_reports_the_required_error_first() {
+    // Clause 12.9.1 requires sensitiveDataOrigin to be CLEAR and only permits
+    // TPM_RC_TYPE for an RSA key ("the TPM may return"). A template that breaks
+    // both has to be answered with the one the clause requires.
+    let h = Harness::started("derive-order");
+    let parent = load_derivation_parent(&h);
+
+    let mut t = Writer::new();
+    t.u16(0x0001); // TPM_ALG_RSA
+    t.u16(alg::SHA256);
+    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000); // sensitiveDataOrigin SET
+    t.u16(0); // authPolicy
+    t.u16(0x0010); // symmetric TPM_ALG_NULL
+    t.u16(0x0014); // scheme TPM_ALG_RSASSA
+    t.u16(alg::SHA256);
+    t.u16(2048);
+    t.u32(0);
+    t.u16(5);
+    t.bytes(b"label");
+    t.u16(0);
+
+    let r = h.send(&create_loaded(parent, &[], &t.finish().unwrap()));
+    assert_eq!(
+        r.code,
+        rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
+        "the permitted error hid the required one: {:#x}",
+        r.code
+    );
+}
+
+#[test]
+fn make_credential_refuses_a_derivation_parent() {
+    // Part 3 clause 12.6.1: "The loaded public area referenced by handle is
+    // required to be the public area of a Storage key." Part 1 clause 20.2
+    // puts a keyed hash parent in the other class, so it is not one.
+    let h = Harness::started("makecredential-parent");
+    let parent = load_derivation_parent(&h);
+
+    let mut p = Writer::new();
+    p.u16(32); // credential
+    p.bytes(&[0xaa; 32]);
+    p.u16(34); // objectName
+    p.bytes(&[0x00, 0x0b]);
+    p.bytes(&[0xbb; 32]);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::MakeCredential,
+        &[parent],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::TYPE | 0x080 | (1 << 8),
+        "a derivation parent protected a credential: {:#x}",
+        r.code
+    );
+}
+
+#[test]
+fn load_refuses_an_object_that_can_neither_sign_nor_decrypt() {
+    // Part 3 clause 12.2.1 repeats the creation rule for TPM2_Load: "If the
+    // Object is a not a keyedHash object, and the sign and encrypt attributes
+    // are CLEAR, the TPM shall return TPM_RC_ATTRIBUTES."
+    let h = Harness::started("load-inert");
+
+    // A parent to load under, and a child made through it.
+    let template = storage_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let parent = Reader::new(&r.body).u32().unwrap();
+
+    // An ECC signing child, created normally.
+    let mut t = Writer::new();
+    t.u16(0x0023); // TPM_ALG_ECC
+    t.u16(alg::SHA256);
+    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000); // sign
+    t.u16(0); // authPolicy
+    t.u16(0x0010); // symmetric TPM_ALG_NULL
+    t.u16(0x0018); // scheme TPM_ALG_ECDSA
+    t.u16(alg::SHA256);
+    t.u16(0x0003); // curve NIST P-256
+    t.u16(0x0010); // kdf TPM_ALG_NULL
+    t.u16(0);
+    t.u16(0);
+    let child = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(child.len() as u16);
+    p.bytes(&child);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Create,
+        &[parent],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Create -> {:#x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let _param = reader.u32().unwrap();
+    let private_size = reader.u16().unwrap() as usize;
+    let private = reader.take(private_size).unwrap().to_vec();
+    let public_size = reader.u16().unwrap() as usize;
+    let public = reader.take(public_size).unwrap().to_vec();
+
+    // It loads as it stands.
+    let load = |public: &[u8]| {
+        let mut p = Writer::new();
+        p.u16(private.len() as u16);
+        p.bytes(&private);
+        p.u16(public.len() as u16);
+        p.bytes(public);
+        h.send(&command(
+            st::SESSIONS,
+            cc::Load,
+            &[parent],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ))
+    };
+    assert_eq!(load(&public).code, rc::SUCCESS, "the child does not load");
+
+    // With sign cleared it can do nothing, and the load is refused before the
+    // integrity of the private area is even reached.
+    let mut inert = public.clone();
+    let attrs = u32::from_be_bytes([inert[4], inert[5], inert[6], inert[7]]);
+    let cleared = (attrs & !0x0004_0000u32).to_be_bytes();
+    inert[4..8].copy_from_slice(&cleared);
+    assert_eq!(
+        load(&inert).code,
+        rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
+        "an object that can do nothing was loaded"
+    );
+}
+
