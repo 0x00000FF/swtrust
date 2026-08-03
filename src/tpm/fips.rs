@@ -81,6 +81,21 @@ const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
 const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 const SHA384_ABC: &str =
     "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7";
+const SHA512_ABC: &str = concat!(
+    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a",
+    "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+);
+
+/// FIPS 202, digest of "abc".
+const SHA3_256_ABC: &str = "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532";
+const SHA3_384_ABC: &str = concat!(
+    "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b2",
+    "98d88cea927ac7f539f1edf228376d25",
+);
+const SHA3_512_ABC: &str = concat!(
+    "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e",
+    "10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0",
+);
 
 /// RFC 4231 test case 2.
 const HMAC_KEY: &[u8] = b"Jefe";
@@ -174,6 +189,10 @@ pub const TESTED_ALGORITHMS: &[u16] = &[
     alg::SHA1,
     alg::SHA256,
     alg::SHA384,
+    alg::SHA512,
+    alg::SHA3_256,
+    alg::SHA3_384,
+    alg::SHA3_512,
     alg::HMAC,
     alg::AES,
     alg::CFB,
@@ -186,12 +205,21 @@ pub const TESTED_ALGORITHMS: &[u16] = &[
     alg::ECDH,
 ];
 
-/// FIPS 180-4 known answer tests, one per digest.
+/// Known answer tests, one per digest the TPM implements.
+///
+/// FIPS 180-4 covers the SHA-2 family and FIPS 202 the SHA-3 family. Every hash
+/// `crate::tpm::crypto::hash` will compute is tested, because a caller can
+/// select any of them and a self test that skipped one would leave that one
+/// unchecked while the module reported that its tests had passed.
 pub fn hash_kats() -> TestResult {
     for (name, hash_alg, want) in [
         ("SHA-1", alg::SHA1, SHA1_ABC),
         ("SHA-256", alg::SHA256, SHA256_ABC),
         ("SHA-384", alg::SHA384, SHA384_ABC),
+        ("SHA-512", alg::SHA512, SHA512_ABC),
+        ("SHA3-256", alg::SHA3_256, SHA3_256_ABC),
+        ("SHA3-384", alg::SHA3_384, SHA3_384_ABC),
+        ("SHA3-512", alg::SHA3_512, SHA3_512_ABC),
     ] {
         let want = vector(name, want)?;
         let got = hash::digest(hash_alg, KAT_MESSAGE).map_err(|_| Failure(name))?;
@@ -663,6 +691,31 @@ mod tests {
     }
 
     #[test]
+    fn every_hash_the_tpm_implements_is_covered_by_a_self_test() {
+        // The set is taken from the code rather than written out again, so a
+        // hash added later is caught here instead of quietly going untested
+        // while the module still reports that its self tests passed.
+        let mut found = 0;
+        for alg_id in 0u16..=0x0100 {
+            if !hash::is_supported(alg_id) {
+                continue;
+            }
+            found += 1;
+            assert!(
+                TESTED_ALGORITHMS.contains(&alg_id),
+                "hash {alg_id:#06x} is implemented but no self test covers it"
+            );
+        }
+        assert!(found >= 7, "only {found} hashes were found, the scan is wrong");
+        // The list must also not name a hash that is not there to test.
+        for alg_id in TESTED_ALGORITHMS {
+            if hash::digest_size(*alg_id).is_ok() {
+                assert!(hash::is_supported(*alg_id));
+            }
+        }
+    }
+
+    #[test]
     fn the_vectors_are_the_published_ones() {
         // These four are public values, so a wrong transcription is visible
         // without running the algorithm at all.
@@ -687,6 +740,10 @@ mod tests {
             ("SHA1_ABC", SHA1_ABC, 20),
             ("SHA256_ABC", SHA256_ABC, 32),
             ("SHA384_ABC", SHA384_ABC, 48),
+            ("SHA512_ABC", SHA512_ABC, 64),
+            ("SHA3_256_ABC", SHA3_256_ABC, 32),
+            ("SHA3_384_ABC", SHA3_384_ABC, 48),
+            ("SHA3_512_ABC", SHA3_512_ABC, 64),
             ("HMAC_SHA256", HMAC_SHA256, 32),
             ("AES_KEY", AES_KEY, 16),
             ("AES_IV", AES_IV, 16),
