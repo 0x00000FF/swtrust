@@ -323,6 +323,14 @@ impl ObjectSlots {
 /// The checks that do not depend on the parent or on other command parameters
 /// live here so that TPM2_Create, TPM2_CreatePrimary, TPM2_Load and
 /// TPM2_LoadExternal all apply the same rules.
+///
+/// The unique field is not one of them. In a creation template it holds no key,
+/// and Part 3 clauses 12.2.1 and 24.1.1 both say that "the size of the unique
+/// field shall not be checked for consistency with the other object
+/// parameters", so a caller that sends a placeholder of the wrong size, or of
+/// the right size filled with zeros, is still asking for a key the TPM can
+/// make. A public area that does carry a key is checked by
+/// [`validate_loaded_public`] instead.
 pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
     let attrs = public.object_attributes;
 
@@ -360,23 +368,6 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
         return Err(TpmRc(rc::HASH));
     }
 
-    // Part 2 Table 195 defines keyBits as the number of bits in the public
-    // modulus, and Part 3 clause 12.2 requires the key size to agree with the
-    // public area or the answer is TPM_RC_KEY_SIZE. The count is of the bits
-    // the modulus actually has, not of the octets it was sent in, so a 2047
-    // bit modulus does not pass as a 2048 bit one just by being padded. A
-    // creation template names no modulus yet, so only a public area that
-    // carries one is checked.
-    if let (
-        crate::tpm::structures::keys::PublicId::Rsa(modulus),
-        crate::tpm::structures::keys::PublicParms::Rsa { key_bits, .. },
-    ) = (&public.unique, &public.parameters)
-    {
-        if !modulus.is_empty() && significant_bits(modulus.as_slice()) != *key_bits as usize {
-            return Err(TpmRc(rc::KEY_SIZE));
-        }
-    }
-
     // Part 3 clause 12.3 says the TPM validates that the authPolicy is either
     // the size of the digest produced by nameAlg or the Empty Buffer. A policy
     // of any other length can never match the digest a session accumulates, so
@@ -393,11 +384,37 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Check a public area that carries a key, for TPM2_Load and TPM2_LoadExternal.
+///
+/// These are the checks of the unique field that a creation template is exempt
+/// from. Here the field is the key itself rather than a placeholder, so a value
+/// that disagrees with the parameters beside it describes an object the TPM
+/// could never use.
+pub fn validate_loaded_public(public: &TpmtPublic) -> TpmResult<()> {
+    validate_public(public)?;
+
+    // Part 2 Table 195 defines keyBits as the number of bits in the public
+    // modulus, and Part 3 clause 12.2 requires the key size to agree with the
+    // public area or the answer is TPM_RC_KEY_SIZE. The count is of the bits
+    // the modulus actually has, not of the octets it was sent in, so a 2047
+    // bit modulus does not pass as a 2048 bit one just by being padded.
+    if let (
+        crate::tpm::structures::keys::PublicId::Rsa(modulus),
+        crate::tpm::structures::keys::PublicParms::Rsa { key_bits, .. },
+    ) = (&public.unique, &public.parameters)
+    {
+        if !modulus.is_empty() && significant_bits(modulus.as_slice()) != *key_bits as usize {
+            return Err(TpmRc(rc::KEY_SIZE));
+        }
+    }
+
     // An ECC public area names a point, and a point that is not on the curve is
     // not a public key. Every use of it fails later anyway, because the point
     // is validated whenever it is loaded into the library, but a key the TPM
-    // accepted has a Name that stands for nothing, so it is refused here. A
-    // creation template carries no point yet, so only one that does is checked.
+    // accepted has a Name that stands for nothing, so it is refused here.
     if let (
         crate::tpm::structures::keys::PublicId::Ecc(point),
         crate::tpm::structures::keys::PublicParms::Ecc { curve_id, .. },
@@ -691,19 +708,57 @@ mod tests {
         // modulus, so a public area that says 4096 while carrying a 2048 bit
         // modulus is refused rather than loaded.
         assert_eq!(
-            validate_public(&rsa_public(4096, 256)).unwrap_err(),
+            validate_loaded_public(&rsa_public(4096, 256)).unwrap_err(),
             TpmRc(rc::KEY_SIZE)
         );
         // The other direction is refused too.
         assert_eq!(
-            validate_public(&rsa_public(2048, 512)).unwrap_err(),
+            validate_loaded_public(&rsa_public(2048, 512)).unwrap_err(),
             TpmRc(rc::KEY_SIZE)
         );
         // A modulus of the stated length is accepted.
-        assert!(validate_public(&rsa_public(2048, 256)).is_ok());
-        // A creation template names no modulus yet, so it is left alone.
+        assert!(validate_loaded_public(&rsa_public(2048, 256)).is_ok());
+    }
+
+    #[test]
+    fn a_creation_template_keeps_whatever_unique_field_it_was_sent() {
+        use crate::tpm::structures::base::Tpm2bPublicKeyRsa;
+        // Part 3 clauses 12.2.1 and 24.1.1: "The size of the unique field shall
+        // not be checked for consistency with the other object parameters."
+        // TPM2_Create, TPM2_CreatePrimary and TPM2_CreateLoaded are making the
+        // key, so the field holds no key to disagree with them.
+
+        // An Empty Buffer is a legal unique field value, clause 24.1.1.
         let mut template = rsa_public(2048, 256);
         template.unique = PublicId::Rsa(Default::default());
+        assert!(validate_public(&template).is_ok());
+
+        // Windows sends a placeholder of the full modulus length filled with
+        // zeros. Counted in bits that is a modulus of 0, which is not 2048, so
+        // checking it here would refuse every key Windows asks for.
+        let zeros = vec![0u8; 256];
+        let mut template = rsa_public(2048, 256);
+        template.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&zeros).unwrap());
+        assert_eq!(significant_bits(&zeros), 0);
+        assert!(
+            validate_public(&template).is_ok(),
+            "a zero filled unique field was checked against keyBits"
+        );
+
+        // A placeholder of some other size is not checked either, since it is
+        // the size the clauses above name.
+        let mut template = rsa_public(2048, 256);
+        template.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&[0xab; 128]).unwrap());
+        assert!(validate_public(&template).is_ok());
+
+        // The same exemption covers an ECC point that is not on the curve.
+        use crate::tpm::structures::base::Tpm2bEccParameter;
+        use crate::tpm::structures::schemes::EccPoint;
+        let mut template = public(ObjectAttributes::SIGN_ENCRYPT);
+        template.unique = PublicId::Ecc(EccPoint {
+            x: Tpm2bEccParameter::new(vec![0u8; 32]).unwrap(),
+            y: Tpm2bEccParameter::new(vec![0u8; 32]).unwrap(),
+        });
         assert!(validate_public(&template).is_ok());
     }
 
@@ -717,7 +772,7 @@ mod tests {
         let mut p = rsa_public(2048, 256);
         p.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&short).unwrap());
         assert_eq!(significant_bits(&short), 2047);
-        assert_eq!(validate_public(&p).unwrap_err(), TpmRc(rc::KEY_SIZE));
+        assert_eq!(validate_loaded_public(&p).unwrap_err(), TpmRc(rc::KEY_SIZE));
 
         // Leading zero octets do not make a modulus longer either.
         let mut padded = vec![0u8; 256];
@@ -725,7 +780,7 @@ mod tests {
         let mut p = rsa_public(2048, 256);
         p.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&padded).unwrap());
         assert_eq!(significant_bits(&padded), 1024);
-        assert_eq!(validate_public(&p).unwrap_err(), TpmRc(rc::KEY_SIZE));
+        assert_eq!(validate_loaded_public(&p).unwrap_err(), TpmRc(rc::KEY_SIZE));
 
         // A modulus with its top bit set is the stated length.
         let mut full = vec![0xabu8; 256];
@@ -733,7 +788,7 @@ mod tests {
         let mut p = rsa_public(2048, 256);
         p.unique = PublicId::Rsa(Tpm2bPublicKeyRsa::from_slice(&full).unwrap());
         assert_eq!(significant_bits(&full), 2048);
-        assert!(validate_public(&p).is_ok());
+        assert!(validate_loaded_public(&p).is_ok());
     }
 
     #[test]
@@ -787,18 +842,20 @@ mod tests {
         // A point that does not satisfy the curve equation is refused.
         let bad = with_point(vec![0x11; 32], vec![0x22; 32]);
         assert_eq!(
-            validate_public(&bad).unwrap_err(),
+            validate_loaded_public(&bad).unwrap_err(),
             TpmRc(rc::ECC_POINT),
             "an off curve point was accepted"
         );
 
         // So is one whose coordinates are not the right size for the curve.
-        assert!(validate_public(&with_point(vec![0x01; 8], vec![0x02; 8])).is_err());
+        assert!(validate_loaded_public(&with_point(vec![0x01; 8], vec![0x02; 8])).is_err());
 
         // A real point on P-256 is accepted.
         let mut rng = crate::tpm::crypto::rand::Drbg::new(&[0x77u8; 48], b"t").unwrap();
         let key = crate::tpm::crypto::ecc::generate(curve::NIST_P256, &mut rng).unwrap();
-        assert!(validate_public(&with_point(key.public_x.clone(), key.public_y.clone())).is_ok());
+        assert!(
+            validate_loaded_public(&with_point(key.public_x.clone(), key.public_y.clone())).is_ok()
+        );
 
         // A creation template names no point yet, so it is left alone.
         assert!(validate_public(&public(ObjectAttributes::SIGN_ENCRYPT)).is_ok());

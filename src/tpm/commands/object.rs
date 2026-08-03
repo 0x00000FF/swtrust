@@ -532,7 +532,7 @@ pub fn load(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     }
     let parent = parent_of(state, parent_handle).map_err(|e| e.with_handle(1))?;
     let public = in_public.public_area;
-    object::validate_public(&public).map_err(|e| e.with_parameter(2))?;
+    object::validate_loaded_public(&public).map_err(|e| e.with_parameter(2))?;
     let object_name = names::object_name(&public)?;
 
     let plain = protect::unwrap_private(
@@ -587,7 +587,7 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     r.expect_end()?;
 
     let public = in_public.public_area;
-    object::validate_public(&public).map_err(|e| e.with_parameter(2))?;
+    object::validate_loaded_public(&public).map_err(|e| e.with_parameter(2))?;
 
     // The shared validator lets an asymmetric public area carry no key at all,
     // because a creation template is written that way. TPM2_LoadExternal is

@@ -2359,3 +2359,140 @@ fn small_clock_steps_add_up_to_an_nv_update() {
         "the steps together must reach an NV update"
     );
 }
+
+/// Decode a hex string that was captured from a command log.
+fn hex(s: &str) -> Vec<u8> {
+    assert!(s.len() % 2 == 0, "hex string has an odd length");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_creation_template_with_a_zero_filled_unique_field_is_accepted() {
+    // Part 3 clause 12.2.1 for TPM2_Create and clause 24.1.1 for
+    // TPM2_CreatePrimary both say that "the size of the unique field shall not
+    // be checked for consistency with the other object parameters", and clause
+    // 24.1.1 adds that "an Empty Buffer is a legal unique field value".
+    //
+    // These two buffers are the TPM2_CreatePrimary commands Windows 11 Setup
+    // sends, taken from a command log byte for byte. Each carries a 256 octet
+    // unique field of zeros beside a keyBits of 2048. Counted in bits that is a
+    // modulus of zero, so a TPM that checked the field against keyBits would
+    // answer TPM_RC_KEY_SIZE and no key would ever be made.
+    let h = Harness::started("windows-primary");
+
+    // The storage primary, under the owner hierarchy.
+    let srk = hex(concat!(
+        "80020000015700000131400000010000001d4000000900000000140000000000",
+        "000000000000000000000000000000000400000000011a0001000b0003047200",
+        "0000060080004300100800000000000100000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000",
+    ));
+    let r = h.send(&srk);
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "the storage primary was refused: {:#x}",
+        r.code
+    );
+
+    // The endorsement primary, whose template also carries the authPolicy the
+    // TCG EK Credential Profile defines.
+    let ek = hex(concat!(
+        "800200000177000001314000000b0000001d4000000900000000140000000000",
+        "000000000000000000000000000000000400000000013a0001000b000300b200",
+        "20837197674484b3f81a90cc8d46a5d724fd52d76e06520b64f2a1da1b331469",
+        "aa00060080004300100800000000000100000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000",
+    ));
+    let r = h.send(&ek);
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "the endorsement primary was refused: {:#x}",
+        r.code
+    );
+
+    // The key that came back has the modulus the template asked for, which is
+    // the field the template itself was excused from stating.
+    let mut rd = Reader::new(&r.body);
+    let _handle = rd.u32().unwrap();
+    let _size = rd.u32().unwrap();
+    let public_size = rd.u16().unwrap() as usize;
+    let public = rd.take(public_size).unwrap().to_vec();
+    let mut pr = Reader::new(&public);
+    assert_eq!(pr.u16().unwrap(), alg::RSA);
+    assert_eq!(pr.u16().unwrap(), alg::SHA256);
+    let _attrs = pr.u32().unwrap();
+    let policy_size = pr.u16().unwrap() as usize;
+    let _policy = pr.take(policy_size).unwrap();
+    let _sym = (pr.u16().unwrap(), pr.u16().unwrap(), pr.u16().unwrap());
+    let _scheme = pr.u16().unwrap();
+    assert_eq!(pr.u16().unwrap(), 2048, "keyBits changed");
+    let _exponent = pr.u32().unwrap();
+    let modulus_size = pr.u16().unwrap() as usize;
+    assert_eq!(modulus_size, 256, "a 2048 bit modulus is 256 octets");
+    let modulus = pr.take(modulus_size).unwrap();
+    assert_ne!(modulus, [0u8; 256], "the modulus is still the placeholder");
+}
+
+#[test]
+fn a_loaded_public_area_is_still_checked_against_its_key_bits() {
+    // The exemption above belongs to the creation templates. TPM2_LoadExternal
+    // is given a key rather than asked to make one, so a modulus that does not
+    // agree with keyBits is refused with TPM_RC_KEY_SIZE, Part 3 clause 12.2.
+    let h = Harness::started("loaded-key-size");
+
+    let mut public = Writer::new();
+    public.u16(alg::RSA);
+    public.u16(alg::SHA256);
+    public.u32(0x0004_0000); // userWithAuth only, no sign or decrypt
+    public.u16(0); // authPolicy
+    public.u16(alg::NULL); // symmetric
+    public.u16(alg::NULL); // scheme
+    public.u16(2048); // keyBits
+    public.u32(0); // exponent
+    public.u16(128); // a 1024 bit modulus beside a keyBits of 2048
+    public.bytes(&{
+        let mut m = vec![0xabu8; 128];
+        m[0] = 0x80;
+        m
+    });
+    let public = public.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(0); // inPrivate, absent
+    p.u16(public.len() as u16);
+    p.bytes(&public);
+    p.u32(rh::NULL);
+
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::LoadExternal,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::KEY_SIZE | 0x080 | 0x040 | (2 << 8),
+        "a modulus that disagrees with keyBits was loaded: {:#x}",
+        r.code
+    );
+}
