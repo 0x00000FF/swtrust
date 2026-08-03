@@ -338,9 +338,8 @@ impl TpmState {
         // (safe) is CLEAR after a non-orderly shutdown."
         //
         // So the repeat is allowed and reported rather than avoided. A TPM that
-        // has been manufactured or cleared and never shut down has had no
-        // non-orderly shutdown either, which is why both leave the recorded
-        // shutdown as an orderly one.
+        // has never been through a startup has had no shutdown of any kind, and
+        // so no non-orderly one, which is what the flag taken above tells apart.
         if disorderly && ever_started {
             self.clock.safe = false;
         }
