@@ -258,8 +258,13 @@ pub fn clock_set(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     // before TPM2_ClockSet() returns", and "After the next NV update of Clock,
     // safe is SET to indicate that Clock is not a repeat." The command writes
     // NV, so the record follows on its own.
-    let apart = state.clock.nv_elapsed.saturating_add(jump);
-    if apart >= u64::from(config::NV_CLOCK_UPDATE_INTERVAL) {
+    // The step counts towards how far the two copies have drifted apart, the
+    // same way passing time does, so a run of small steps reaches the interval
+    // just as one large step does. Dropping a step that did not reach it on its
+    // own would let a caller move Clock as far as it liked without the copy in
+    // NV ever being brought up to date.
+    state.clock.nv_elapsed = state.clock.nv_elapsed.saturating_add(jump);
+    if state.clock.nv_elapsed >= u64::from(config::NV_CLOCK_UPDATE_INTERVAL) {
         state.clock.nv_elapsed = 0;
         state.clock.safe = true;
     }

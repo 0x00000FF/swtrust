@@ -2307,3 +2307,55 @@ fn a_large_clock_set_updates_nv_and_makes_the_clock_safe_again() {
     assert_eq!(r.code, rc::SUCCESS);
     assert_eq!(read_safe(), 1, "the NV update puts safe back");
 }
+
+/// A run of small steps reaches the update interval just as one large step
+/// does, so the copy of Clock in NV cannot be left behind for ever.
+///
+/// Part 3 clause 29.2.1: "If the value of Clock after the update makes the
+/// volatile and non-volatile versions of TPMS_CLOCK_INFO.clock differ by more
+/// than the reported update interval, then the TPM shall update the
+/// non-volatile version of TPMS_CLOCK_INFO.clock before returning."
+#[test]
+fn small_clock_steps_add_up_to_an_nv_update() {
+    let h = Harness::started("clockstep");
+    h.tpm.with_state_mut(|s| {
+        s.clock.safe = false;
+        s.clock.nv_elapsed = 0;
+    });
+
+    let step = u64::from(swtrust::tpm::config::NV_CLOCK_UPDATE_INTERVAL) / 8;
+    for _ in 0..7 {
+        let now = h.tpm.with_state(|s| s.clock.clock);
+        let mut p = Writer::new();
+        p.u64(now + step);
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::ClockSet,
+            &[rh::OWNER],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS);
+    }
+    assert!(
+        !h.tpm.with_state(|s| s.clock.safe),
+        "seven eighths of an interval is not one"
+    );
+
+    // The eighth step takes the pair past the interval.
+    let now = h.tpm.with_state(|s| s.clock.clock);
+    let mut p = Writer::new();
+    p.u64(now + step + 1);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::ClockSet,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    assert!(
+        h.tpm.with_state(|s| s.clock.safe),
+        "the steps together must reach an NV update"
+    );
+}
