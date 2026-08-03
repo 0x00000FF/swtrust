@@ -202,9 +202,12 @@ pub const MANUFACTURER_STRING: &str = "SWT";
 
 /// Hash algorithms the TPM implements, in the order reported by GetCapability.
 ///
-/// SHA-1 is absent because the PC Client Platform TPM Profile 1.07 clause 4.3
-/// Table 3 lists it as Not Allowed.
+/// SHA-1 is here even though the PC Client Platform TPM Profile 1.07 clause 4.3
+/// Table 3 lists it as Not Allowed. The reason is in `crypto::hash::algorithm`:
+/// callers on real hardware still ask for it, and BitLocker cannot protect a
+/// drive without it.
 pub const IMPLEMENTED_HASHES: &[u16] = &[
+    alg::SHA1,
     alg::SHA256,
     alg::SHA384,
     alg::SHA512,
@@ -220,7 +223,12 @@ pub const IMPLEMENTED_HASHES: &[u16] = &[
 pub const DEFAULT_PCR_BANKS: &[u16] = &[alg::SHA256, alg::SHA384];
 
 /// PCR banks that may be allocated.
+///
+/// SHA-1 may be allocated but is not among the defaults, so a platform that
+/// wants the bank asks for it with TPM2_PCR_Allocate. Clause 4.7 item 3.b.ii
+/// allows any supported hash to back a bank.
 pub const IMPLEMENTED_PCR_BANKS: &[u16] = &[
+    alg::SHA1,
     alg::SHA256,
     alg::SHA384,
     alg::SHA512,
@@ -254,6 +262,7 @@ pub const IMPLEMENTED_AES_KEY_BITS: &[u16] = &[128, 192, 256];
 /// Every algorithm identifier the TPM implements, reported by TPM_CAP_ALGS.
 pub const IMPLEMENTED_ALGORITHMS: &[u16] = &[
     alg::RSA,
+    alg::SHA1,
     alg::HMAC,
     alg::AES,
     alg::MGF1,

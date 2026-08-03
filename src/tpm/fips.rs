@@ -77,6 +77,9 @@ fn expect(name: &'static str, got: &[u8], want: &[u8]) -> TestResult {
 // Where a public vector exists the value is that vector, noted below.
 
 /// FIPS 180-4, digest of "abc".
+/// FIPS 180-4, and the reason SHA-1 is implemented is in
+/// `crypto::hash::algorithm`.
+const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
 const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 const SHA384_ABC: &str =
     "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7";
@@ -185,6 +188,7 @@ const KAT_MESSAGE: &[u8] = b"abc";
 /// TPM2_IncrementalSelfTest reports what is left to do from this list, and
 /// TPM2_GetCapability(TPM_CAP_ALGS) is a superset of it.
 pub const TESTED_ALGORITHMS: &[u16] = &[
+    alg::SHA1,
     alg::SHA256,
     alg::SHA384,
     alg::SHA512,
@@ -209,6 +213,7 @@ pub const TESTED_ALGORITHMS: &[u16] = &[
 /// This is the list [`hash_kats`] works through, so a test can ask what is
 /// really covered rather than what some other list says is covered.
 const HASH_KATS: &[(&str, u16, &str)] = &[
+    ("SHA-1", alg::SHA1, SHA1_ABC),
     ("SHA-256", alg::SHA256, SHA256_ABC),
     ("SHA-384", alg::SHA384, SHA384_ABC),
     ("SHA-512", alg::SHA512, SHA512_ABC),

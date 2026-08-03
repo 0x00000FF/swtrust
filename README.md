@@ -236,8 +236,18 @@ TPM2_PCR_SetAuthPolicy and TPM2_PCR_SetAuthValue report TPM_RC_VALUE.
 
 Hashes: SHA-1, SHA-256, SHA-384, SHA-512, SHA3-256, SHA3-384, SHA3-512.
 Symmetric: AES with 128, 192 and 256 bit keys in CTR, OFB, CBC, CFB and ECB.
-Asymmetric: RSA 1024 through 4096 with RSASSA, RSAPSS, RSAES and OAEP; ECC on
+Asymmetric: RSA 2048, 3072 and 4096 with RSASSA, RSAPSS, RSAES and OAEP; ECC on
 NIST P-224, P-256, P-384 and P-521 with ECDSA, ECDH, ECDAA and EC Schnorr.
+
+SHA-1 is a deliberate departure from the profile. Clause 4.3 Table 3 lists
+TPM_ALG_SHA1 as Not Allowed and item 5 of that clause says such an algorithm
+"SHALL NOT be supported", but every shipping PC Client TPM has it and callers
+depend on that. BitLocker seals its volume master key in an object whose
+nameAlg is TPM_ALG_SHA1; against a TPM that answers TPM_RC_HASH there, a drive
+cannot be protected at all. SHA-1 is therefore available to a caller that names
+it, and is not among the PCR banks allocated by default, which clause 4.7 item
+3 fixes as SHA-256 and SHA-384. The test that used to assert its absence now
+asserts its presence and says why.
 
 NIST P-192 is not offered because the underlying library does not build that
 group. SM2, SM3, SM4, Camellia, TDES, ML-KEM and ML-DSA are not implemented.

@@ -1079,10 +1079,11 @@ mod tests {
         let saved = s.save().unwrap();
 
         // Find the allocation, which is a count followed by that many
-        // algorithms, and put SHA-1 in front of what is there.
+        // algorithms, and put SM3-256 in front of what is there. The
+        // profile lists it as optional and this build does not have it.
         let mut w = Writer::new();
         w.u32(2);
-        w.u16(alg::SHA1);
+        w.u16(alg::SM3_256);
         w.u16(alg::SHA256);
         let replacement = w.finish().unwrap();
 
@@ -1101,10 +1102,10 @@ mod tests {
         older.extend_from_slice(&replacement);
         older.extend_from_slice(&saved[at + current.len()..]);
 
-        let back = TpmState::load(&older).expect("a file naming SHA-1 was refused");
+        let back = TpmState::load(&older).expect("a file naming SM3-256 was refused");
         assert_eq!(back.hierarchies.owner.auth, b"ownerauth");
         assert!(
-            !back.pcr_allocation.contains(&alg::SHA1),
+            !back.pcr_allocation.contains(&alg::SM3_256),
             "a bank the TPM does not implement must not come back"
         );
         assert!(back.pcr_allocation.contains(&alg::SHA256));

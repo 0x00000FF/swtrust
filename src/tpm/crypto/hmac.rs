@@ -260,13 +260,14 @@ mod tests {
         );
     }
 
-    /// RFC 4231 test cases 1 and 2, which cover the SHA-2 family.
-    ///
-    /// The SHA-1 vectors of RFC 2202 used to be here. They are gone with the
-    /// algorithm: the platform profile lists SHA-1 as Not Allowed, so asking
-    /// this TPM for an HMAC over it is asking for a hash it does not have.
+    /// RFC 4231 test cases 1 and 2 for the SHA-2 family, and the RFC 2202 case
+    /// for SHA-1, which callers still key an HMAC with.
     #[test]
     fn rfc_4231_vectors() {
+        assert_eq!(
+            hmac(alg::SHA1, &vec![0x0b; 20], b"Hi There").unwrap(),
+            hex("b617318655057264e28bc0b6fb378c8ef146be00")
+        );
         assert_eq!(
             hmac(alg::SHA384, &vec![0x0b; 20], b"Hi There").unwrap(),
             hex(concat!(
@@ -295,7 +296,6 @@ mod tests {
                 "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"
             ))
         );
-        assert!(hmac(alg::SHA1, &vec![0x0b; 20], b"Hi There").is_err());
     }
 
     #[test]

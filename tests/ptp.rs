@@ -202,23 +202,47 @@ fn no_pcr_group_has_a_policy_or_an_authorization_value_of_its_own() {
 fn no_algorithm_the_profile_forbids_is_supported() {
     let h = Harness::new("forbidden");
     let reported = h.algorithms();
-    for (name, id) in [
-        ("TPM_ALG_SHA1", alg::SHA1),
-        ("TPM_ALG_TDES", alg::TDES),
-    ] {
-        assert!(
-            !reported.contains(&id),
-            "{name} is reported as implemented but the profile forbids it"
-        );
-    }
+    assert!(
+        !reported.contains(&alg::TDES),
+        "TPM_ALG_TDES is reported as implemented but the profile forbids it"
+    );
+}
 
-    // Reporting is not enough on its own: the algorithm must not work either.
-    let mut body = 20u16.to_be_bytes().to_vec();
-    body.extend_from_slice(&[0u8; 20]);
+/// Clause 4.3 Table 3 lists TPM_ALG_SHA1 as Not Allowed and this TPM has it
+/// anyway, which is a departure recorded here rather than left to be found.
+///
+/// Every shipping PC Client TPM implements SHA-1 and callers rely on that:
+/// BitLocker seals its volume master key in an object whose nameAlg is
+/// TPM_ALG_SHA1, and against a TPM without it the drive cannot be protected at
+/// all. The profile's other requirements about SHA-1 are still met, in that it
+/// is not one of the banks allocated by default.
+#[test]
+fn sha1_is_implemented_although_the_profile_forbids_it() {
+    let h = Harness::new("sha1");
+    assert!(
+        h.algorithms().contains(&alg::SHA1),
+        "SHA-1 is not reported as implemented"
+    );
+
+    // Reporting is not enough on its own: the algorithm has to work.
+    let mut body = 3u16.to_be_bytes().to_vec();
+    body.extend_from_slice(b"abc");
     body.extend_from_slice(&alg::SHA1.to_be_bytes());
     body.extend_from_slice(&0x4000_0007u32.to_be_bytes());
     let r = h.send(cc::Hash, &body);
-    assert_ne!(code_of(&r), rc::SUCCESS, "TPM2_Hash accepted SHA-1");
+    assert_eq!(code_of(&r), rc::SUCCESS, "TPM2_Hash refused SHA-1");
+    // FIPS 180-4 gives SHA-1("abc").
+    let digest = &r[10 + 2..10 + 2 + 20];
+    assert_eq!(
+        digest,
+        &[
+            0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
+            0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
+        ]
+    );
+
+    // Clause 4.7 item 3 still fixes the default banks, and SHA-1 is not one.
+    assert!(!config::DEFAULT_PCR_BANKS.contains(&alg::SHA1));
 }
 
 /// Clause 4.3 Table 3: the algorithms marked Mandatory (M) that this TPM

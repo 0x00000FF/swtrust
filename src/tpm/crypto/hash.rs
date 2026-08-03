@@ -11,13 +11,21 @@ use crate::tpm::error::{TpmRc, TpmResult};
 
 /// The aws-lc-rs algorithm for a TPM_ALG_ID.
 ///
-/// SHA-1 is absent. The PC Client Platform TPM Profile 1.07 clause 4.3 Table 3
-/// lists TPM_ALG_SHA1 as Not Allowed, and item 5 of that clause says an
-/// algorithm listed that way "SHALL NOT be supported". Leaving it out here is
-/// what makes that true everywhere, because every use of a hash in this TPM
-/// goes through this function.
+/// SHA-1 is present, which is a departure from the PC Client Platform TPM
+/// Profile 1.07. Clause 4.3 Table 3 lists TPM_ALG_SHA1 as Not Allowed and item
+/// 5 of that clause says such an algorithm "SHALL NOT be supported". The TPM
+/// 2.0 Library Specification and the TCG Algorithm Registry both still define
+/// it, every shipping PC Client TPM implements it, and software that runs on
+/// those TPMs relies on it: BitLocker seals its volume master key in an object
+/// whose nameAlg is TPM_ALG_SHA1, and a TPM without it answers TPM_RC_HASH and
+/// cannot protect a drive at all.
+///
+/// SHA-1 is therefore available to a caller that asks for it by name, and is
+/// kept out of the PCR banks this TPM allocates by default, which clause 4.7
+/// item 3 fixes as SHA-256 and SHA-384.
 pub fn algorithm(hash_alg: u16) -> TpmResult<&'static digest::Algorithm> {
     Ok(match hash_alg {
+        alg::SHA1 => &digest::SHA1_FOR_LEGACY_USE_ONLY,
         alg::SHA256 => &digest::SHA256,
         alg::SHA384 => &digest::SHA384,
         alg::SHA512 => &digest::SHA512,
@@ -39,7 +47,7 @@ pub fn digest_size(hash_alg: u16) -> TpmResult<usize> {
 /// For the SHA-3 family this is the sponge rate.
 pub fn block_size(hash_alg: u16) -> TpmResult<usize> {
     Ok(match hash_alg {
-        alg::SHA256 => 64,
+        alg::SHA1 | alg::SHA256 => 64,
         alg::SHA384 | alg::SHA512 => 128,
         alg::SHA3_256 => 136,
         alg::SHA3_384 => 104,
@@ -107,9 +115,7 @@ mod tests {
 
     #[test]
     fn digest_sizes_match_the_specification() {
-        // SHA-1 is Not Allowed by the platform profile, so it is not a hash
-        // this TPM has and asking for its size is asking about nothing.
-        assert_eq!(digest_size(alg::SHA1).unwrap_err(), TpmRc(rc::HASH));
+        assert_eq!(digest_size(alg::SHA1).unwrap(), 20);
         assert_eq!(digest_size(alg::SHA256).unwrap(), 32);
         assert_eq!(digest_size(alg::SHA384).unwrap(), 48);
         assert_eq!(digest_size(alg::SHA512).unwrap(), 64);
@@ -122,7 +128,7 @@ mod tests {
 
     #[test]
     fn block_sizes_match_the_standards() {
-        assert!(block_size(alg::SHA1).is_err());
+        assert_eq!(block_size(alg::SHA1).unwrap(), 64);
         assert_eq!(block_size(alg::SHA256).unwrap(), 64);
         assert_eq!(block_size(alg::SHA384).unwrap(), 128);
         assert_eq!(block_size(alg::SHA512).unwrap(), 128);
@@ -135,7 +141,10 @@ mod tests {
 
     #[test]
     fn known_answers_for_the_empty_message() {
-        assert_eq!(digest(alg::SHA1, b"").unwrap_err(), TpmRc(rc::HASH));
+        assert_eq!(
+            digest(alg::SHA1, b"").unwrap(),
+            hex("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        );
         assert_eq!(
             digest(alg::SHA256, b"").unwrap(),
             hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
