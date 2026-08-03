@@ -57,6 +57,12 @@ macro_rules! attribute {
             }
 
             /// Check that no reserved bit is set.
+            ///
+            /// A few of the attribute types this macro builds have no reserved
+            /// bits at all, so the mask is zero and the test can never be true.
+            /// That is the right answer for them and not a mistake, which is
+            /// what the allow says.
+            #[allow(clippy::bad_bit_mask)]
             pub fn check_reserved(self) -> TpmResult<()> {
                 if self.0 & Self::RESERVED != 0 {
                     return Err(TpmRc(rc::RESERVED_BITS));

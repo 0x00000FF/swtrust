@@ -125,9 +125,14 @@ impl Server {
 
             // The data channel is the command port and the control channel the
             // one after it, which is the pairing the caller is configured with.
-            let opened = connect_within(port, Duration::from_secs(2)).and_then(|data| {
-                connect_within(port + 1, Duration::from_secs(2)).map(|control| (data, control))
-            });
+            // A first channel that never came up stops the attempt here, so
+            // the second budget is not spent waiting for a port that is not
+            // going to answer either.
+            let opened = match connect_within(port, Duration::from_secs(2)) {
+                None => None,
+                Some(data) => connect_within(port + 1, Duration::from_secs(2))
+                    .map(|control| (data, control)),
+            };
 
             // A transport that has already returned never bound the pair, and
             // anything that was connected above reached whoever did. Binding is
