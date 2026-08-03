@@ -8,8 +8,9 @@
 //! here even though it looked correct on its own terms.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -32,33 +33,28 @@ const SEARCH_BASE: u32 = 20000;
 /// How many ports the search may walk.
 const SEARCH_SPAN: u32 = 40000;
 
-/// Find a port such that it and the next one are both free.
+/// Hand out a port pair that no other test in this process has been given.
 ///
-/// Asking the system for any free port and then hoping the one after it is
-/// free as well fails often enough to matter, because the port it hands back
-/// comes from a range it is busy handing out. Instead a wide range is walked
-/// two at a time, from a starting point that depends on the process and the
-/// clock so that two runs at once do not walk the same ground in step.
-fn free_port_pair() -> u16 {
-    let spread = std::process::id() as u32 ^ swtrust::util::time::unix_millis_now() as u32;
-    let start = spread % SEARCH_SPAN;
-    for step in 0..SEARCH_SPAN / 2 {
-        let port = SEARCH_BASE + (start + step * 2) % SEARCH_SPAN;
-        if port + 1 > u16::MAX as u32 {
-            continue;
-        }
-        let port = port as u16;
-        let Ok(a) = TcpListener::bind(("127.0.0.1", port)) else {
-            continue;
-        };
-        let Ok(b) = TcpListener::bind(("127.0.0.1", port + 1)) else {
-            continue;
-        };
-        drop(a);
-        drop(b);
-        return port;
-    }
-    panic!("no free port pair in {SEARCH_BASE}..{}", SEARCH_BASE + SEARCH_SPAN);
+/// Searching for a free pair by binding it and letting it go does not work
+/// here. Two tests can find the same pair, and the one that loses the race to
+/// bind it still connects, because the one that won is listening there. It
+/// then talks to the wrong TPM and only finds out when its own transport turns
+/// out to have stopped with the address already in use.
+///
+/// So the pairs are handed out instead of searched for, which removes the
+/// collision inside this process entirely. A collision with an unrelated
+/// process is still possible, and that is what the retry in `start` covers.
+fn next_port_pair() -> u16 {
+    static BASE: OnceLock<u32> = OnceLock::new();
+    static OFFSET: AtomicU32 = AtomicU32::new(0);
+
+    // The starting point depends on the process and the clock so that two runs
+    // at once do not walk the same ground in step.
+    let base = *BASE.get_or_init(|| {
+        (std::process::id() ^ swtrust::util::time::unix_millis_now() as u32) % SEARCH_SPAN
+    });
+    let offset = OFFSET.fetch_add(2, Ordering::SeqCst);
+    (SEARCH_BASE + (base + offset) % SEARCH_SPAN) as u16
 }
 
 /// Connect within a budget, or report that nothing came up in time.
@@ -105,9 +101,9 @@ fn abandon(joined: thread::JoinHandle<std::io::Result<()>>, port: u16) {
 
 impl Server {
     fn start(tag: &str) -> Server {
-        // A port pair is chosen by binding it and letting it go again, so
-        // another test can take it in between. That is retried rather than
-        // reported, because it says nothing about the transport.
+        // An unrelated process can be holding the pair this one was given, so
+        // failing to bind is retried rather than reported: it says nothing
+        // about the transport.
         for attempt in 0..8 {
             let mut dir = std::env::temp_dir();
             dir.push(format!(
@@ -115,7 +111,7 @@ impl Server {
                 std::process::id(),
                 swtrust::util::time::unix_millis_now()
             ));
-            let port = free_port_pair();
+            let port = next_port_pair();
             let config = Config {
                 interface: Interface::Qemu,
                 port,
@@ -132,6 +128,17 @@ impl Server {
             let opened = connect_within(port, Duration::from_secs(2)).and_then(|data| {
                 connect_within(port + 1, Duration::from_secs(2)).map(|control| (data, control))
             });
+
+            // A transport that has already returned never bound the pair, and
+            // anything that was connected above reached whoever did. Binding is
+            // the first thing it does, so by now it has either bound or failed.
+            if joined.is_finished() {
+                drop(opened);
+                abandon(joined, port);
+                std::fs::remove_dir_all(&dir).ok();
+                continue;
+            }
+
             match opened {
                 Some((data, control)) => {
                     return Server {
