@@ -365,8 +365,7 @@ mod tests {
         let name = [3u8; 34];
         let sensitive = vec![0x5au8; 48];
         for (name_alg, bits) in [
-            (alg::SHA1, 128u16),
-            (alg::SHA256, 128),
+            (alg::SHA256, 128u16),
             (alg::SHA256, 256),
             (alg::SHA384, 192),
             (alg::SHA512, 256),

@@ -77,7 +77,6 @@ fn expect(name: &'static str, got: &[u8], want: &[u8]) -> TestResult {
 // Where a public vector exists the value is that vector, noted below.
 
 /// FIPS 180-4, digest of "abc".
-const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
 const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 const SHA384_ABC: &str =
     "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7";
@@ -186,7 +185,6 @@ const KAT_MESSAGE: &[u8] = b"abc";
 /// TPM2_IncrementalSelfTest reports what is left to do from this list, and
 /// TPM2_GetCapability(TPM_CAP_ALGS) is a superset of it.
 pub const TESTED_ALGORITHMS: &[u16] = &[
-    alg::SHA1,
     alg::SHA256,
     alg::SHA384,
     alg::SHA512,
@@ -213,7 +211,6 @@ pub const TESTED_ALGORITHMS: &[u16] = &[
 /// unchecked while the module reported that its tests had passed.
 pub fn hash_kats() -> TestResult {
     for (name, hash_alg, want) in [
-        ("SHA-1", alg::SHA1, SHA1_ABC),
         ("SHA-256", alg::SHA256, SHA256_ABC),
         ("SHA-384", alg::SHA384, SHA384_ABC),
         ("SHA-512", alg::SHA512, SHA512_ABC),
@@ -706,7 +703,11 @@ mod tests {
                 "hash {alg_id:#06x} is implemented but no self test covers it"
             );
         }
-        assert!(found >= 7, "only {found} hashes were found, the scan is wrong");
+        assert_eq!(
+            found,
+            crate::tpm::config::IMPLEMENTED_HASHES.len(),
+            "the scan found a different set of hashes than the one reported"
+        );
         // The list must also not name a hash that is not there to test.
         for alg_id in TESTED_ALGORITHMS {
             if hash::digest_size(*alg_id).is_ok() {
@@ -723,7 +724,6 @@ mod tests {
             SHA256_ABC,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert_eq!(SHA1_ABC, "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(
             HMAC_SHA256,
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
@@ -737,7 +737,6 @@ mod tests {
         // an easy place to drop or repeat a character. A wrong length is caught
         // here rather than showing up as an unexplained algorithm failure.
         for (name, text, want) in [
-            ("SHA1_ABC", SHA1_ABC, 20),
             ("SHA256_ABC", SHA256_ABC, 32),
             ("SHA384_ABC", SHA384_ABC, 48),
             ("SHA512_ABC", SHA512_ABC, 64),

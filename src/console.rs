@@ -638,7 +638,6 @@ fn alg_name(value: u16) -> String {
         alg::ECC => "ecc".to_string(),
         alg::KEYEDHASH => "keyedhash".to_string(),
         alg::SYMCIPHER => "symcipher".to_string(),
-        alg::SHA1 => "sha1".to_string(),
         alg::SHA256 => "sha256".to_string(),
         alg::SHA384 => "sha384".to_string(),
         alg::SHA512 => "sha512".to_string(),
@@ -652,7 +651,6 @@ fn alg_name(value: u16) -> String {
 /// The algorithm a name stands for.
 fn alg_value(name: &str) -> Option<u16> {
     match name {
-        "sha1" => Some(alg::SHA1),
         "sha256" => Some(alg::SHA256),
         "sha384" => Some(alg::SHA384),
         "sha512" => Some(alg::SHA512),

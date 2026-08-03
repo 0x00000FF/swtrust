@@ -10,9 +10,14 @@ use crate::tpm::constants::{alg, rc};
 use crate::tpm::error::{TpmRc, TpmResult};
 
 /// The aws-lc-rs algorithm for a TPM_ALG_ID.
+///
+/// SHA-1 is absent. The PC Client Platform TPM Profile 1.07 clause 4.3 Table 3
+/// lists TPM_ALG_SHA1 as Not Allowed, and item 5 of that clause says an
+/// algorithm listed that way "SHALL NOT be supported". Leaving it out here is
+/// what makes that true everywhere, because every use of a hash in this TPM
+/// goes through this function.
 pub fn algorithm(hash_alg: u16) -> TpmResult<&'static digest::Algorithm> {
     Ok(match hash_alg {
-        alg::SHA1 => &digest::SHA1_FOR_LEGACY_USE_ONLY,
         alg::SHA256 => &digest::SHA256,
         alg::SHA384 => &digest::SHA384,
         alg::SHA512 => &digest::SHA512,
@@ -34,7 +39,7 @@ pub fn digest_size(hash_alg: u16) -> TpmResult<usize> {
 /// For the SHA-3 family this is the sponge rate.
 pub fn block_size(hash_alg: u16) -> TpmResult<usize> {
     Ok(match hash_alg {
-        alg::SHA1 | alg::SHA256 => 64,
+        alg::SHA256 => 64,
         alg::SHA384 | alg::SHA512 => 128,
         alg::SHA3_256 => 136,
         alg::SHA3_384 => 104,
@@ -102,7 +107,9 @@ mod tests {
 
     #[test]
     fn digest_sizes_match_the_specification() {
-        assert_eq!(digest_size(alg::SHA1).unwrap(), 20);
+        // SHA-1 is Not Allowed by the platform profile, so it is not a hash
+        // this TPM has and asking for its size is asking about nothing.
+        assert_eq!(digest_size(alg::SHA1).unwrap_err(), TpmRc(rc::HASH));
         assert_eq!(digest_size(alg::SHA256).unwrap(), 32);
         assert_eq!(digest_size(alg::SHA384).unwrap(), 48);
         assert_eq!(digest_size(alg::SHA512).unwrap(), 64);
@@ -115,7 +122,7 @@ mod tests {
 
     #[test]
     fn block_sizes_match_the_standards() {
-        assert_eq!(block_size(alg::SHA1).unwrap(), 64);
+        assert!(block_size(alg::SHA1).is_err());
         assert_eq!(block_size(alg::SHA256).unwrap(), 64);
         assert_eq!(block_size(alg::SHA384).unwrap(), 128);
         assert_eq!(block_size(alg::SHA512).unwrap(), 128);
@@ -128,10 +135,7 @@ mod tests {
 
     #[test]
     fn known_answers_for_the_empty_message() {
-        assert_eq!(
-            digest(alg::SHA1, b"").unwrap(),
-            hex("da39a3ee5e6b4b0d3255bfef95601890afd80709")
-        );
+        assert_eq!(digest(alg::SHA1, b"").unwrap_err(), TpmRc(rc::HASH));
         assert_eq!(
             digest(alg::SHA256, b"").unwrap(),
             hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
@@ -159,10 +163,6 @@ mod tests {
     #[test]
     fn known_answers_for_abc() {
         assert_eq!(
-            digest(alg::SHA1, b"abc").unwrap(),
-            hex("a9993e364706816aba3e25717850c26c9cd0d89d")
-        );
-        assert_eq!(
             digest(alg::SHA256, b"abc").unwrap(),
             hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
@@ -189,15 +189,7 @@ mod tests {
     #[test]
     fn incremental_matches_one_shot() {
         let data: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
-        for a in [
-            alg::SHA1,
-            alg::SHA256,
-            alg::SHA384,
-            alg::SHA512,
-            alg::SHA3_256,
-            alg::SHA3_384,
-            alg::SHA3_512,
-        ] {
+        for a in crate::tpm::config::IMPLEMENTED_HASHES.iter().copied() {
             let mut h = Hasher::new(a).unwrap();
             for chunk in data.chunks(37) {
                 h.update(chunk);

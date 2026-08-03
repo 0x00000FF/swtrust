@@ -146,7 +146,10 @@ fn private_exponent(e: &BigNum, p: &BigNum, q: &BigNum, ctx: &BnCtx) -> TpmResul
 /// the product always has exactly `key_bits` bits, following FIPS 186-5
 /// appendix A.1.3.
 pub fn generate(rng: &mut dyn Rng, key_bits: u16, exponent: u32) -> TpmResult<RsaPrivate> {
-    if key_bits < 1024 || key_bits > config::MAX_RSA_KEY_BITS || key_bits % 8 != 0 {
+    // The lower bound is 2048 rather than 1024: the PC Client Platform TPM
+    // Profile 1.07 clause 4.3 says a TPM "SHALL NOT support 1024-bit keys", so
+    // there must be no way to make one, not merely no way to ask for one.
+    if key_bits < 2048 || key_bits > config::MAX_RSA_KEY_BITS || key_bits % 8 != 0 {
         return Err(TpmRc(rc::KEY_SIZE));
     }
     let e_value = effective_exponent(exponent);
@@ -393,10 +396,6 @@ pub fn pkcs1v15_encrypt_unpad(encoded: &[u8]) -> TpmResult<Vec<u8>> {
 fn digest_info_prefix(hash_alg: u16) -> TpmResult<&'static [u8]> {
     use crate::tpm::constants::alg;
     Ok(match hash_alg {
-        alg::SHA1 => &[
-            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
-            0x14,
-        ],
         alg::SHA256 => &[
             0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
             0x01, 0x05, 0x00, 0x04, 0x20,
@@ -562,20 +561,25 @@ mod tests {
         Drbg::new(&[0x5au8; 48], b"rsa").unwrap()
     }
 
-    /// A 1024 bit key, which is the smallest the TPM accepts, generated once
-    /// per test to keep the suite quick.
+    /// A 2048 bit key, which is the smallest the TPM accepts, generated from a
+    /// fixed seed so the same key comes back every time.
+    ///
+    /// 1024 bit keys are not used anywhere, including here: the PC Client
+    /// Platform TPM Profile 1.07 clause 4.3 says a TPM "SHALL NOT support
+    /// 1024-bit keys", and a test that made one would be testing something the
+    /// TPM must not do.
     fn small_key() -> RsaPrivate {
         let mut r = SeededRng::new(alg::SHA256, &[7u8; 32], "TEST", b"rsa");
-        generate(&mut r, 1024, 0).unwrap()
+        generate(&mut r, 2048, 0).unwrap()
     }
 
     #[test]
     fn generation_produces_a_usable_key() {
         let key = small_key();
-        assert_eq!(key.public.bits(), 1024);
-        assert_eq!(key.size(), 128);
-        assert_eq!(key.prime_bytes().unwrap().len(), 64);
-        assert_eq!(key.modulus_bytes().unwrap().len(), 128);
+        assert_eq!(key.public.bits(), 2048);
+        assert_eq!(key.size(), 256);
+        assert_eq!(key.prime_bytes().unwrap().len(), 128);
+        assert_eq!(key.modulus_bytes().unwrap().len(), 256);
 
         // n = p * q with both primes odd and greater than one.
         let ctx = BnCtx::new().unwrap();
@@ -595,7 +599,7 @@ mod tests {
     #[test]
     fn generation_differs_for_a_different_seed() {
         let mut r = SeededRng::new(alg::SHA256, &[8u8; 32], "TEST", b"rsa");
-        let other = generate(&mut r, 1024, 0).unwrap();
+        let other = generate(&mut r, 2048, 0).unwrap();
         assert_ne!(
             other.modulus_bytes().unwrap(),
             small_key().modulus_bytes().unwrap()
@@ -610,9 +614,12 @@ mod tests {
             generate(&mut r, 8192, 0).unwrap_err(),
             TpmRc(rc::KEY_SIZE)
         );
-        assert_eq!(generate(&mut r, 1023, 0).unwrap_err(), TpmRc(rc::KEY_SIZE));
-        assert_eq!(generate(&mut r, 1024, 4).unwrap_err(), TpmRc(rc::VALUE));
-        assert_eq!(generate(&mut r, 1024, 1).unwrap_err(), TpmRc(rc::VALUE));
+        assert_eq!(generate(&mut r, 2047, 0).unwrap_err(), TpmRc(rc::KEY_SIZE));
+        // 1024 bit keys are refused outright, which the platform profile
+        // requires and which no other size demonstrates.
+        assert_eq!(generate(&mut r, 1024, 0).unwrap_err(), TpmRc(rc::KEY_SIZE));
+        assert_eq!(generate(&mut r, 2048, 4).unwrap_err(), TpmRc(rc::VALUE));
+        assert_eq!(generate(&mut r, 2048, 1).unwrap_err(), TpmRc(rc::VALUE));
     }
 
     #[test]
@@ -625,7 +632,7 @@ mod tests {
         )
         .unwrap();
         // Both keys must agree on every operation.
-        let msg = vec![0x01u8; 128];
+        let msg = vec![0x01u8; key.size()];
         let a = private_op(&key, &msg).unwrap();
         let b = private_op(&rebuilt, &msg).unwrap();
         assert_eq!(a, b);
@@ -645,10 +652,11 @@ mod tests {
     #[test]
     fn raw_operations_are_inverses() {
         let key = small_key();
-        let mut message = vec![0u8; 128];
-        message[1..].copy_from_slice(&[0x42u8; 127]);
+        let mut message = vec![0x42u8; key.size()];
+        // The leading octet is cleared so the value is below the modulus.
+        message[0] = 0;
         let c = public_op(&key.public, &message).unwrap();
-        assert_eq!(c.len(), 128);
+        assert_eq!(c.len(), key.size());
         assert_eq!(private_op(&key, &c).unwrap(), message);
 
         // And in the other order, which is what signing does.
@@ -671,10 +679,10 @@ mod tests {
     #[test]
     fn oaep_round_trip() {
         let mut r = rng();
-        for hash in [alg::SHA1, alg::SHA256, alg::SHA384] {
+        for hash in [alg::SHA256, alg::SHA384, alg::SHA512] {
             let msg = b"a short message";
-            let encoded = oaep_encode(hash, 128, msg, b"LABEL\0", &mut r).unwrap();
-            assert_eq!(encoded.len(), 128);
+            let encoded = oaep_encode(hash, 256, msg, b"LABEL\0", &mut r).unwrap();
+            assert_eq!(encoded.len(), 256);
             assert_eq!(encoded[0], 0x00);
             assert_eq!(oaep_decode(hash, &encoded, b"LABEL\0").unwrap(), msg);
         }
@@ -790,13 +798,13 @@ mod tests {
     #[test]
     fn pss_round_trip() {
         let mut r = rng();
-        for hash in [alg::SHA1, alg::SHA256, alg::SHA384] {
+        for hash in [alg::SHA256, alg::SHA384, alg::SHA512] {
             let h_len = digest_size(hash).unwrap();
             let d = vec![0x5au8; h_len];
-            let em = pss_encode(hash, &d, 1024, &mut r).unwrap();
-            assert_eq!(em.len(), 128);
+            let em = pss_encode(hash, &d, 2048, &mut r).unwrap();
+            assert_eq!(em.len(), 256);
             assert_eq!(*em.last().unwrap(), 0xbc);
-            pss_verify(hash, &d, &em, 1024).unwrap();
+            pss_verify(hash, &d, &em, 2048).unwrap();
         }
     }
 
@@ -804,10 +812,10 @@ mod tests {
     fn pss_uses_the_largest_salt() {
         let mut r = rng();
         let d = vec![0x11u8; 32];
-        let em = pss_encode(alg::SHA256, &d, 1024, &mut r).unwrap();
-        // emLen is 128, so the salt is 128 - 32 - 2 = 94 octets and the
+        let em = pss_encode(alg::SHA256, &d, 2048, &mut r).unwrap();
+        // emLen is 256, so the salt is 256 - 32 - 2 = 222 octets and the
         // padding string is empty, leaving 0x01 as the first octet of DB.
-        let db_len = 128 - 32 - 1;
+        let db_len = 256 - 32 - 1;
         let db_mask = mgf1(alg::SHA256, &em[db_len..db_len + 32], db_len).unwrap();
         let mut db = em[..db_len].to_vec();
         for (a, b) in db.iter_mut().zip(db_mask.iter()) {
@@ -821,24 +829,24 @@ mod tests {
     fn pss_rejects_corrupt_encodings() {
         let mut r = rng();
         let d = vec![0x22u8; 32];
-        let em = pss_encode(alg::SHA256, &d, 1024, &mut r).unwrap();
+        let em = pss_encode(alg::SHA256, &d, 2048, &mut r).unwrap();
 
         let mut bad = em.clone();
         *bad.last_mut().unwrap() = 0xbb;
-        assert!(pss_verify(alg::SHA256, &d, &bad, 1024).is_err());
+        assert!(pss_verify(alg::SHA256, &d, &bad, 2048).is_err());
 
         let mut bad = em.clone();
         bad[0] ^= 0x80;
-        assert!(pss_verify(alg::SHA256, &d, &bad, 1024).is_err());
+        assert!(pss_verify(alg::SHA256, &d, &bad, 2048).is_err());
 
         let mut bad = em.clone();
         bad[50] ^= 0x01;
-        assert!(pss_verify(alg::SHA256, &d, &bad, 1024).is_err());
+        assert!(pss_verify(alg::SHA256, &d, &bad, 2048).is_err());
 
         // A different digest does not verify.
-        assert!(pss_verify(alg::SHA256, &vec![0x23u8; 32], &em, 1024).is_err());
+        assert!(pss_verify(alg::SHA256, &vec![0x23u8; 32], &em, 2048).is_err());
         // The wrong length is refused.
-        assert!(pss_verify(alg::SHA256, &d, &em[..127], 1024).is_err());
+        assert!(pss_verify(alg::SHA256, &d, &em[..255], 2048).is_err());
     }
 
     #[test]

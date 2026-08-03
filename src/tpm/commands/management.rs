@@ -541,7 +541,7 @@ fn tpm_properties(state: &TpmState, property: u32) -> Vec<TaggedProperty> {
         TaggedProperty::new(pt::MAX_SESSION_CONTEXT, config::MAX_SESSION_CONTEXT),
         TaggedProperty::new(pt::PS_FAMILY_INDICATOR, crate::tpm::constants::ps::PC),
         TaggedProperty::new(pt::PS_LEVEL, 0),
-        TaggedProperty::new(pt::PS_REVISION, TPM_SPEC_VERSION),
+        TaggedProperty::new(pt::PS_REVISION, config::PS_REVISION),
         TaggedProperty::new(pt::PS_DAY_OF_YEAR, 0),
         TaggedProperty::new(pt::PS_YEAR, 0),
         TaggedProperty::new(pt::SPLIT_MAX, config::MAX_COMMIT_SEQUENCES as u32),

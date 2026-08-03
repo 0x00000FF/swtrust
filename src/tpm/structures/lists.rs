@@ -365,10 +365,10 @@ mod tests {
 
     #[test]
     fn a_list_is_a_count_then_elements() {
-        let l = TpmlAlg::new(vec![alg::SHA1, alg::SHA256]).unwrap();
+        let l = TpmlAlg::new(vec![alg::SHA384, alg::SHA256]).unwrap();
         assert_eq!(
             l.to_bytes(),
-            vec![0x00, 0x00, 0x00, 0x02, 0x00, 0x04, 0x00, 0x0b]
+            vec![0x00, 0x00, 0x00, 0x02, 0x00, 0x0c, 0x00, 0x0b]
         );
         assert_eq!(TpmlAlg::from_bytes(&l.to_bytes()).unwrap(), l);
     }
@@ -426,7 +426,7 @@ mod tests {
         s.select(0);
         s.select(7);
         let l = TpmlPcrSelection::new(vec![
-            PcrSelection::new(alg::SHA1, s.clone()),
+            PcrSelection::new(alg::SHA384, s.clone()),
             PcrSelection::new(alg::SHA256, s),
         ])
         .unwrap();
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn digest_values_list_round_trip() {
         let l = TpmlDigestValues::new(vec![
-            TpmtHa::new(alg::SHA1, vec![1u8; 20]).unwrap(),
+            TpmtHa::new(alg::SHA384, vec![1u8; 48]).unwrap(),
             TpmtHa::new(alg::SHA256, vec![2u8; 32]).unwrap(),
         ])
         .unwrap();

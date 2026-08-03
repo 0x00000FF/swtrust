@@ -241,16 +241,42 @@ mod tests {
         );
     }
 
+    /// RFC 4231 test cases 1 and 2, which cover the SHA-2 family.
+    ///
+    /// The SHA-1 vectors of RFC 2202 used to be here. They are gone with the
+    /// algorithm: the platform profile lists SHA-1 as Not Allowed, so asking
+    /// this TPM for an HMAC over it is asking for a hash it does not have.
     #[test]
-    fn rfc_2202_sha1_vectors() {
+    fn rfc_4231_vectors() {
         assert_eq!(
-            hmac(alg::SHA1, &vec![0x0b; 20], b"Hi There").unwrap(),
-            hex("b617318655057264e28bc0b6fb378c8ef146be00")
+            hmac(alg::SHA384, &vec![0x0b; 20], b"Hi There").unwrap(),
+            hex(concat!(
+                "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec6",
+                "82aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6"
+            ))
         );
         assert_eq!(
-            hmac(alg::SHA1, b"Jefe", b"what do ya want for nothing?").unwrap(),
-            hex("effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")
+            hmac(alg::SHA512, &vec![0x0b; 20], b"Hi There").unwrap(),
+            hex(concat!(
+                "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cde",
+                "daa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"
+            ))
         );
+        assert_eq!(
+            hmac(alg::SHA384, b"Jefe", b"what do ya want for nothing?").unwrap(),
+            hex(concat!(
+                "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47",
+                "e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649"
+            ))
+        );
+        assert_eq!(
+            hmac(alg::SHA512, b"Jefe", b"what do ya want for nothing?").unwrap(),
+            hex(concat!(
+                "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554",
+                "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"
+            ))
+        );
+        assert!(hmac(alg::SHA1, &vec![0x0b; 20], b"Hi There").is_err());
     }
 
     #[test]
@@ -292,7 +318,7 @@ mod tests {
     fn incremental_hmac_matches_one_shot() {
         let key = b"a key";
         let data: Vec<u8> = (0u8..=255).cycle().take(500).collect();
-        for a in [alg::SHA1, alg::SHA256, alg::SHA384, alg::SHA512, alg::SHA3_512] {
+        for a in crate::tpm::config::IMPLEMENTED_HASHES.iter().copied() {
             let mut m = Hmac::new(a, key).unwrap();
             for c in data.chunks(13) {
                 m.update(c);
@@ -402,9 +428,9 @@ mod tests {
     fn mgf1_known_answer() {
         // RFC 8017 does not publish MGF1 vectors directly, so this checks the
         // shortest possible output against the first digest block.
-        let out = mgf1(alg::SHA1, b"", 1).unwrap();
+        let out = mgf1(alg::SHA256, b"", 1).unwrap();
         let full =
-            super::super::hash::digest_parts(alg::SHA1, &[b"", &0u32.to_be_bytes()]).unwrap();
+            super::super::hash::digest_parts(alg::SHA256, &[b"", &0u32.to_be_bytes()]).unwrap();
         assert_eq!(out, vec![full[0]]);
     }
 }

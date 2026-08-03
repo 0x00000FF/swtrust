@@ -117,8 +117,9 @@ fn a_register_is_read_extended_written_and_reset() {
         swtrust::tpm::config::IMPLEMENTATION_PCR as usize
     );
 
-    // A bank may be named, and an unknown one is refused.
-    assert_eq!(run(&h, "pcr read 0 sha1").len(), 40);
+    // A bank may be named, and an unknown one is refused. SHA-384 is the
+    // second of the two banks the platform profile allocates by default.
+    assert_eq!(run(&h, "pcr read 0 sha384").len(), 96);
     assert!(run(&h, "pcr read 0 sha999").contains("unknown hash algorithm"));
     // A digest of the wrong length is refused rather than stored.
     assert!(run(&h, "pcr write 0 abcd").contains("error"));

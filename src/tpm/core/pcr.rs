@@ -489,22 +489,22 @@ mod tests {
     use crate::tpm::constants::alg;
 
     fn banks() -> PcrBanks {
-        PcrBanks::new(&[alg::SHA1, alg::SHA256]).unwrap()
+        PcrBanks::new(config::DEFAULT_PCR_BANKS).unwrap()
     }
 
     #[test]
     fn allocation_creates_every_register() {
         let b = banks();
-        assert_eq!(b.algorithms(), vec![alg::SHA1, alg::SHA256]);
-        assert!(b.has_bank(alg::SHA1));
-        assert!(!b.has_bank(alg::SHA384));
-        assert_eq!(b.read(alg::SHA1, 0).unwrap().len(), 20);
+        assert_eq!(b.algorithms(), vec![alg::SHA256, alg::SHA384]);
+        assert!(b.has_bank(alg::SHA256));
+        assert!(!b.has_bank(alg::SHA512));
         assert_eq!(b.read(alg::SHA256, 0).unwrap().len(), 32);
+        assert_eq!(b.read(alg::SHA384, 0).unwrap().len(), 48);
         assert_eq!(
             b.read(alg::SHA256, config::IMPLEMENTATION_PCR).unwrap_err(),
             TpmRc(rc::VALUE)
         );
-        assert_eq!(b.read(alg::SHA384, 0).unwrap_err(), TpmRc(rc::VALUE));
+        assert_eq!(b.read(alg::SHA512, 0).unwrap_err(), TpmRc(rc::VALUE));
     }
 
     #[test]
@@ -529,7 +529,7 @@ mod tests {
         let expected = hash::digest_parts(alg::SHA256, &[&[0u8; 32], &digest]).unwrap();
         assert_eq!(b.read(alg::SHA256, 0).unwrap(), &expected[..]);
         // The bank that was not named is untouched.
-        assert!(b.read(alg::SHA1, 0).unwrap().iter().all(|v| *v == 0));
+        assert!(b.read(alg::SHA384, 0).unwrap().iter().all(|v| *v == 0));
     }
 
     #[test]
@@ -553,7 +553,7 @@ mod tests {
         b.extend(
             0,
             0,
-            &[(alg::SHA1, vec![1u8; 20]), (alg::SHA256, vec![1u8; 32])],
+            &[(alg::SHA256, vec![1u8; 32]), (alg::SHA384, vec![1u8; 48])],
         )
         .unwrap();
         assert_eq!(b.update_counter(), 2, "two banks changed, so two counts");
@@ -562,7 +562,7 @@ mod tests {
         b.extend(
             0,
             0,
-            &[(alg::SHA256, vec![2u8; 32]), (alg::SHA384, vec![2u8; 48])],
+            &[(alg::SHA256, vec![2u8; 32]), (alg::SHA512, vec![2u8; 64])],
         )
         .unwrap();
         assert_eq!(b.update_counter(), 3, "only the allocated bank counted");
@@ -777,9 +777,11 @@ mod tests {
         let mut sel = PcrSelect::none();
         sel.select(0);
         sel.select(23);
+        // SHA-512 is implemented but not allocated, so its half of the
+        // selection is dropped while SHA-256 keeps both registers.
         let list = TpmlPcrSelection::new(vec![
             PcrSelection::new(alg::SHA256, sel.clone()),
-            PcrSelection::new(alg::SHA384, sel),
+            PcrSelection::new(alg::SHA512, sel),
         ])
         .unwrap();
         let filtered = b.filter_selection(&list);
@@ -792,10 +794,10 @@ mod tests {
     fn reallocation_resets_every_register() {
         let mut b = banks();
         b.extend(0, 0, &[(alg::SHA256, vec![1u8; 32])]).unwrap();
-        b.allocate(&[alg::SHA256, alg::SHA384]).unwrap();
-        assert_eq!(b.algorithms(), vec![alg::SHA256, alg::SHA384]);
+        b.allocate(&[alg::SHA256, alg::SHA512]).unwrap();
+        assert_eq!(b.algorithms(), vec![alg::SHA256, alg::SHA512]);
         assert!(b.read(alg::SHA256, 0).unwrap().iter().all(|v| *v == 0));
-        assert!(!b.has_bank(alg::SHA1));
+        assert!(!b.has_bank(alg::SHA384));
         assert_eq!(
             b.allocate(&[alg::RSA]).unwrap_err(),
             TpmRc(rc::HASH)
