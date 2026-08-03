@@ -231,20 +231,24 @@ impl Device for Tpm {
         }
         let code = parse_header(command).map(|h| h.code).ok();
         let elapsed = self.elapsed();
-        let response = {
+        let (response, clock_rolled_over) = {
             let mut state = self.locked();
             // The time that passed since the last command is credited before
             // the command runs, so a command that reports the clock or reads
             // the countdown timer sees the value it should.
-            state.advance_time(elapsed);
-            crate::tpm::commands::execute::run(&mut state, locality, command)
+            let rolled = state.advance_time(elapsed);
+            (
+                crate::tpm::commands::execute::run(&mut state, locality, command),
+                rolled,
+            )
         };
         // A command that touches non-volatile state is followed by a write so
-        // the state file matches what the TPM reports.
-        if let Some(code) = code {
-            if Tpm::writes_nv(code) {
-                self.persist();
-            }
+        // the state file matches what the TPM reports. So is a rollover of the
+        // clock, which is the moment Part 2 clause 10.10.2 asks for the copy in
+        // NV to be brought up to date.
+        let writes_nv = code.map(Tpm::writes_nv).unwrap_or(false);
+        if writes_nv || clock_rolled_over {
+            self.persist();
         }
         response
     }
@@ -365,7 +369,7 @@ impl Device for Tpm {
         }
         let elapsed = self.elapsed();
         let mut state = self.locked();
-        state.advance_time(elapsed);
+        let _ = state.advance_time(elapsed);
         state.act.signaled()
     }
 }

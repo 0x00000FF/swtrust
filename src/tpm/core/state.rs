@@ -98,6 +98,13 @@ pub struct ClockState {
     /// Time only means something within one epoch. Part 3 clause 23.2.2 uses
     /// this to expire an authorization whose epoch has passed.
     pub time_epoch: u64,
+    /// Milliseconds since the copy of Clock in NV was last brought up to date.
+    ///
+    /// Part 2 clause 10.10.2 lets Clock have a volatile component so long as
+    /// the non-volatile one is refreshed at least every 2^22 milliseconds, and
+    /// Part 1 Table 39 lets clockSafe become SET again once that rollover has
+    /// happened. This is the volatile part, so it is not saved.
+    pub nv_elapsed: u64,
 }
 
 impl Marshal for ClockState {
@@ -121,6 +128,7 @@ impl Unmarshal for ClockState {
             safe: r.u8()? != 0,
             total_reset_count: r.u32()?,
             time_epoch: r.u64()?,
+            nv_elapsed: 0,
         })
     }
 }
@@ -290,6 +298,11 @@ impl TpmState {
     pub fn on_startup_clear(&mut self) -> TpmResult<()> {
         let restart = self.shutdown_type == su::STATE;
         let disorderly = self.shutdown_type == su::NONE;
+        // A TPM that has never been powered has reported no Clock at all, so
+        // its first startup cannot be behind a value it gave out earlier. Part
+        // 2 clause 10.10.1 has safe SET in that state, and every later startup
+        // that was not orderly may have lost the volatile part of Clock.
+        let ever_powered = self.clock.reset_count > 0 || self.clock.restart_count > 0;
         self.hierarchies.on_reset(&mut self.rng)?;
         self.pcr.allocate(&self.pcr_allocation.clone())?;
         self.pcr.reset_update_counter();
@@ -304,6 +317,21 @@ impl TpmState {
             self.clock.restart_count = 0;
         }
         self.clock.time = 0;
+        self.clock.nv_elapsed = 0;
+        // The volatile part of Clock goes with the power. Part 2 clause 10.10.1
+        // says safe means "no value of Clock greater than the current value of
+        // Clock has been previously reported by the TPM", and after a startup
+        // that was not orderly the saved value may be behind one that was
+        // already reported. Move Clock on by a whole update interval, which is
+        // the most that can have been lost, and report that it is not safe
+        // until it rolls over again, which is what Part 1 Table 39 asks for.
+        if disorderly && ever_powered {
+            self.clock.clock = self
+                .clock
+                .clock
+                .saturating_add(u64::from(config::NV_CLOCK_UPDATE_INTERVAL));
+            self.clock.safe = false;
+        }
         // Part 1 clause 34.4 lists the command audit digest among the values a
         // TPM Reset returns to their initialization value. A TPM Restart keeps
         // it, which is what clause 32 means by preserving it over an orderly
@@ -333,13 +361,25 @@ impl TpmState {
     /// since the last _TPM_Init, and clause 40.2 counts the ACT down once per
     /// second over the same period. The transport calls this before each
     /// command, which is the only moment the TPM is asked anything.
-    pub fn advance_time(&mut self, millis: u64) {
+    pub fn advance_time(&mut self, millis: u64) -> bool {
         if millis == 0 {
-            return;
+            return false;
         }
         self.clock.clock = self.clock.clock.saturating_add(millis);
         self.clock.time = self.clock.time.saturating_add(millis);
         self.act.advance(millis);
+
+        // Part 2 clause 10.10.2 requires the copy of Clock in NV to be brought
+        // up to date at least every TPM_PT_CLOCK_UPDATE milliseconds. Part 1
+        // Table 39 says clockSafe, once CLEAR, "is not SET until the RAM value
+        // of Clock rolls over", which is that same moment.
+        self.clock.nv_elapsed = self.clock.nv_elapsed.saturating_add(millis);
+        if self.clock.nv_elapsed >= u64::from(config::NV_CLOCK_UPDATE_INTERVAL) {
+            self.clock.nv_elapsed = 0;
+            self.clock.safe = true;
+            return true;
+        }
+        false
     }
 
     /// Apply TPM2_Startup(TPM_SU_STATE), which is a TPM Resume.
@@ -962,6 +1002,49 @@ mod tests {
         assert!(!s.persistent.contains_key(&hc::PERSISTENT_FIRST));
         assert!(s.persistent.contains_key(&hc::PLATFORM_PERSISTENT));
         assert_eq!(s.clock.reset_count, 0);
+    }
+
+    /// Part 2 clause 10.10.1 says safe means "no value of Clock greater than
+    /// the current value of Clock has been previously reported by the TPM", and
+    /// Part 1 Table 39 has clockSafe CLEAR when a Startup is not orderly and
+    /// SET again once the RAM value of Clock rolls over.
+    #[test]
+    fn a_startup_that_was_not_orderly_says_the_clock_is_not_safe() {
+        let mut s = TpmState::manufacture().unwrap();
+
+        // The first startup of a TPM that has never been powered reported no
+        // Clock at all, so it cannot be behind one and stays safe.
+        s.on_startup_clear().unwrap();
+        assert!(s.clock.safe, "the first startup has nothing to be behind");
+
+        // Time passes and the TPM loses power without a shutdown.
+        s.advance_time(5_000);
+        let before = s.clock.clock;
+        s.shutdown_type = su::NONE;
+        s.on_startup_clear().unwrap();
+        assert!(!s.clock.safe, "a startup that was not orderly is not safe");
+        assert!(
+            s.clock.clock >= before + u64::from(config::NV_CLOCK_UPDATE_INTERVAL),
+            "Clock must move past anything that could have been reported"
+        );
+
+        // It becomes safe again when the value rolls over.
+        assert!(!s.advance_time(u64::from(config::NV_CLOCK_UPDATE_INTERVAL) - 1));
+        assert!(!s.clock.safe);
+        assert!(s.advance_time(1), "the rollover is reported to the caller");
+        assert!(s.clock.safe);
+    }
+
+    /// An orderly shutdown keeps the promise, because nothing was lost.
+    #[test]
+    fn an_orderly_shutdown_leaves_the_clock_safe() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        s.advance_time(5_000);
+        s.shutdown_type = su::CLEAR;
+        s.clock.safe = true;
+        s.on_startup_clear().unwrap();
+        assert!(s.clock.safe);
     }
 
     /// Octets the timer block occupies when the policy is empty: the
