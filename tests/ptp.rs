@@ -352,6 +352,44 @@ fn the_timer_the_profile_asks_for_is_there_and_counts() {
     assert_ne!(code_of(&r), rc::SUCCESS, "a second timer answered");
 }
 
+/// Part 1 clause 40.2: an ACT "will decrement by one each second that the TPM
+/// is powered", and signals on reaching zero.
+///
+/// The seconds are handed to the TPM rather than waited for, so the test says
+/// what it means and takes no time. Without this the timer could stand still
+/// and every other ACT test would still pass.
+#[test]
+fn the_timer_counts_down_while_the_tpm_is_powered() {
+    const SIGNALED: u32 = 1;
+
+    let h = Harness::new("actcount");
+    let r = h.send_auth(cc::ACT_SetTimeout, 0x4000_0110, &3u32.to_be_bytes());
+    assert_eq!(code_of(&r), rc::SUCCESS);
+    assert_eq!(h.act().0, 3);
+
+    h.tpm.with_state_mut(|s| {
+        s.advance_time(2_000);
+    });
+    let (timeout, attributes) = h.act();
+    assert_eq!(timeout, 1, "two of the three seconds have gone");
+    assert_eq!(attributes & SIGNALED, 0, "it has not reached zero yet");
+
+    h.tpm.with_state_mut(|s| {
+        s.advance_time(1_000);
+    });
+    let (timeout, attributes) = h.act();
+    assert_eq!(timeout, 0);
+    assert_eq!(attributes & SIGNALED, SIGNALED, "reaching zero signals");
+
+    // It stays signalled until something clears it, and does not wrap round.
+    h.tpm.with_state_mut(|s| {
+        s.advance_time(60_000);
+    });
+    let (timeout, attributes) = h.act();
+    assert_eq!(timeout, 0);
+    assert_eq!(attributes & SIGNALED, SIGNALED);
+}
+
 /// Clause 4.7 item 7: "The optional TPM2_PCR_SetAuthPolicy and
 /// TPM2_PCR_SetAuthValue commands, if implemented, SHALL return TPM_RC_VALUE."
 #[test]
@@ -426,6 +464,39 @@ fn walk(dir: &str) -> Vec<std::path::PathBuf> {
 /// be PCR 0."
 #[test]
 fn the_drtm_and_hcrtm_registers_are_the_ones_the_profile_names() {
+    let h = Harness::new("hcrtm");
+
+    // A D-RTM register starts at all ones, which is what marks it as one.
+    let before: Vec<u8> = h
+        .tpm
+        .with_state(|s| s.pcr.read(alg::SHA256, 17).unwrap().to_vec());
+    assert!(before.iter().all(|v| *v == 0xff), "PCR 17 starts at ones");
+    let hcrtm_before: Vec<u8> = h
+        .tpm
+        .with_state(|s| s.pcr.read(alg::SHA256, 0).unwrap().to_vec());
+    assert!(hcrtm_before.iter().all(|v| *v == 0), "PCR 0 starts at zeros");
+
+    // Run an H-CRTM event sequence the way the interface delivers one.
+    h.tpm.hash_start();
+    h.tpm.hash_data(b"a measurement");
+    h.tpm.hash_end();
+
+    // Clause 4.7 item 8 names PCR 17 the D-RTM register, which the sequence
+    // takes to zero, and PCR 0 the S-HCRTM register, which it extends.
+    let after: Vec<u8> = h
+        .tpm
+        .with_state(|s| s.pcr.read(alg::SHA256, 17).unwrap().to_vec());
+    assert!(
+        after.iter().all(|v| *v == 0),
+        "the D-RTM register is taken to zero, not left at ones"
+    );
+    let hcrtm_after: Vec<u8> = h
+        .tpm
+        .with_state(|s| s.pcr.read(alg::SHA256, 0).unwrap().to_vec());
+    assert_ne!(hcrtm_after, hcrtm_before, "the S-HCRTM register is extended");
+
+    // And they are the registers the configuration names, so nothing else in
+    // the TPM is looking at a different pair.
     assert_eq!(config::DRTM_PCR, 17);
     assert_eq!(config::HCRTM_PCR, 0);
 }

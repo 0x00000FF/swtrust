@@ -70,7 +70,6 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::ACT_SetTimeout => duplication::act_set_timeout(state, request),
 
         // Part 3 clause 30.3, setting a capability.
-        cc::SetCapability => duplication::set_capability(state, request),
 
         // Part 3 clause 14, asymmetric primitives.
         cc::RSA_Encrypt => crypto::rsa_encrypt(state, request),

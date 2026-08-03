@@ -200,7 +200,6 @@ const ROWS: &[Row] = &[
     (cc::SequenceComplete, &[H(Object, false)], &[R::User]),
     (cc::SequenceUpdate, &[H(Object, false)], &[R::User]),
     (cc::SetAlgorithmSet, &[H(Platform, false)], &[R::User]),
-    (cc::SetCapability, &[H(HierarchyAuth, true)], &[R::User]),
     // Part 3 Table 197 writes the type and the name on one line, so this row
     // is added by hand rather than taken from the table sweep.
     (cc::SetPrimaryPolicy, &[H(HierarchyPolicy, false)], &[R::User]),
@@ -331,7 +330,12 @@ pub fn allows(handle_spec: Handle, handle: u32) -> bool {
         Kind::Lockout => handle == rh::LOCKOUT,
         Kind::Hierarchy => hierarchy(handle) || handle == rh::NULL,
         Kind::HierarchyAuth => hierarchy(handle) || handle == rh::LOCKOUT,
-        Kind::HierarchyPolicy => hierarchy(handle) || handle == rh::LOCKOUT,
+        // Part 2 Table 62 puts the ACT handles in TPMI_RH_HIERARCHY_POLICY, so
+        // TPM2_SetPrimaryPolicy can give a timer the policy of its own that
+        // Part 1 clause 40.2 says it has.
+        Kind::HierarchyPolicy => {
+            hierarchy(handle) || handle == rh::LOCKOUT || (rh::ACT_0..=rh::ACT_F).contains(&handle)
+        }
         Kind::BaseHierarchy => hierarchy(handle),
     }
 }

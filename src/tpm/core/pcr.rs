@@ -317,6 +317,26 @@ impl PcrBanks {
         }
     }
 
+    /// Take every register a D-RTM event resets to zero.
+    ///
+    /// This is the event, not TPM2_PCR_Reset. The PC Client Platform TPM
+    /// Profile 1.07 clause 4.7.1 says the hardware that runs a D-RTM sequence
+    /// "is incapable of doing TPM2_PCR_Reset", and repurposes the locality four
+    /// reset attribute "to indicate the initial state of the PCR (0 or -1) and
+    /// to indicate which PCR are set to 0 by a successful D-RTM Sequence". The
+    /// registers that start at ones are exactly those, so no locality is
+    /// checked here: the sequence itself is the authority.
+    pub fn drtm_reset(&mut self) {
+        for (alg, bank) in self.banks.iter_mut() {
+            let size = digest_size(*alg).unwrap_or(0);
+            for (index, reg) in bank.iter_mut().enumerate() {
+                if attributes(index as u16).starts_at_ones {
+                    *reg = vec![0u8; size];
+                }
+            }
+        }
+    }
+
     /// Reset one PCR in every bank, checking the locality.
     pub fn reset(&mut self, index: u16, locality: u8) -> TpmResult<()> {
         if !is_implemented(index) {

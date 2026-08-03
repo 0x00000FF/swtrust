@@ -6,7 +6,8 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use std::sync::{Arc, Mutex};
 
 use crate::logging::Logger;
@@ -86,12 +87,17 @@ pub struct Tpm {
     state: Mutex<TpmState>,
     powered: AtomicBool,
     cancel: AtomicBool,
-    /// Host time, in milliseconds, when the TPM last advanced its own.
+    /// When the TPM last advanced its own time.
     ///
-    /// Part 1 clause 37.2 advances Clock and Time while the TPM is powered.
+    /// Part 1 clause 33 advances Clock and Time while the TPM is powered.
     /// Nothing runs inside a software TPM between commands, so the time that
-    /// passed is worked out from the host clock when the next command arrives.
-    last_tick: AtomicI64,
+    /// passed is worked out when the next command arrives.
+    ///
+    /// The reference is monotonic rather than the wall clock, because clause
+    /// 33.1 calls Time "a free-running hardware value that is not under
+    /// software control" and a wall clock can be moved either way by anything
+    /// on the host.
+    last_tick: Mutex<Instant>,
     /// The platform establishment flag, set by _TPM_Hash_Start.
     ///
     /// It is kept here rather than in the state file because it belongs to the
@@ -160,7 +166,7 @@ impl Tpm {
             state: Mutex::new(state),
             powered: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
-            last_tick: AtomicI64::new(crate::util::time::unix_millis_now()),
+            last_tick: Mutex::new(Instant::now()),
             established: AtomicBool::new(false),
             store,
             logger,
@@ -207,13 +213,33 @@ impl Tpm {
 
     /// Milliseconds of powered time since this was last asked.
     ///
-    /// A host clock that has been put back gives no time at all rather than
-    /// negative time, because Part 1 clause 37.2 does not let Clock go
-    /// backwards.
+    /// Part 1 clause 40.2 counts an ACT down "each second that the TPM is
+    /// powered", and clause 33 advances Clock and Time on the same terms, so a
+    /// TPM with no power is given no time at all.
     fn elapsed(&self) -> u64 {
-        let now = crate::util::time::unix_millis_now();
-        let before = self.last_tick.swap(now, Ordering::SeqCst);
-        u64::try_from(now.saturating_sub(before)).unwrap_or(0)
+        if !self.powered.load(Ordering::SeqCst) {
+            return 0;
+        }
+        let now = Instant::now();
+        let mut last = match self.last_tick.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let delta = now.saturating_duration_since(*last);
+        *last = now;
+        u64::try_from(delta.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Start counting powered time again from now.
+    ///
+    /// Applying power begins a new powered period, and the interval before it
+    /// belongs to no period at all.
+    fn restart_tick(&self) {
+        let mut last = match self.last_tick.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last = Instant::now();
     }
 
     /// True when the command changes anything that must reach the state file.
@@ -254,6 +280,9 @@ impl Device for Tpm {
     }
 
     fn power_on(&self) {
+        // The powered period starts here, so whatever passed while the TPM had
+        // no power is not credited to Clock, Time or the countdown timer.
+        self.restart_tick();
         self.powered.store(true, Ordering::SeqCst);
         {
             let mut state = self.locked();
@@ -337,9 +366,10 @@ impl Device for Tpm {
             return;
         };
         // The D-RTM registers are set to zero before the event is recorded.
-        for index in 17..=22u16 {
-            let _ = state.pcr.reset(index, 4);
-        }
+        // This is the sequence doing it, not a command: the platform profile
+        // says no TPM2_PCR_Reset can, and the command path refuses for exactly
+        // that reason, so it cannot be used here.
+        state.pcr.drtm_reset();
         let algorithms = state.pcr.algorithms();
         for a in algorithms {
             let Ok(digest) = crate::tpm::crypto::hash::digest(a, &buf) else {

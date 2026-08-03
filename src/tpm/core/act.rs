@@ -111,8 +111,10 @@ impl Act {
         self.written = true;
         self.fraction = 0;
         // The value that clears a signal is a request to stop, not a request to
-        // count for that many seconds.
-        if start == CLEAR_SIGNALED && self.timeout == 0 {
+        // count for that many seconds. Clause 33.2.1 asks for all three of a
+        // stopped timer, a set signal and that value; with the signal clear it
+        // is an ordinary non-zero timeout and starts a countdown.
+        if start == CLEAR_SIGNALED && self.timeout == 0 && self.signaled {
             self.signaled = false;
             self.preserve_signaled = false;
             return;
@@ -243,6 +245,25 @@ mod tests {
         a.set_timeout(CLEAR_SIGNALED);
         assert!(!a.signaled(), "the signal is cleared");
         assert_eq!(a.timeout(), 0, "and no new countdown is started");
+    }
+
+    /// Clause 33.2.1 asks for a stopped timer, a set signal and the value. With
+    /// the signal clear it is an ordinary timeout, which state 1 of the same
+    /// clause starts.
+    #[test]
+    fn the_clearing_value_starts_a_countdown_when_nothing_has_signalled() {
+        let mut a = Act::default();
+        assert!(!a.signaled());
+        a.set_timeout(CLEAR_SIGNALED);
+        assert_eq!(a.timeout(), CLEAR_SIGNALED, "state 1 starts the countdown");
+        assert!(!a.signaled());
+
+        // A running timer takes it as a timeout too, which is state 2.
+        let mut a = Act::default();
+        a.set_timeout(5);
+        a.set_timeout(CLEAR_SIGNALED);
+        assert_eq!(a.timeout(), CLEAR_SIGNALED);
+        assert!(!a.signaled());
     }
 
     #[test]

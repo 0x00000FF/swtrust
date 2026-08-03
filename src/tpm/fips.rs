@@ -203,6 +203,20 @@ pub const TESTED_ALGORITHMS: &[u16] = &[
     alg::ECDH,
 ];
 
+/// The vector each digest is tested against, as a name, an algorithm and the
+/// digest of "abc".
+///
+/// This is the list [`hash_kats`] works through, so a test can ask what is
+/// really covered rather than what some other list says is covered.
+const HASH_KATS: &[(&str, u16, &str)] = &[
+    ("SHA-256", alg::SHA256, SHA256_ABC),
+    ("SHA-384", alg::SHA384, SHA384_ABC),
+    ("SHA-512", alg::SHA512, SHA512_ABC),
+    ("SHA3-256", alg::SHA3_256, SHA3_256_ABC),
+    ("SHA3-384", alg::SHA3_384, SHA3_384_ABC),
+    ("SHA3-512", alg::SHA3_512, SHA3_512_ABC),
+];
+
 /// Known answer tests, one per digest the TPM implements.
 ///
 /// FIPS 180-4 covers the SHA-2 family and FIPS 202 the SHA-3 family. Every hash
@@ -210,14 +224,7 @@ pub const TESTED_ALGORITHMS: &[u16] = &[
 /// select any of them and a self test that skipped one would leave that one
 /// unchecked while the module reported that its tests had passed.
 pub fn hash_kats() -> TestResult {
-    for (name, hash_alg, want) in [
-        ("SHA-256", alg::SHA256, SHA256_ABC),
-        ("SHA-384", alg::SHA384, SHA384_ABC),
-        ("SHA-512", alg::SHA512, SHA512_ABC),
-        ("SHA3-256", alg::SHA3_256, SHA3_256_ABC),
-        ("SHA3-384", alg::SHA3_384, SHA3_384_ABC),
-        ("SHA3-512", alg::SHA3_512, SHA3_512_ABC),
-    ] {
+    for (name, hash_alg, want) in HASH_KATS.iter().copied() {
         let want = vector(name, want)?;
         let got = hash::digest(hash_alg, KAT_MESSAGE).map_err(|_| Failure(name))?;
         expect(name, &got, &want)?;
@@ -698,9 +705,16 @@ mod tests {
                 continue;
             }
             found += 1;
+            // Membership of the reported list is not enough on its own: the
+            // run has to hold a vector for the algorithm, or the module would
+            // report a test it never performs.
+            assert!(
+                HASH_KATS.iter().any(|(_, a, _)| *a == alg_id),
+                "hash {alg_id:#06x} is implemented but hash_kats has no vector for it"
+            );
             assert!(
                 TESTED_ALGORITHMS.contains(&alg_id),
-                "hash {alg_id:#06x} is implemented but no self test covers it"
+                "hash {alg_id:#06x} is implemented but is not reported as tested"
             );
         }
         assert_eq!(

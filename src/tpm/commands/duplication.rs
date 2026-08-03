@@ -367,18 +367,6 @@ pub fn act_set_timeout(state: &mut TpmState, request: &Request) -> TpmResult<Res
     respond(|_| Ok(()))
 }
 
-/// TPM2_SetCapability, Part 3 clause 30.3.
-///
-/// No capability of this TPM is settable, so any request is refused.
-pub fn set_capability(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
-    use crate::tpm::structures::capability::CapabilityData;
-    let mut r = request.reader();
-    let size = r.u16()? as usize;
-    let mut inner = r.sub(size)?;
-    r.expect_end()?;
-    let _data = CapabilityData::unmarshal(&mut inner)?;
-    Err(TpmRc(rc::VALUE).with_parameter(1))
-}
 
 
 /// TPM2_AC_GetCapability, Part 3 clause 32.2.

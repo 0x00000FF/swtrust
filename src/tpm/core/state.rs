@@ -618,9 +618,25 @@ impl TpmState {
         state.shutdown_type = r.u16()?;
 
         let count = bounded_count(&mut r, config::HASH_COUNT)?;
-        state.pcr_allocation = (0..count).map(|_| r.u16()).collect::<TpmResult<_>>()?;
-        // The banks the saved allocation names are what the TPM comes up with,
-        // then the saved register values go back into them.
+        let saved_allocation: Vec<u16> = (0..count).map(|_| r.u16()).collect::<TpmResult<_>>()?;
+        // A file written when this TPM still allocated a bank it no longer
+        // implements names that bank here. The PC Client Platform TPM Profile
+        // 1.07 clause 4.3 says an algorithm listed as Not Allowed "SHALL NOT be
+        // supported", so the bank is dropped rather than brought back. The
+        // values that follow are self describing and a bank with nowhere to go
+        // is discarded as they are read, so the record still lines up.
+        state.pcr_allocation = saved_allocation
+            .iter()
+            .copied()
+            .filter(|a| config::IMPLEMENTED_PCR_BANKS.contains(a))
+            .collect();
+        // Dropping every bank would leave a TPM with no PCR at all, so the
+        // allocation a manufactured TPM has is used instead.
+        if state.pcr_allocation.is_empty() {
+            state.pcr_allocation = config::DEFAULT_PCR_BANKS.to_vec();
+        }
+        // The banks the allocation names are what the TPM comes up with, then
+        // the saved register values go back into them.
         state.pcr = PcrBanks::new(&state.pcr_allocation)?;
         state.pcr.unmarshal_values(&mut r)?;
         let saved_update_counter = r.u32()?;
@@ -689,7 +705,13 @@ impl TpmState {
             // is a damaged file rather than an older one. Accepting a short
             // nonce would leave the TPM deriving commit values from less
             // material than clause 44.2.3 asks for.
-            if !commit_random.is_empty() || !commit_used.is_empty() {
+            if commit_random.is_empty() && commit_used.is_empty() {
+                // A TPM with no commit values has no counter either, so a
+                // count beside the empty buffers is a damaged record.
+                if commit_count != 0 {
+                    return Err(TpmRc(rc::BAD_CONTEXT));
+                }
+            } else {
                 if commit_random.len() != config::COMMIT_NONCE_BYTES
                     || commit_used.len() != config::MAX_COMMIT_SEQUENCES as usize / 8
                 {
@@ -706,7 +728,13 @@ impl TpmState {
         // Reset puts it anyway.
         if !r.is_empty() {
             let timeout = r.u32()?;
-            let signaled = r.u8()? != 0;
+            // The signal is one bit written as an octet, so anything other
+            // than the two values it can take is a damaged record.
+            let signaled = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(TpmRc(rc::BAD_CONTEXT)),
+            };
             let policy_alg = r.u16()?;
             let policy_digest = read_sized(&mut r)?;
             state.act.restore(timeout, signaled);
@@ -1002,6 +1030,49 @@ mod tests {
         assert!(!s.persistent.contains_key(&hc::PERSISTENT_FIRST));
         assert!(s.persistent.contains_key(&hc::PLATFORM_PERSISTENT));
         assert_eq!(s.clock.reset_count, 0);
+    }
+
+    /// A file from a TPM that allocated a bank this one no longer implements
+    /// still loads, and comes back without it.
+    ///
+    /// The record is built by hand rather than by saving, because the point is
+    /// a file this build can no longer produce.
+    #[test]
+    fn a_state_file_naming_a_bank_that_is_gone_still_loads() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.hierarchies.owner.auth = b"ownerauth".to_vec();
+        let saved = s.save().unwrap();
+
+        // Find the allocation, which is a count followed by that many
+        // algorithms, and put SHA-1 in front of what is there.
+        let mut w = Writer::new();
+        w.u32(2);
+        w.u16(alg::SHA1);
+        w.u16(alg::SHA256);
+        let replacement = w.finish().unwrap();
+
+        let mut w = Writer::new();
+        w.u32(config::DEFAULT_PCR_BANKS.len() as u32);
+        for a in config::DEFAULT_PCR_BANKS {
+            w.u16(*a);
+        }
+        let current = w.finish().unwrap();
+
+        let at = saved
+            .windows(current.len())
+            .position(|c| c == current.as_slice())
+            .expect("the allocation is in the record");
+        let mut older = saved[..at].to_vec();
+        older.extend_from_slice(&replacement);
+        older.extend_from_slice(&saved[at + current.len()..]);
+
+        let back = TpmState::load(&older).expect("a file naming SHA-1 was refused");
+        assert_eq!(back.hierarchies.owner.auth, b"ownerauth");
+        assert!(
+            !back.pcr_allocation.contains(&alg::SHA1),
+            "a bank the TPM does not implement must not come back"
+        );
+        assert!(back.pcr_allocation.contains(&alg::SHA256));
     }
 
     /// Part 2 clause 10.10.1 says safe means "no value of Clock greater than

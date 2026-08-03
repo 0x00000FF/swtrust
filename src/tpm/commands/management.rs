@@ -402,6 +402,15 @@ fn build_capability(
             // TPM2_GetCapability(TPM_CAP_ACT, TPM_RH_ACT_x). There is one timer,
             // so the list holds one entry and a property above it selects
             // nothing.
+            // Part 3 clause 30.2.1 gives this capability a TPM_HANDLE property
+            // and asks for TPM_RC_VALUE when it is not in the range the
+            // capability covers, which for a timer is TPM_RH_ACT_0 to
+            // TPM_RH_ACT_F.
+            if !(crate::tpm::constants::rh::ACT_0..=crate::tpm::constants::rh::ACT_F)
+                .contains(&property)
+            {
+                return Err(TpmRc(rc::VALUE).with_parameter(2));
+            }
             let all: Vec<ActData> = if property <= crate::tpm::constants::rh::ACT_0 {
                 vec![ActData {
                     handle: crate::tpm::constants::rh::ACT_0,

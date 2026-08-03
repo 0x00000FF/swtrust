@@ -106,6 +106,11 @@ pub fn set_primary_policy(state: &mut TpmState, request: &Request) -> TpmResult<
         rh::PLATFORM | rh::OWNER | rh::ENDORSEMENT => {
             state.hierarchies.get_mut(auth_handle)?.policy = value;
         }
+        // Part 3 clause 24.3.1: "On TPMs implementing Authenticated Countdown
+        // Timers (ACT), this command may also be used to set the authorization
+        // policy for an ACT." This TPM has the one instance the platform
+        // profile asks for.
+        rh::ACT_0 => state.act.policy = value,
         _ => return Err(TpmRc(rc::VALUE).with_handle(1)),
     }
     respond(|_| Ok(()))

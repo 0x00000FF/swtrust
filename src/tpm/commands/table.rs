@@ -202,14 +202,15 @@ pub const COMMANDS: &[CommandInfo] = &[
     plain(cc::AC_GetCapability, 1, 0),
     plain(cc::AC_Send, 3, 2),
     plain(cc::Policy_AC_SendSelect, 1, 0),
-    nv(cc::ACT_SetTimeout, 1, 1),
+    // Part 3 Table 283 does not mark this {NV}. Clause 40.2 has the timeout
+    // written out by TPM2_Shutdown(TPM_SU_STATE), not by this command.
+    plain(cc::ACT_SetTimeout, 1, 1),
     plain(cc::ECC_Encrypt, 1, 0),
     plain(cc::ECC_Decrypt, 1, 1),
     plain(cc::PolicyCapability, 1, 0),
     plain(cc::PolicyParameters, 1, 0),
     nv(cc::NV_DefineSpace2, 1, 1),
     plain(cc::NV_ReadPublic2, 1, 0),
-    nv(cc::SetCapability, 1, 1),
     nv(cc::ReadOnlyControl, 1, 1),
     plain(cc::PolicyTransportSPDM, 1, 0),
     // Part 3 Table 118 authorizes the sequence but not the verification key.
@@ -272,7 +273,10 @@ mod tests {
     /// Field upgrade is absent because a software TPM has no field upgradeable
     /// firmware to replace or read back. TPM2_CertifyX509 is absent because
     /// completing and re-encoding a partial X.509 certificate is not written.
+    /// TPM2_SetCapability is absent because there is no capability this TPM
+    /// lets a caller set, so every well formed request could only be refused.
     const NOT_IMPLEMENTED: &[u32] = &[
+        cc::SetCapability,
         cc::FieldUpgradeStart,
         cc::FieldUpgradeData,
         cc::FirmwareRead,
