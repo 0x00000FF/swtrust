@@ -30,6 +30,14 @@ pub fn startup(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let startup_type = r.u16()?;
     r.expect_end()?;
+    // PC Client Platform TPM Profile 1.07 clause 5.3.2 item 1: "The TPM2_Startup
+    // command SHALL come from Locality 0 or 3, else a TPM SHALL return
+    // TPM_RC_Locality." The two are the ones a platform starts from: locality 0
+    // for an ordinary boot and locality 3 for one that has run an S-HCRTM
+    // sequence first.
+    if request.locality != 0 && request.locality != 3 {
+        return Err(TpmRc(rc::LOCALITY));
+    }
     match startup_type {
         su::CLEAR => state.on_startup_clear()?,
         su::STATE => {

@@ -442,6 +442,42 @@ fn the_pcr_authorization_commands_refuse_with_the_value_the_profile_names() {
     assert!(is_value_error(code_of(&r)), "SetAuthPolicy answered {:#06x}", code_of(&r));
 }
 
+/// Clause 5.3.2 item 1: "The TPM2_Startup command SHALL come from Locality 0
+/// or 3, else a TPM SHALL return TPM_RC_Locality."
+#[test]
+fn startup_is_refused_from_a_locality_the_profile_does_not_allow() {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "swtrust-ptp-startloc-{}-{}",
+        std::process::id(),
+        swtrust::util::time::unix_millis_now()
+    ));
+    let logger = Arc::new(Logger::new(dir.join("logs"), false).unwrap());
+    let tpm = Tpm::new(dir.join("state"), logger).unwrap();
+    tpm.power_on();
+
+    let startup = {
+        let body = [0x00u8, 0x00];
+        let mut v = st::NO_SESSIONS.to_be_bytes().to_vec();
+        v.extend_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+        v.extend_from_slice(&cc::Startup.to_be_bytes());
+        v.extend_from_slice(&body);
+        v
+    };
+
+    for locality in [1u8, 2, 4] {
+        let r = tpm.execute(locality, &startup);
+        assert_eq!(
+            code_of(&r),
+            rc::LOCALITY,
+            "startup was accepted from locality {locality}"
+        );
+    }
+    // Locality 0 is the ordinary one and is accepted.
+    assert_eq!(code_of(&tpm.execute(0, &startup)), rc::SUCCESS);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Clause 4.6.1 item 1.b: a read of TPM_PT_MEMORY "SHALL return TPMA_MEMORY"
 /// with "sharedRAM SHALL be CLEAR".
 #[test]
