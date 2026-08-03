@@ -641,11 +641,10 @@ impl TpmState {
         let count = bounded_count(&mut r, config::HASH_COUNT)?;
         let saved_allocation: Vec<u16> = (0..count).map(|_| r.u16()).collect::<TpmResult<_>>()?;
         // A file written when this TPM still allocated a bank it no longer
-        // implements names that bank here. The PC Client Platform TPM Profile
-        // 1.07 clause 4.3 says an algorithm listed as Not Allowed "SHALL NOT be
-        // supported", so the bank is dropped rather than brought back. The
-        // values that follow are self describing and a bank with nowhere to go
-        // is discarded as they are read, so the record still lines up.
+        // implements names that bank here, and the bank is dropped rather than
+        // brought back. The values that follow are self describing and a bank
+        // with nowhere to go is discarded as they are read, so the record still
+        // lines up.
         state.pcr_allocation = saved_allocation
             .iter()
             .copied()

@@ -47,8 +47,7 @@ pub const MAX_PRIVATE_SIZE: usize = (2 + MAX_DIGEST_SIZE) + 2 + MAX_SENSITIVE_SI
 /// The digest size for `hash_alg`, or `None` when the algorithm is not a hash.
 pub fn digest_size(hash_alg: u16) -> Option<usize> {
     Some(match hash_alg {
-        // SHA-1 is absent: the platform profile lists it as Not Allowed, and a
-        // size here would let a TPMT_HA name it and be unmarshalled.
+        alg::SHA1 => 20,
         alg::SHA256 | alg::SHA3_256 => 32,
         alg::SHA384 | alg::SHA3_384 => 48,
         alg::SHA512 | alg::SHA3_512 => 64,
@@ -446,7 +445,7 @@ mod tests {
 
     #[test]
     fn digest_sizes_match_the_algorithms() {
-        assert_eq!(digest_size(alg::SHA1), None);
+        assert_eq!(digest_size(alg::SHA1), Some(20));
         assert_eq!(digest_size(alg::SHA256), Some(32));
         assert_eq!(digest_size(alg::SHA384), Some(48));
         assert_eq!(digest_size(alg::SHA512), Some(64));
