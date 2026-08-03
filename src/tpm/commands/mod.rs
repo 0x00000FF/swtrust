@@ -61,9 +61,10 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::AC_GetCapability => duplication::ac_get_capability(state, request),
         cc::AC_Send => duplication::ac_send(state, request),
 
-        // Part 3 clause 34, field upgrade.
-        cc::FieldUpgradeStart => duplication::field_upgrade_start(state, request),
-        cc::FieldUpgradeData => duplication::field_upgrade_data(state, request),
+        // Part 3 clause 34, field upgrade, is not implemented. A software TPM
+        // has no field upgradeable firmware to replace or to read back, so
+        // those commands are absent from the command table and answered the
+        // way any other command this TPM does not implement is answered.
 
         // Part 3 clause 37, authenticated timers.
         cc::ACT_SetTimeout => duplication::act_set_timeout(state, request),
@@ -115,7 +116,6 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::ECC_Decrypt => signing::ecc_decrypt(state, request),
         cc::Encapsulate => signing::encapsulate(state, request),
         cc::Decapsulate => signing::decapsulate(state, request),
-        cc::CertifyX509 => signing::certify_x509(state, request),
 
         // Part 3 clause 20.4 to 20.9, the version 185 signing commands.
         cc::SignDigest => signing::sign_digest_command(state, request),
@@ -217,7 +217,6 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::NV_ChangeAuth => nv::nv_change_auth(state, request),
 
         // Part 3 clause 34, field upgrade.
-        cc::FirmwareRead => management::firmware_read(state, request),
 
         // Part 3 clause 36, the clock.
         cc::ReadClock => management::read_clock(state, request),

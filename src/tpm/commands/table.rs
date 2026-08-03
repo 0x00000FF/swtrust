@@ -103,7 +103,6 @@ pub const COMMANDS: &[CommandInfo] = &[
     nv(cc::PCR_SetAuthPolicy, 1, 1),
     nv(cc::PP_Commands, 1, 1),
     nv(cc::SetPrimaryPolicy, 1, 1),
-    nv(cc::FieldUpgradeStart, 2, 1),
     nv(cc::ClockRateAdjust, 1, 1),
     rhandle_nv(cc::CreatePrimary, 1, 1),
     nv(cc::NV_GlobalWriteLock, 1, 1),
@@ -121,7 +120,6 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo::new(cc::SequenceComplete, 1, 1, false, false, false, true),
     nv(cc::SetAlgorithmSet, 1, 1),
     nv(cc::SetCommandCodeAuditStatus, 1, 1),
-    nv(cc::FieldUpgradeData, 0, 0),
     plain(cc::IncrementalSelfTest, 0, 0),
     plain(cc::SelfTest, 0, 0),
     // Part 3 Table 8 marks TPM2_Startup {NV}: it records that the TPM is
@@ -175,7 +173,6 @@ pub const COMMANDS: &[CommandInfo] = &[
     rhandle(cc::StartAuthSession, 2, 0),
     plain(cc::VerifySignature, 1, 0),
     plain(cc::ECC_Parameters, 0, 0),
-    plain(cc::FirmwareRead, 0, 0),
     plain(cc::GetCapability, 0, 0),
     plain(cc::GetRandom, 0, 0),
     plain(cc::GetTestResult, 0, 0),
@@ -205,7 +202,6 @@ pub const COMMANDS: &[CommandInfo] = &[
     plain(cc::AC_GetCapability, 1, 0),
     plain(cc::AC_Send, 3, 2),
     plain(cc::Policy_AC_SendSelect, 1, 0),
-    plain(cc::CertifyX509, 2, 2),
     nv(cc::ACT_SetTimeout, 1, 1),
     plain(cc::ECC_Encrypt, 1, 0),
     plain(cc::ECC_Decrypt, 1, 1),
@@ -264,17 +260,58 @@ mod tests {
     use crate::tpm::config;
     use crate::tpm::constants::cc_name;
 
+    /// Commands the specification names that this TPM does not implement.
+    ///
+    /// Part 1 clause 5 lets a TPM leave out a command Part 3 does not make
+    /// mandatory. What it may not do is leave one out and still name it, since
+    /// Part 3 defines TPM_CAP_COMMANDS as the attributes of "all of the
+    /// commands implemented in the TPM". These are therefore absent from the
+    /// table, which is what the capability report is built from, and a caller
+    /// that sends one is told the command code is not supported.
+    ///
+    /// Field upgrade is absent because a software TPM has no field upgradeable
+    /// firmware to replace or read back. TPM2_CertifyX509 is absent because
+    /// completing and re-encoding a partial X.509 certificate is not written.
+    const NOT_IMPLEMENTED: &[u32] = &[
+        cc::FieldUpgradeStart,
+        cc::FieldUpgradeData,
+        cc::FirmwareRead,
+        cc::CertifyX509,
+    ];
+
     #[test]
-    fn every_named_command_is_in_the_table() {
+    fn every_named_command_is_in_the_table_unless_it_is_not_implemented() {
         for code in cc::FIRST..=cc::LAST {
-            if cc_name(code).is_none() {
+            let Some(name) = cc_name(code) else {
+                continue;
+            };
+            if NOT_IMPLEMENTED.contains(&code) {
+                assert!(
+                    lookup(code).is_none(),
+                    "0x{code:08x} ({name}) is not implemented, so it must not be in the table"
+                );
                 continue;
             }
             assert!(
                 lookup(code).is_some(),
-                "missing table entry for 0x{code:08x} ({})",
-                cc_name(code).unwrap()
+                "missing table entry for 0x{code:08x} ({name})"
             );
+        }
+    }
+
+    #[test]
+    fn what_is_not_implemented_is_not_reported_as_implemented() {
+        // The capability report and the dispatcher read the same table, so this
+        // is what keeps the two from drifting apart again.
+        let codes = implemented_codes();
+        for code in NOT_IMPLEMENTED {
+            assert!(
+                !codes.contains(code),
+                "0x{code:08x} is reported as implemented"
+            );
+            assert!(!crate::tpm::commands::management::is_implemented_command(
+                *code
+            ));
         }
     }
 

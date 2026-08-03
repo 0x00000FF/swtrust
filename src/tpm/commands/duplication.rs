@@ -375,17 +375,6 @@ pub fn set_capability(_state: &mut TpmState, request: &Request) -> TpmResult<Res
     Err(TpmRc(rc::VALUE).with_parameter(1))
 }
 
-/// TPM2_FieldUpgradeStart, Part 3 clause 34.1.
-///
-/// This TPM has no field upgradeable firmware.
-pub fn field_upgrade_start(_state: &mut TpmState, _request: &Request) -> TpmResult<Response> {
-    Err(TpmRc(rc::COMMAND_CODE))
-}
-
-/// TPM2_FieldUpgradeData, Part 3 clause 34.2.
-pub fn field_upgrade_data(_state: &mut TpmState, _request: &Request) -> TpmResult<Response> {
-    Err(TpmRc(rc::UPGRADE))
-}
 
 /// TPM2_AC_GetCapability, Part 3 clause 32.2.
 ///

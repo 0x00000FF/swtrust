@@ -657,16 +657,6 @@ fn pcr_properties(property: u32) -> Vec<TaggedPcrSelect> {
     out
 }
 
-/// TPM2_FirmwareRead, Part 3 clause 34.3.
-///
-/// This TPM has no field upgradeable firmware, so there is nothing to read.
-pub fn firmware_read(_state: &TpmState, request: &Request) -> TpmResult<Response> {
-    let mut r = request.reader();
-    let _sequence = r.u32()?;
-    r.expect_end()?;
-    Err(TpmRc(rc::VALUE).with_parameter(1))
-}
-
 /// TPM2_Vendor_TCG_Test, Part 3 clause 38.1.
 ///
 /// The command exists so a caller can check that command dispatch works. The
@@ -700,6 +690,9 @@ pub fn is_implemented_command(code: u32) -> bool {
 }
 
 /// Commands that may be given physical presence, used by TPM2_PP_Commands.
+///
+/// TPM2_FieldUpgradeStart belongs to this set in Part 2 but is not implemented
+/// here, and a command this TPM does not implement cannot be selected.
 pub fn is_pp_eligible(code: u32) -> bool {
     matches!(
         code,
@@ -711,7 +704,6 @@ pub fn is_pp_eligible(code: u32) -> bool {
             | cc::ChangePPS
             | cc::PP_Commands
             | cc::SetPrimaryPolicy
-            | cc::FieldUpgradeStart
             | cc::NV_DefineSpace
             | cc::NV_UndefineSpace
     )

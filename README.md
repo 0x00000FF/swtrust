@@ -144,9 +144,23 @@ tests/
 
 ## Implemented commands
 
-All 135 commands in the table are dispatched. 134 carry out their operation;
-TPM2_CertifyX509 is dispatched but answers TPM_RC_COMMAND_CODE because
-building and re-encoding a partial X.509 certificate is not implemented.
+Every command in the table is dispatched and carries out its operation.
+
+The table is also what TPM2_GetCapability(TPM_CAP_COMMANDS) is built from,
+which Part 3 defines as the attributes of "all of the commands implemented in
+the TPM". A command that is not implemented is therefore absent from it, and
+a caller that sends one is answered TPM_RC_COMMAND_CODE, which is what that
+response code means. Part 1 clause 5 allows a command Part 3 does not make
+mandatory to be left out; it does not allow one to be left out and still
+reported as present.
+
+Four optional commands are left out on that basis:
+
+- TPM2_CertifyX509, because completing and re-encoding a partial X.509
+  certificate needs DER handling that is not written.
+- TPM2_FieldUpgradeStart, TPM2_FieldUpgradeData and TPM2_FirmwareRead,
+  because a software TPM has no field upgradeable firmware to replace or to
+  read back.
 
 By clause:
 
@@ -179,13 +193,11 @@ that hierarchy unloadable.
 
 ## Commands that report a limitation
 
-- TPM2_CertifyX509 answers TPM_RC_COMMAND_CODE: completing a partial X.509
-  certificate needs DER encoding that is not implemented.
 - TPM2_ACT_SetTimeout, TPM2_AC_Send and TPM2_SetCapability answer
   TPM_RC_VALUE because this TPM has no authenticated timers, no attached
-  components and no settable capability.
-- TPM2_FieldUpgradeStart and TPM2_FieldUpgradeData answer TPM_RC_COMMAND_CODE
-  and TPM_RC_UPGRADE because the firmware is not field upgradeable.
+  components and no settable capability. They are implemented and reported as
+  implemented: they check their arguments and refuse a request they cannot
+  carry out, rather than denying that the command exists.
 - TPM2_Encapsulate and TPM2_Decapsulate work over ECC. The ML-KEM form is
   refused with TPM_RC_TYPE, as ML-KEM is not implemented.
 

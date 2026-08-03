@@ -936,14 +936,6 @@ pub fn decapsulate(state: &TpmState, request: &Request) -> TpmResult<Response> {
     })
 }
 
-/// TPM2_CertifyX509, Part 3 clause 18.8.
-///
-/// The command asks the TPM to complete a partial X.509 certificate. Building
-/// and re-encoding the DER structure is not implemented, so the command is
-/// refused rather than producing a certificate the caller cannot rely on.
-pub fn certify_x509(_state: &mut TpmState, _request: &Request) -> TpmResult<Response> {
-    Err(TpmRc(rc::COMMAND_CODE))
-}
 
 #[cfg(test)]
 mod tests {
