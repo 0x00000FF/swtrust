@@ -391,15 +391,23 @@ pub fn trim_auth(auth: &[u8]) -> &[u8] {
 ///
 /// `bind_auth` is the authorization value of the bound entity, empty when the
 /// session is unbound, and `salt` is the decrypted salt, empty when the session
-/// is unsalted. Part 1 clause 19.6.8 concatenates the two to key the KDF.
+/// is unsalted. Part 1 clause 16.6.8 concatenates the two to key the KDF.
+///
+/// `plain` says that both tpmKey and bind were TPM_RH_NULL, which is the only
+/// case the clause exempts: "If both tpmKey and bind are TPM_RH_NULL, then
+/// sessionKey is set to an Empty Buffer. Otherwise, the sessionKey is created
+/// as follows". The test is on the two handles and not on what they yield, so a
+/// session bound to an entity whose authorization value happens to be empty
+/// still gets a key, and it is not the Empty Buffer.
 pub fn derive_session_key(
     auth_hash: u16,
+    plain: bool,
     bind_auth: &[u8],
     salt: &[u8],
     nonce_tpm: &[u8],
     nonce_caller: &[u8],
 ) -> TpmResult<Vec<u8>> {
-    if bind_auth.is_empty() && salt.is_empty() {
+    if plain {
         return Ok(Vec::new());
     }
     let mut key_material = Vec::with_capacity(bind_auth.len() + salt.len());
@@ -765,6 +773,10 @@ mod tests {
     use super::*;
     use crate::tpm::constants::rh;
 
+    fn hex(s: &str) -> Vec<u8> {
+        crate::util::hex::decode(s).unwrap()
+    }
+
     fn session(session_type: u8) -> Session {
         Session::new(
             hc::HMAC_SESSION_FIRST,
@@ -804,14 +816,59 @@ mod tests {
 
     #[test]
     fn an_unsalted_unbound_session_has_no_key() {
-        assert!(derive_session_key(alg::SHA256, b"", b"", b"n1", b"n2")
+        assert!(derive_session_key(alg::SHA256, true, b"", b"", b"n1", b"n2")
             .unwrap()
             .is_empty());
     }
 
     #[test]
+    fn a_bound_session_has_a_key_even_when_the_bound_value_is_empty() {
+        // Part 1 clause 16.6.8: "If both tpmKey and bind are TPM_RH_NULL, then
+        // sessionKey is set to an Empty Buffer. Otherwise, the sessionKey is
+        // created as follows". The exemption is on the two handles, not on what
+        // they yield, so binding to an entity whose authorization value is
+        // empty still runs the KDF over nothing and gets a key.
+        let key = derive_session_key(alg::SHA256, false, b"", b"", b"tpm", b"caller").unwrap();
+        assert_eq!(key.len(), 32);
+        assert_eq!(
+            key,
+            kdfa(alg::SHA256, b"", "ATH", b"tpm", b"caller", 256).unwrap()
+        );
+
+        // Windows binds a session to TPM_RH_LOCKOUT before it sets the lockout
+        // authorization, and a TPM that answered with an Empty Buffer here
+        // refused every command Windows sent on that session. These are the
+        // nonces and the HMAC from one such command, taken from a command log.
+        let nonce_tpm =
+            hex("51702a01aa40328fa39e0012efe86b9e49a3fc72f2505ad7158474e0342403e5");
+        let nonce_caller =
+            hex("01878c105e542784d3c71662e2506a1c18517368f0705fe3957510ebea2fc9d9");
+        let session_key =
+            derive_session_key(alg::SHA256, false, b"", b"", &nonce_tpm, &nonce_caller).unwrap();
+
+        // TPM2_HierarchyChangeAuth on TPM_RH_LOCKOUT setting an empty value.
+        // The Name of a permanent handle is the handle, Part 1 clause 16.
+        let cp = cp_hash(alg::SHA256, 0x0000_0129, &[&hex("4000000a")], &hex("0000")).unwrap();
+        let command_nonce =
+            hex("5ae571f232419f3c976628ff3b1eeff73e6cba12afed5eb8b8768412a0e00f88");
+        let mut body = Vec::new();
+        body.extend_from_slice(&cp);
+        body.extend_from_slice(&command_nonce);
+        body.extend_from_slice(&nonce_tpm);
+        body.push(0x00);
+        // The session is bound to the entity being authorized, so the
+        // authorization value is not added to the key, Part 1 clause 16.6.9.
+        assert_eq!(
+            crate::tpm::crypto::hmac::hmac(alg::SHA256, &session_key, &body).unwrap(),
+            hex("d2cd2fe7af6e7673a625e05fd154a1108815cde1f453afd2ee600aecd5eea1a7"),
+            "the session key does not match what a real caller computed"
+        );
+    }
+
+    #[test]
     fn the_session_key_is_kdfa_over_the_bind_value_and_salt() {
-        let key = derive_session_key(alg::SHA256, b"auth", b"salt", b"tpm", b"caller").unwrap();
+        let key =
+            derive_session_key(alg::SHA256, false, b"auth", b"salt", b"tpm", b"caller").unwrap();
         let expected = kdfa(
             alg::SHA256,
             b"authsalt",
@@ -827,12 +884,12 @@ mod tests {
 
     #[test]
     fn the_session_key_changes_with_every_input() {
-        let base = derive_session_key(alg::SHA256, b"a", b"s", b"t", b"c").unwrap();
-        assert_ne!(base, derive_session_key(alg::SHA256, b"b", b"s", b"t", b"c").unwrap());
-        assert_ne!(base, derive_session_key(alg::SHA256, b"a", b"x", b"t", b"c").unwrap());
-        assert_ne!(base, derive_session_key(alg::SHA256, b"a", b"s", b"u", b"c").unwrap());
-        assert_ne!(base, derive_session_key(alg::SHA256, b"a", b"s", b"t", b"d").unwrap());
-        assert_ne!(base, derive_session_key(alg::SHA384, b"a", b"s", b"t", b"c").unwrap());
+        let base = derive_session_key(alg::SHA256, false, b"a", b"s", b"t", b"c").unwrap();
+        assert_ne!(base, derive_session_key(alg::SHA256, false, b"b", b"s", b"t", b"c").unwrap());
+        assert_ne!(base, derive_session_key(alg::SHA256, false, b"a", b"x", b"t", b"c").unwrap());
+        assert_ne!(base, derive_session_key(alg::SHA256, false, b"a", b"s", b"u", b"c").unwrap());
+        assert_ne!(base, derive_session_key(alg::SHA256, false, b"a", b"s", b"t", b"d").unwrap());
+        assert_ne!(base, derive_session_key(alg::SHA384, false, b"a", b"s", b"t", b"c").unwrap());
     }
 
     #[test]

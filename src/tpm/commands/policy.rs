@@ -70,6 +70,7 @@ pub fn start_auth_session(state: &mut TpmState, request: &Request) -> TpmResult<
     let nonce_tpm = state.rng.bytes(digest_size)?;
     let session_key = session::derive_session_key(
         auth_hash,
+        tpm_key == rh::NULL && bind == rh::NULL,
         &bind_auth,
         &salt,
         &nonce_tpm,
