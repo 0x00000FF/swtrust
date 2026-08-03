@@ -2210,3 +2210,100 @@ fn an_rsa_key_whose_modulus_disagrees_with_key_bits_is_refused() {
     ));
     assert_eq!(r.code, expected, "a 2047 bit modulus -> {:08x}", r.code);
 }
+
+/// Part 3 clause 29.2.1: "The command will fail if newTime is less than the
+/// current value of Clock or if the new time is greater than
+/// FF FF 00 00 00 00 00 00. If both of these checks succeed, Clock is set to
+/// newTime. If either of these checks fails, the TPM shall return TPM_RC_VALUE
+/// and make no change to Clock."
+#[test]
+fn clock_set_refuses_a_time_that_goes_back_or_past_the_maximum() {
+    let h = Harness::started("clockset");
+    let set = |value: u64| {
+        let mut p = Writer::new();
+        p.u64(value);
+        h.send(&command(
+            st::SESSIONS,
+            cc::ClockSet,
+            &[rh::OWNER],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ))
+    };
+    let read = || {
+        let r = h.send(&command(st::NO_SESSIONS, cc::ReadClock, &[], None, &[]));
+        let mut reader = Reader::new(&r.body);
+        let _time = reader.u64().unwrap();
+        let clock = reader.u64().unwrap();
+        let _reset = reader.u32().unwrap();
+        let _restart = reader.u32().unwrap();
+        (clock, reader.u8().unwrap())
+    };
+
+    let (before, _) = read();
+
+    // Going back is refused and changes nothing.
+    let r = set(before.saturating_sub(1_000));
+    assert_eq!(r.code & 0x03f, rc::VALUE & 0x03f, "a time in the past");
+    assert!(read().0 >= before, "Clock must not have moved");
+
+    // One past the maximum is refused too.
+    let r = set(swtrust::tpm::config::MAX_CLOCK + 1);
+    assert_eq!(r.code & 0x03f, rc::VALUE & 0x03f, "past the maximum");
+
+    // The maximum itself is accepted. What comes back is at least that, since
+    // Clock keeps advancing between the two commands.
+    assert_eq!(set(swtrust::tpm::config::MAX_CLOCK).code, rc::SUCCESS);
+    assert!(read().0 >= swtrust::tpm::config::MAX_CLOCK);
+}
+
+/// Part 1 clause 33.3.1: "If TPM2_ClockSet() causes the volatile and
+/// non-volatile versions of Clock to differ by more than the
+/// implementation-dependent update interval, then NV Clock will be updated
+/// before TPM2_ClockSet() returns", and "After the next NV update of Clock,
+/// safe is SET to indicate that Clock is not a repeat."
+#[test]
+fn a_large_clock_set_updates_nv_and_makes_the_clock_safe_again() {
+    let h = Harness::started("clocksetsafe");
+    // Put the TPM in the state a startup that was not orderly leaves.
+    h.tpm.with_state_mut(|s| s.clock.safe = false);
+
+    let read_safe = || {
+        let r = h.send(&command(st::NO_SESSIONS, cc::ReadClock, &[], None, &[]));
+        let mut reader = Reader::new(&r.body);
+        let _ = reader.u64().unwrap();
+        let _ = reader.u64().unwrap();
+        let _ = reader.u32().unwrap();
+        let _ = reader.u32().unwrap();
+        reader.u8().unwrap()
+    };
+    assert_eq!(read_safe(), 0, "it starts unsafe");
+
+    // A jump smaller than the interval does not reach an NV update.
+    let now = h.tpm.with_state(|s| s.clock.clock);
+    let mut p = Writer::new();
+    p.u64(now + 1_000);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::ClockSet,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    assert_eq!(read_safe(), 0, "a small step is not an NV update");
+
+    // One larger than the interval does.
+    let now = h.tpm.with_state(|s| s.clock.clock);
+    let mut p = Writer::new();
+    p.u64(now + u64::from(swtrust::tpm::config::NV_CLOCK_UPDATE_INTERVAL) + 1);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::ClockSet,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    assert_eq!(read_safe(), 1, "the NV update puts safe back");
+}

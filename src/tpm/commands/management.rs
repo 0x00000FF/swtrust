@@ -241,11 +241,28 @@ pub fn clock_set(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let mut r = request.reader();
     let new_time = r.u64()?;
     r.expect_end()?;
-    // Clock only ever advances.
-    if new_time < state.clock.clock {
+    // Part 3 clause 29.2.1: "The command will fail if newTime is less than the
+    // current value of Clock or if the new time is greater than
+    // FF FF 00 00 00 00 00 00. If both of these checks succeed, Clock is set to
+    // newTime. If either of these checks fails, the TPM shall return
+    // TPM_RC_VALUE and make no change to Clock."
+    if new_time < state.clock.clock || new_time > config::MAX_CLOCK {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
+    let jump = new_time - state.clock.clock;
     state.clock.clock = new_time;
+
+    // Part 1 clause 33.3.1: "If TPM2_ClockSet() causes the volatile and
+    // non-volatile versions of Clock to differ by more than the
+    // implementation-dependent update interval, then NV Clock will be updated
+    // before TPM2_ClockSet() returns", and "After the next NV update of Clock,
+    // safe is SET to indicate that Clock is not a repeat." The command writes
+    // NV, so the record follows on its own.
+    let apart = state.clock.nv_elapsed.saturating_add(jump);
+    if apart >= u64::from(config::NV_CLOCK_UPDATE_INTERVAL) {
+        state.clock.nv_elapsed = 0;
+        state.clock.safe = true;
+    }
     respond(|_| Ok(()))
 }
 

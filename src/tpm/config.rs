@@ -77,6 +77,13 @@ pub const ORDERLY_BITS: u32 = 8;
 pub const MAX_ORDERLY_COUNT: u64 = (1u64 << ORDERLY_BITS) - 1;
 /// Number of clock updates between NV writes of the clock value, in ms.
 pub const NV_CLOCK_UPDATE_INTERVAL: u32 = 1 << 17;
+/// Largest value TPM2_ClockSet may set.
+///
+/// Part 3 clause 29.2.1 fails the command when "the new time is greater than
+/// FF FF 00 00 00 00 00 00". Part 1 clause 33.3.1 gives the reason: it leaves
+/// enough room that Clock cannot roll over in the lifetime of the TPM, so
+/// nothing that uses Clock has to allow for it wrapping.
+pub const MAX_CLOCK: u64 = 0xFFFF_0000_0000_0000;
 
 /// Size of a primary seed in octets.
 pub const PRIMARY_SEED_SIZE: usize = 32;

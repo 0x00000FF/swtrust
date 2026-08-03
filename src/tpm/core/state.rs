@@ -761,10 +761,19 @@ impl TpmState {
             let policy_digest = read_sized(&mut r)?;
             state.act.restore(timeout, signaled);
             state.act.policy = TpmtHa::new(policy_alg, policy_digest)?;
-            state.ever_started = match r.u8()? {
-                0 => false,
-                1 => true,
-                _ => return Err(TpmRc(rc::BAD_CONTEXT)),
+            // The flag was added after the timer block, so a record can carry
+            // the timer without it. Such a record was written by a build that
+            // had already been running, and reading it as started is the
+            // careful way round: it costs one update interval of the clock
+            // being reported unsafe, never the other way about.
+            state.ever_started = if r.is_empty() {
+                true
+            } else {
+                match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(TpmRc(rc::BAD_CONTEXT)),
+                }
             };
         }
 
@@ -1134,6 +1143,26 @@ mod tests {
         assert!(s.clock.safe);
     }
 
+    /// A record written before the started flag existed still loads, and is
+    /// read the careful way round.
+    #[test]
+    fn a_record_with_a_timer_but_no_started_flag_still_loads() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        s.act.set_timeout(90);
+        let saved = s.save().unwrap();
+
+        // The flag is the last octet of the record, so a build that did not
+        // write it produced this.
+        let older = &saved[..saved.len() - 1];
+        let back = TpmState::load(older).expect("a record without the flag was refused");
+        assert_eq!(back.act.timeout(), 90, "the timer still comes back");
+        assert!(
+            back.ever_started,
+            "a record with no flag is read as having been started"
+        );
+    }
+
     /// An orderly shutdown keeps the promise, because nothing was lost.
     #[test]
     fn an_orderly_shutdown_leaves_the_clock_safe() {
@@ -1284,8 +1313,11 @@ mod tests {
     fn a_truncated_or_tagged_state_is_refused() {
         let s = TpmState::manufacture().unwrap();
         let saved = s.save().unwrap();
+        // Two octets, not one: the last octet of the record is the started
+        // flag, which a build that came before it did not write, so a record
+        // one octet short is an older one rather than a damaged one.
         assert_eq!(
-            TpmState::load(&saved[..saved.len() - 1]).unwrap_err(),
+            TpmState::load(&saved[..saved.len() - 2]).unwrap_err(),
             TpmRc(rc::INSUFFICIENT)
         );
         let mut bad = saved.clone();
@@ -1314,10 +1346,18 @@ mod tests {
             w.u16(*a);
         }
         let allocation = w.finish().unwrap();
-        let at = saved
+        // The record holds seeds and proofs taken from the generator, so the
+        // same octets could in principle turn up elsewhere. Requiring exactly
+        // one occurrence means the test is looking at the allocation and not at
+        // some other field that happened to match.
+        let found: Vec<usize> = saved
             .windows(allocation.len())
-            .position(|c| c == allocation.as_slice())
-            .expect("the allocation is in the record");
+            .enumerate()
+            .filter(|(_, c)| *c == allocation.as_slice())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(found.len(), 1, "the allocation was not found exactly once");
+        let at = found[0];
 
         // One more bank than the TPM can hold is refused by the bound, not by
         // the read running out, because the algorithms that follow are there.
