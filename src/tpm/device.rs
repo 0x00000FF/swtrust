@@ -386,6 +386,14 @@ impl Device for Tpm {
             // the platform profile says no TPM2_PCR_Reset can, and the command
             // path refuses for exactly that reason.
             state.pcr.drtm_reset();
+            // The specification is not of one mind about where this belongs.
+            // Part 2 clause 10.10.1 says restartCount counts TPM2_Shutdown or
+            // _TPM_Hash_Start, clause 10.10.4 says TPM Restart or TPM Resume,
+            // and the clause quoted above says this indication. It is done here
+            // because that is the sentence that speaks about the H-CRTM
+            // sequence, and because a sequence abandoned between its start and
+            // its end changes no PCR, so counting it would record a restart
+            // that did not happen.
             state.clock.restart_count = state.clock.restart_count.wrapping_add(1);
             for a in algorithms {
                 let Ok(digest) = hash::digest(a, &buf) else {
