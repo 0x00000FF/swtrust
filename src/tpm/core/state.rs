@@ -213,6 +213,14 @@ pub struct TpmState {
     /// Outstanding split ECC operations, Part 1 clause 44.2. The nonce behind
     /// them is chosen at each TPM Reset, so a commit lives no longer than that.
     pub commits: crate::tpm::core::commit::Commits,
+    /// True once the TPM has been through a TPM2_Startup.
+    ///
+    /// Part 1 clause 33.3.1 clears the Clock safety flag "after a non-orderly
+    /// shutdown". A TPM that has been manufactured and never started has had
+    /// no shutdown of any kind, so this tells the two apart. It is not reset
+    /// by TPM2_Clear, because a Clear happens while the TPM is running and
+    /// Clock can have been reported since.
+    pub ever_started: bool,
     /// The authenticated countdown timer, Part 1 clause 40.
     ///
     /// The PC Client Platform TPM Profile 1.07 clause 5.1.2 asks a TPM that
@@ -279,6 +287,7 @@ impl TpmState {
             failure_mode: false,
             self_test_done: true,
             commits: crate::tpm::core::commit::Commits::new(),
+            ever_started: false,
             act: crate::tpm::core::act::Act::default(),
             test_digest: Vec::new(),
             test_failure: None,
@@ -298,11 +307,13 @@ impl TpmState {
     pub fn on_startup_clear(&mut self) -> TpmResult<()> {
         let restart = self.shutdown_type == su::STATE;
         let disorderly = self.shutdown_type == su::NONE;
-        // A TPM that has never been powered has reported no Clock at all, so
-        // its first startup cannot be behind a value it gave out earlier. Part
-        // 2 clause 10.10.1 has safe SET in that state, and every later startup
-        // that was not orderly may have lost the volatile part of Clock.
-        let ever_powered = self.clock.reset_count > 0 || self.clock.restart_count > 0;
+        // Taken before the counters below are raised, because it asks what the
+        // TPM had done before this startup, not after it. An older record has
+        // no such flag, so the counters stand in for it: a TPM that has been
+        // through a startup has raised one of them. Clock is not used, because
+        // it has already moved on by the time this runs.
+        let ever_started =
+            self.ever_started || self.clock.reset_count > 0 || self.clock.restart_count > 0;
         self.hierarchies.on_reset(&mut self.rng)?;
         self.pcr.allocate(&self.pcr_allocation.clone())?;
         self.pcr.reset_update_counter();
@@ -318,18 +329,19 @@ impl TpmState {
         }
         self.clock.time = 0;
         self.clock.nv_elapsed = 0;
-        // The volatile part of Clock goes with the power. Part 2 clause 10.10.1
-        // says safe means "no value of Clock greater than the current value of
-        // Clock has been previously reported by the TPM", and after a startup
-        // that was not orderly the saved value may be behind one that was
-        // already reported. Move Clock on by a whole update interval, which is
-        // the most that can have been lost, and report that it is not safe
-        // until it rolls over again, which is what Part 1 Table 39 asks for.
-        if disorderly && ever_powered {
-            self.clock.clock = self
-                .clock
-                .clock
-                .saturating_add(u64::from(config::NV_CLOCK_UPDATE_INTERVAL));
+        // Part 1 clause 33.3.1: other values written to NV on an orderly
+        // shutdown "will be advanced to a known safe value on the next startup.
+        // However, Clock is not advanced because power outages would cause the
+        // clock to be advanced to a time in the future and it could not be
+        // adjusted back to an accurate value. To indicate that a value reported
+        // in Clock may be a repeat of a previously reported value, a flag
+        // (safe) is CLEAR after a non-orderly shutdown."
+        //
+        // So the repeat is allowed and reported rather than avoided. A TPM that
+        // has been manufactured or cleared and never shut down has had no
+        // non-orderly shutdown either, which is why both leave the recorded
+        // shutdown as an orderly one.
+        if disorderly && ever_started {
             self.clock.safe = false;
         }
         // Part 1 clause 34.4 lists the command audit digest among the values a
@@ -425,6 +437,7 @@ impl TpmState {
         }
         self.startup_clear = StartupClearAttributes(attributes);
         self.started = true;
+        self.ever_started = true;
         self.shutdown_type = su::NONE;
         // Time started again from zero, so this is a new epoch and any
         // timeout recorded against the previous one has passed.
@@ -454,7 +467,15 @@ impl TpmState {
             .flush_hierarchy(crate::tpm::constants::rh::OWNER);
         self.objects
             .flush_hierarchy(crate::tpm::constants::rh::ENDORSEMENT);
+        // Part 2 clause 10.10.2: "TPM2_Clear() will set Clock to zero." Clause
+        // 10.10.3 and clause 10.10.4 reset both counters, and clause 10.10.1
+        // has safe "Set to YES on TPM2_Clear()", which it can be because a
+        // Clock of zero repeats nothing.
+        self.clock.clock = 0;
+        self.clock.nv_elapsed = 0;
         self.clock.reset_count = 0;
+        self.clock.restart_count = 0;
+        self.clock.safe = true;
         // Part 1 clause 32 resets only the audit counter here. The selected
         // algorithm, the list of audited commands and the digest all survive
         // TPM2_Clear.
@@ -569,10 +590,11 @@ impl TpmState {
         // the whole of it when TPM2_ACT_SetTimeout has been used since the last
         // startup, and half otherwise, which stops a caller extending the timer
         // for ever by shutting down and starting up again.
-        w.u32(self.act.saved_timeout());
+        w.u32(self.act.timeout());
         w.u8(u8::from(self.act.signaled()));
         w.u16(self.act.policy.hash_alg);
         w.sized16(&self.act.policy.digest);
+        w.u8(u8::from(self.ever_started));
 
         w.finish()
     }
@@ -739,6 +761,11 @@ impl TpmState {
             let policy_digest = read_sized(&mut r)?;
             state.act.restore(timeout, signaled);
             state.act.policy = TpmtHa::new(policy_alg, policy_digest)?;
+            state.ever_started = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(TpmRc(rc::BAD_CONTEXT)),
+            };
         }
 
         if !r.is_empty() {
@@ -1094,10 +1121,11 @@ mod tests {
         s.shutdown_type = su::NONE;
         s.on_startup_clear().unwrap();
         assert!(!s.clock.safe, "a startup that was not orderly is not safe");
-        assert!(
-            s.clock.clock >= before + u64::from(config::NV_CLOCK_UPDATE_INTERVAL),
-            "Clock must move past anything that could have been reported"
-        );
+        // Clause 33.3.1 says Clock is not moved on: "power outages would cause
+        // the clock to be advanced to a time in the future and it could not be
+        // adjusted back to an accurate value". The repeat is reported by safe
+        // instead of being avoided.
+        assert_eq!(s.clock.clock, before, "Clock must not be advanced");
 
         // It becomes safe again when the value rolls over.
         assert!(!s.advance_time(u64::from(config::NV_CLOCK_UPDATE_INTERVAL) - 1));
@@ -1120,7 +1148,7 @@ mod tests {
 
     /// Octets the timer block occupies when the policy is empty: the
     /// timeout, the signal, the policy algorithm and an empty digest.
-    const ACT_BLOCK: usize = 4 + 1 + 2 + 2;
+    const ACT_BLOCK: usize = 4 + 1 + 2 + 2 + 1;
 
     #[test]
     fn a_state_file_without_the_commit_values_still_loads() {
@@ -1276,19 +1304,31 @@ mod tests {
     fn a_bogus_count_in_the_state_is_refused() {
         let s = TpmState::manufacture().unwrap();
         let saved = s.save().unwrap();
-        // Find the PCR allocation count and make it absurd.
-        let mut bad = saved.clone();
-        // The count cannot be located reliably, so every four octet window is
-        // tried; at least one produces an oversized count that is rejected.
-        let mut rejected = false;
-        for i in 0..bad.len().saturating_sub(4) {
-            bad.copy_from_slice(&saved);
-            bad[i..i + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
-            if TpmState::load(&bad).is_err() {
-                rejected = true;
-            }
+        // The PCR allocation is a count followed by that many algorithms, so it
+        // can be found rather than guessed at. Spraying a large value over
+        // every window instead would pass on a corrupted version tag and say
+        // nothing at all about the bound on this count.
+        let mut w = Writer::new();
+        w.u32(config::DEFAULT_PCR_BANKS.len() as u32);
+        for a in config::DEFAULT_PCR_BANKS {
+            w.u16(*a);
         }
-        assert!(rejected);
+        let allocation = w.finish().unwrap();
+        let at = saved
+            .windows(allocation.len())
+            .position(|c| c == allocation.as_slice())
+            .expect("the allocation is in the record");
+
+        // One more bank than the TPM can hold is refused by the bound, not by
+        // the read running out, because the algorithms that follow are there.
+        let mut bad = saved.clone();
+        bad[at..at + 4].copy_from_slice(&(config::HASH_COUNT as u32 + 1).to_be_bytes());
+        assert_eq!(TpmState::load(&bad).unwrap_err(), TpmRc(rc::BAD_CONTEXT));
+
+        // And a count that would take the reader far past the end.
+        let mut bad = saved;
+        bad[at..at + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        assert_eq!(TpmState::load(&bad).unwrap_err(), TpmRc(rc::BAD_CONTEXT));
     }
 
     #[test]

@@ -359,25 +359,57 @@ impl Device for Tpm {
         }
     }
 
-    /// _TPM_Hash_End records the H-CRTM measurement in PCR 17 through 22.
+    /// _TPM_Hash_End records the H-CRTM measurement, Part 3 clause 22.11.
+    ///
+    /// Where it goes depends on whether the sequence ran before or after
+    /// TPM2_Startup, and the clause gives a different register and a different
+    /// starting value for each.
     fn hash_end(&self) {
+        use crate::tpm::config;
+        use crate::tpm::crypto::hash;
+
         let mut state = self.locked();
         let Some(buf) = state.hcrtm_buffer.take() else {
             return;
         };
-        // The D-RTM registers are set to zero before the event is recorded.
-        // This is the sequence doing it, not a command: the platform profile
-        // says no TPM2_PCR_Reset can, and the command path refuses for exactly
-        // that reason, so it cannot be used here.
-        state.pcr.drtm_reset();
         let algorithms = state.pcr.algorithms();
-        for a in algorithms {
-            let Ok(digest) = crate::tpm::crypto::hash::digest(a, &buf) else {
-                continue;
-            };
-            let _ = state
-                .pcr
-                .extend(crate::tpm::config::HCRTM_PCR, 4, &[(a, digest)]);
+
+        if state.started {
+            // "If the H-CRTM Event Sequence occurs after TPM2_Startup(), the
+            // TPM will set all of the PCR designated in the platform-specific
+            // specifications as resettable by this event to the value indicated
+            // in the platform specific specification and increment
+            // restartCount. The TPM will then Extend the Event Sequence
+            // digest/digests into the designated D-RTM PCR (PCR[17])."
+            //
+            // Setting those registers is the sequence doing it, not a command:
+            // the platform profile says no TPM2_PCR_Reset can, and the command
+            // path refuses for exactly that reason.
+            state.pcr.drtm_reset();
+            state.clock.restart_count = state.clock.restart_count.wrapping_add(1);
+            for a in algorithms {
+                let Ok(digest) = hash::digest(a, &buf) else {
+                    continue;
+                };
+                let _ = state.pcr.extend(config::DRTM_PCR, 4, &[(a, digest)]);
+            }
+        } else {
+            // "A platform-specific specification may allow an H-CRTM Event
+            // Sequence before TPM2_Startup(). If so, _TPM_Hash_End will
+            // complete the digest, initialize PCR[0] with a digest-size value
+            // of 4, and then extend the H-CRTM Event Sequence data into
+            // PCR[0]."
+            for a in algorithms {
+                let (Ok(digest), Ok(size)) = (hash::digest(a, &buf), hash::digest_size(a)) else {
+                    continue;
+                };
+                let mut initial = vec![0u8; size];
+                initial[size - 1] = 4;
+                if state.pcr.set(a, config::HCRTM_PCR, &initial).is_err() {
+                    continue;
+                }
+                let _ = state.pcr.extend(config::HCRTM_PCR, 4, &[(a, digest)]);
+            }
         }
     }
 

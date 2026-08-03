@@ -390,6 +390,38 @@ fn the_timer_counts_down_while_the_tpm_is_powered() {
     assert_eq!(attributes & SIGNALED, SIGNALED);
 }
 
+/// Real time passing counts the timer down, and time while the TPM has no
+/// power does not.
+///
+/// The other timer tests hand the seconds to the state directly, so they would
+/// pass even if nothing ever credited the time or if time off the power were
+/// credited too. This one waits, which is the only way to go through the whole
+/// path: the monotonic reference, the elapsed calculation and the check that
+/// the TPM is powered.
+#[test]
+fn real_time_counts_the_timer_down_and_time_without_power_does_not() {
+    let h = Harness::new("actreal");
+    let r = h.send_auth(cc::ACT_SetTimeout, 0x4000_0110, &5u32.to_be_bytes());
+    assert_eq!(code_of(&r), rc::SUCCESS);
+    assert_eq!(h.act().0, 5);
+
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    assert_eq!(h.act().0, 4, "a real second must be credited");
+
+    // Part 1 clause 40.2 counts "each second that the TPM is powered", so an
+    // interval with the power removed is worth nothing. Reading the signal
+    // goes through the same path as a command, so it is what is asked here.
+    let before = h.tpm.with_state(|s| s.act.timeout());
+    h.tpm.power_off();
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let _ = h.tpm.act_get_signaled(0);
+    assert_eq!(
+        h.tpm.with_state(|s| s.act.timeout()),
+        before,
+        "time with no power must not be credited"
+    );
+}
+
 /// Clause 4.7 item 7: "The optional TPM2_PCR_SetAuthPolicy and
 /// TPM2_PCR_SetAuthValue commands, if implemented, SHALL return TPM_RC_VALUE."
 #[test]
@@ -466,34 +498,49 @@ fn walk(dir: &str) -> Vec<std::path::PathBuf> {
 fn the_drtm_and_hcrtm_registers_are_the_ones_the_profile_names() {
     let h = Harness::new("hcrtm");
 
-    // A D-RTM register starts at all ones, which is what marks it as one.
-    let before: Vec<u8> = h
-        .tpm
-        .with_state(|s| s.pcr.read(alg::SHA256, 17).unwrap().to_vec());
-    assert!(before.iter().all(|v| *v == 0xff), "PCR 17 starts at ones");
-    let hcrtm_before: Vec<u8> = h
-        .tpm
-        .with_state(|s| s.pcr.read(alg::SHA256, 0).unwrap().to_vec());
-    assert!(hcrtm_before.iter().all(|v| *v == 0), "PCR 0 starts at zeros");
+    let read = |index: u16| -> Vec<u8> {
+        h.tpm
+            .with_state(|s| s.pcr.read(alg::SHA256, index).unwrap().to_vec())
+    };
 
-    // Run an H-CRTM event sequence the way the interface delivers one.
+    // A D-RTM register starts at all ones, which is what marks it as one.
+    assert!(read(17).iter().all(|v| *v == 0xff), "PCR 17 starts at ones");
+    let hcrtm_before = read(0);
+    let restarts_before = h.tpm.with_state(|s| s.clock.restart_count);
+
+    // Run an H-CRTM event sequence the way the interface delivers one. The
+    // harness has already started the TPM, so this is the after-Startup case.
     h.tpm.hash_start();
     h.tpm.hash_data(b"a measurement");
     h.tpm.hash_end();
 
-    // Clause 4.7 item 8 names PCR 17 the D-RTM register, which the sequence
-    // takes to zero, and PCR 0 the S-HCRTM register, which it extends.
-    let after: Vec<u8> = h
-        .tpm
-        .with_state(|s| s.pcr.read(alg::SHA256, 17).unwrap().to_vec());
+    // Part 3 clause 22.11: the registers the platform marks resettable by this
+    // event are set, restartCount is incremented, and the digest is extended
+    // into the D-RTM register, which clause 4.7 item 8 of the profile names as
+    // PCR 17.
+    let after = read(17);
     assert!(
-        after.iter().all(|v| *v == 0),
-        "the D-RTM register is taken to zero, not left at ones"
+        after.iter().any(|v| *v != 0xff),
+        "the D-RTM register was left at its initial value"
     );
-    let hcrtm_after: Vec<u8> = h
-        .tpm
-        .with_state(|s| s.pcr.read(alg::SHA256, 0).unwrap().to_vec());
-    assert_ne!(hcrtm_after, hcrtm_before, "the S-HCRTM register is extended");
+    assert!(
+        after.iter().any(|v| *v != 0),
+        "the digest was not extended into the D-RTM register"
+    );
+    assert_eq!(
+        read(0),
+        hcrtm_before,
+        "an event after Startup does not touch the S-HCRTM register"
+    );
+    assert_eq!(
+        h.tpm.with_state(|s| s.clock.restart_count),
+        restarts_before + 1,
+        "restartCount must be incremented"
+    );
+    assert!(
+        read(18).iter().all(|v| *v == 0),
+        "the other registers the event resets go to zero"
+    );
 
     // And they are the registers the configuration names, so nothing else in
     // the TPM is looking at a different pair.

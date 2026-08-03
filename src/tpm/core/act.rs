@@ -157,7 +157,7 @@ impl Act {
         self.fraction = 0;
     }
 
-    /// The timeout TPM2_Shutdown(TPM_SU_STATE) writes out.
+    /// The timeout TPM2_Shutdown(TPM_SU_STATE) keeps.
     ///
     /// Clause 40.2: the current timeout when TPM2_ACT_SetTimeout has been used
     /// since the last startup, and half of it otherwise, which stops a caller
@@ -168,6 +168,18 @@ impl Act {
         } else {
             self.timeout / 2
         }
+    }
+
+    /// Apply TPM2_Shutdown(TPM_SU_STATE) to the timer.
+    ///
+    /// The halving has to happen to the timer itself and not only to the copy
+    /// written out, or a power cycle that never reloads the record would resume
+    /// with the whole timeout and the extension the clause guards against would
+    /// work after all.
+    pub fn on_shutdown_state(&mut self) {
+        self.timeout = self.saved_timeout();
+        self.written = false;
+        self.fraction = 0;
     }
 
     /// Restore a timeout saved by an orderly shutdown.
@@ -288,12 +300,20 @@ mod tests {
     }
 
     #[test]
-    fn half_the_timeout_is_saved_when_it_was_not_set_since_startup() {
+    fn half_the_timeout_is_kept_when_it_was_not_set_since_startup() {
         let mut a = Act::default();
         a.set_timeout(100);
-        assert_eq!(a.saved_timeout(), 100, "set since startup, so all of it");
+        a.on_shutdown_state();
+        assert_eq!(a.timeout(), 100, "set since startup, so all of it");
+
+        // Now shut down again without setting it, which is the sequence the
+        // clause guards against.
         a.on_resume();
-        assert_eq!(a.saved_timeout(), 50, "otherwise half");
+        a.on_shutdown_state();
+        assert_eq!(a.timeout(), 50, "otherwise half");
+        a.on_resume();
+        a.on_shutdown_state();
+        assert_eq!(a.timeout(), 25, "and half again, so it cannot be held up");
     }
 
     #[test]

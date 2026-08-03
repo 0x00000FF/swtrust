@@ -54,7 +54,19 @@ pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
     match shutdown_type {
         su::CLEAR | su::STATE => {
             state.shutdown_type = shutdown_type;
-            state.clock.safe = true;
+            // safe is deliberately left as it is. Part 1 clause 33.3.3: "If
+            // Safe is not SET when TPM2_Shutdown() is received, then NVClock
+            // must not be set from Clock and Safe must not be SET on the
+            // subsequent startup." A clock that is already unsafe stays unsafe
+            // until it rolls over, which is the only thing that clears the
+            // doubt.
+            if shutdown_type == su::STATE {
+                // Part 1 clause 40.2 saves the ACT timeout here, whole when
+                // TPM2_ACT_SetTimeout has been used since the last startup and
+                // half otherwise, so that shutting down and starting up again
+                // cannot extend the timer for ever.
+                state.act.on_shutdown_state();
+            }
         }
         _ => return Err(TpmRc(rc::VALUE).with_parameter(1)),
     }
