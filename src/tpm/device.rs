@@ -411,8 +411,13 @@ impl Device for Tpm {
                 let (Ok(digest), Ok(size)) = (hash::digest(a, &buf), hash::digest_size(a)) else {
                     continue;
                 };
+                // Every hash this TPM has produces a digest, so the last octet
+                // is there; a hash with none could not carry the value anyway.
+                let Some(last) = size.checked_sub(1) else {
+                    continue;
+                };
                 let mut initial = vec![0u8; size];
-                initial[size - 1] = 4;
+                initial[last] = 4;
                 if state.pcr.set(a, config::HCRTM_PCR, &initial).is_err() {
                     continue;
                 }
@@ -438,9 +443,19 @@ impl Device for Tpm {
             return false;
         }
         let elapsed = self.elapsed();
-        let mut state = self.locked();
-        let _ = state.advance_time(elapsed);
-        state.act.signaled()
+        let (signaled, rolled) = {
+            let mut state = self.locked();
+            let rolled = state.advance_time(elapsed);
+            (state.act.signaled(), rolled)
+        };
+        // A rollover is the moment Part 2 clause 10.10.2 asks for the copy of
+        // Clock in NV to be brought up to date, and it is what puts the safe
+        // indication back. Reading the signal can be the thing that reaches it,
+        // so the write happens here too rather than only after a command.
+        if rolled {
+            self.persist();
+        }
+        signaled
     }
 }
 

@@ -88,7 +88,7 @@ impl Act {
         if self.timeout == 0 {
             return;
         }
-        self.fraction += millis;
+        self.fraction = self.fraction.saturating_add(millis);
         let seconds = self.fraction / 1000;
         self.fraction %= 1000;
         if seconds == 0 {
