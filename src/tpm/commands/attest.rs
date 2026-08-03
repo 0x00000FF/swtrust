@@ -30,22 +30,25 @@ fn signing_object(state: &TpmState, handle: u32) -> TpmResult<Object> {
             .get(&handle)
             .ok_or(TpmRc(rc::HANDLE))?
     };
+    // Part 3 clause 18.1 gives the attestation commands one rule about the key:
+    // "If the sign attribute is not SET in the key referenced by signHandle then
+    // the TPM shall return TPM_RC_KEY."
     if !object
         .public
         .object_attributes
         .has(ObjectAttributes::SIGN_ENCRYPT)
     {
-        return Err(TpmRc(rc::ATTRIBUTES));
+        return Err(TpmRc(rc::KEY));
     }
-    if !object
-        .public
-        .object_attributes
-        .has(ObjectAttributes::RESTRICTED)
-    {
-        // Only a restricted signing key may sign TPM generated structures, so
-        // that an ordinary key cannot be used to forge one.
-        return Err(TpmRc(rc::ATTRIBUTES));
-    }
+    // A restricted key is not required. The clause only observes that
+    // "attestation commands typically use a restricted, sensitiveDataOrigin
+    // signing key. A key that is not restricted can sign any digest and would
+    // permit a forged attestation", which is advice to whoever trusts the
+    // result rather than a rule for the TPM. The same clause says outright that
+    // "for a signing key that is not restricted, the caller may specify the
+    // scheme to be used", so such a key reaching here is expected. Windows
+    // quotes with one, and refusing it left BitLocker unable to bind a key to
+    // the PCR values it had just measured.
     Ok(object.clone())
 }
 
@@ -467,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_restricted_signing_key_may_attest() {
+    fn any_signing_key_may_attest_and_nothing_else_may() {
         let mut state = TpmState::manufacture().unwrap();
         let plain = Object::new(
             signing_public(ObjectAttributes::SIGN_ENCRYPT),
@@ -481,10 +484,11 @@ mod tests {
             .objects
             .insert(crate::tpm::core::object::Slot::Object(Box::new(plain)))
             .unwrap();
-        assert_eq!(
-            signing_object(&state, handle).unwrap_err(),
-            TpmRc(rc::ATTRIBUTES)
-        );
+        // Part 3 clause 18.1 asks only for the sign attribute. A key that is
+        // not restricted is named there as one the caller may choose a scheme
+        // for, so it attests too; that it "would permit a forged attestation"
+        // is a warning to whoever trusts the result, not a rule for the TPM.
+        assert!(signing_object(&state, handle).is_ok());
 
         let restricted = Object::new(
             signing_public(ObjectAttributes::SIGN_ENCRYPT | ObjectAttributes::RESTRICTED),
@@ -500,7 +504,8 @@ mod tests {
             .unwrap();
         assert!(signing_object(&state, handle).is_ok());
 
-        // A decryption key cannot attest at all.
+        // A key without the sign attribute cannot attest, and the clause
+        // names the answer: "the TPM shall return TPM_RC_KEY".
         let decrypting = Object::new(
             signing_public(ObjectAttributes::DECRYPT),
             None,
@@ -513,10 +518,7 @@ mod tests {
             .objects
             .insert(crate::tpm::core::object::Slot::Object(Box::new(decrypting)))
             .unwrap();
-        assert_eq!(
-            signing_object(&state, handle).unwrap_err(),
-            TpmRc(rc::ATTRIBUTES)
-        );
+        assert_eq!(signing_object(&state, handle).unwrap_err(), TpmRc(rc::KEY));
     }
 
     #[test]
