@@ -6,7 +6,7 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::logging::Logger;
@@ -86,6 +86,12 @@ pub struct Tpm {
     state: Mutex<TpmState>,
     powered: AtomicBool,
     cancel: AtomicBool,
+    /// Host time, in milliseconds, when the TPM last advanced its own.
+    ///
+    /// Part 1 clause 37.2 advances Clock and Time while the TPM is powered.
+    /// Nothing runs inside a software TPM between commands, so the time that
+    /// passed is worked out from the host clock when the next command arrives.
+    last_tick: AtomicI64,
     /// The platform establishment flag, set by _TPM_Hash_Start.
     ///
     /// It is kept here rather than in the state file because it belongs to the
@@ -154,6 +160,7 @@ impl Tpm {
             state: Mutex::new(state),
             powered: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
+            last_tick: AtomicI64::new(crate::util::time::unix_millis_now()),
             established: AtomicBool::new(false),
             store,
             logger,
@@ -198,6 +205,17 @@ impl Tpm {
         }
     }
 
+    /// Milliseconds of powered time since this was last asked.
+    ///
+    /// A host clock that has been put back gives no time at all rather than
+    /// negative time, because Part 1 clause 37.2 does not let Clock go
+    /// backwards.
+    fn elapsed(&self) -> u64 {
+        let now = crate::util::time::unix_millis_now();
+        let before = self.last_tick.swap(now, Ordering::SeqCst);
+        u64::try_from(now.saturating_sub(before)).unwrap_or(0)
+    }
+
     /// True when the command changes anything that must reach the state file.
     fn writes_nv(code: u32) -> bool {
         crate::tpm::commands::table::lookup(code)
@@ -212,8 +230,13 @@ impl Device for Tpm {
             return error_response(TpmRc(rc::INITIALIZE));
         }
         let code = parse_header(command).map(|h| h.code).ok();
+        let elapsed = self.elapsed();
         let response = {
             let mut state = self.locked();
+            // The time that passed since the last command is credited before
+            // the command runs, so a command that reports the clock or reads
+            // the countdown timer sees the value it should.
+            state.advance_time(elapsed);
             crate::tpm::commands::execute::run(&mut state, locality, command)
         };
         // A command that touches non-volatile state is followed by a write so
@@ -332,8 +355,18 @@ impl Device for Tpm {
         self.established.store(false, Ordering::SeqCst);
     }
 
-    fn act_get_signaled(&self, _act: u32) -> bool {
-        false
+    /// The signal of one authenticated countdown timer.
+    ///
+    /// This TPM has the single instance the platform profile asks for, so any
+    /// other number has no timer and cannot be signalling.
+    fn act_get_signaled(&self, act: u32) -> bool {
+        if act != 0 {
+            return false;
+        }
+        let elapsed = self.elapsed();
+        let mut state = self.locked();
+        state.advance_time(elapsed);
+        state.act.signaled()
     }
 }
 

@@ -47,6 +47,41 @@ impl Harness {
         self.tpm.execute(0, &v)
     }
 
+    /// Send a command that names one handle and authorizes it with a password.
+    fn send_auth(&self, command: u32, handle: u32, parameters: &[u8]) -> Vec<u8> {
+        let mut auth = 0x4000_0009u32.to_be_bytes().to_vec(); // TPM_RS_PW
+        auth.extend_from_slice(&0u16.to_be_bytes()); // nonce
+        auth.push(0); // session attributes
+        auth.extend_from_slice(&0u16.to_be_bytes()); // password
+
+        let mut body = handle.to_be_bytes().to_vec();
+        body.extend_from_slice(&(auth.len() as u32).to_be_bytes());
+        body.extend_from_slice(&auth);
+        body.extend_from_slice(parameters);
+
+        let mut v = st::SESSIONS.to_be_bytes().to_vec();
+        v.extend_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+        v.extend_from_slice(&command.to_be_bytes());
+        v.extend_from_slice(&body);
+        self.tpm.execute(0, &v)
+    }
+
+    /// The timer this TPM reports, as a timeout and its attributes.
+    fn act(&self) -> (u32, u32) {
+        let mut body = cap::ACT.to_be_bytes().to_vec();
+        body.extend_from_slice(&0x4000_0110u32.to_be_bytes()); // TPM_RH_ACT_0
+        body.extend_from_slice(&4u32.to_be_bytes());
+        let r = self.send(cc::GetCapability, &body);
+        assert_eq!(code_of(&r), rc::SUCCESS);
+        let count = u32::from_be_bytes(r[15..19].try_into().unwrap()) as usize;
+        assert_eq!(count, 1, "the profile asks for one timer");
+        // TPMS_ACT_DATA is the handle, the timeout and the attributes.
+        (
+            u32::from_be_bytes(r[23..27].try_into().unwrap()),
+            u32::from_be_bytes(r[27..31].try_into().unwrap()),
+        )
+    }
+
     /// Every TPM_PT this TPM reports, as property and value.
     fn properties(&self) -> Vec<(u32, u32)> {
         let mut body = cap::TPM_PROPERTIES.to_be_bytes().to_vec();
@@ -97,6 +132,14 @@ impl Drop for Harness {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.dir).ok();
     }
+}
+
+/// True when `code` is TPM_RC_VALUE, whichever handle or parameter it names.
+///
+/// Part 2 clause 6.6.2 builds a format-one code from the error number in
+/// bits 5:0, so the qualifier has to be taken off before comparing.
+fn is_value_error(code: u32) -> bool {
+    code & rc::RC_FMT1 != 0 && code & 0x3f == rc::VALUE & 0x3f
 }
 
 fn code_of(buf: &[u8]) -> u32 {
@@ -264,6 +307,119 @@ fn the_banks_allocated_by_default_are_the_ones_the_profile_requires() {
         !banks.contains(&alg::SHA1),
         "SHA-1 is Not Allowed, so no bank may use it"
     );
+}
+
+/// Clause 5.1.2: "If a TPM implements the optional TPM2_ACT_SetTimeout command:
+/// 1. The TPM SHALL support one ACT instance".
+///
+/// The timer is driven through the command interface and read back through
+/// TPM2_GetCapability(TPM_CAP_ACT), which is how Part 2 clause 8.12 says the
+/// attributes are read.
+#[test]
+fn the_timer_the_profile_asks_for_is_there_and_counts() {
+    /// TPMA_ACT.signaled, Part 2 Table 46 bit 0.
+    const SIGNALED: u32 = 1;
+
+    let h = Harness::new("act");
+    let (timeout, attributes) = h.act();
+    assert_eq!(timeout, 0, "a started TPM has no countdown running");
+    assert_eq!(attributes & SIGNALED, 0);
+
+    // Part 3 clause 33.2.1 state 1: zero and non-zero leaves signaled CLEAR.
+    let r = h.send_auth(cc::ACT_SetTimeout, 0x4000_0110, &60u32.to_be_bytes());
+    assert_eq!(code_of(&r), rc::SUCCESS, "setting the timeout failed");
+    let (timeout, attributes) = h.act();
+    assert_eq!(timeout, 60);
+    assert_eq!(attributes & SIGNALED, 0);
+
+    // State 4: non-zero and zero signals, because the timer went to zero.
+    let r = h.send_auth(cc::ACT_SetTimeout, 0x4000_0110, &0u32.to_be_bytes());
+    assert_eq!(code_of(&r), rc::SUCCESS);
+    let (timeout, attributes) = h.act();
+    assert_eq!(timeout, 0);
+    assert_eq!(attributes & SIGNALED, SIGNALED, "reaching zero is a signal");
+
+    // "When ACT Timeout is zero and the signaled attribute is SET, writing a
+    // startTimeout of FF FF FF FF will clear signaled and stop the counting."
+    let r = h.send_auth(cc::ACT_SetTimeout, 0x4000_0110, &u32::MAX.to_be_bytes());
+    assert_eq!(code_of(&r), rc::SUCCESS);
+    let (timeout, attributes) = h.act();
+    assert_eq!(timeout, 0, "no new countdown is started");
+    assert_eq!(attributes & SIGNALED, 0, "the signal is cleared");
+
+    // There is one timer, so no other handle names one.
+    let r = h.send_auth(cc::ACT_SetTimeout, 0x4000_0111, &60u32.to_be_bytes());
+    assert_ne!(code_of(&r), rc::SUCCESS, "a second timer answered");
+}
+
+/// Clause 4.7 item 7: "The optional TPM2_PCR_SetAuthPolicy and
+/// TPM2_PCR_SetAuthValue commands, if implemented, SHALL return TPM_RC_VALUE."
+#[test]
+fn the_pcr_authorization_commands_refuse_with_the_value_the_profile_names() {
+    let h = Harness::new("pcrauth");
+
+    // TPM2_PCR_SetAuthValue takes the PCR handle and an authorization value.
+    let r = h.send_auth(cc::PCR_SetAuthValue, 0, &[0x00, 0x00]);
+    assert!(is_value_error(code_of(&r)), "SetAuthValue answered {:#06x}", code_of(&r));
+
+    // TPM2_PCR_SetAuthPolicy takes the platform handle, then the policy, the
+    // hash and the PCR the policy is for.
+    let mut body = 32u16.to_be_bytes().to_vec();
+    body.extend_from_slice(&[0u8; 32]);
+    body.extend_from_slice(&alg::SHA256.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes());
+    let r = h.send_auth(cc::PCR_SetAuthPolicy, 0x4000_000C, &body);
+    assert!(is_value_error(code_of(&r)), "SetAuthPolicy answered {:#06x}", code_of(&r));
+}
+
+/// Clause 4.6.1 item 1.b: a read of TPM_PT_MEMORY "SHALL return TPMA_MEMORY"
+/// with "sharedRAM SHALL be CLEAR".
+#[test]
+fn the_memory_attributes_say_ram_is_not_shared() {
+    /// TPMA_MEMORY.sharedRAM, Part 2 Table 42 bit 0.
+    const SHARED_RAM: u32 = 1;
+    let h = Harness::new("memory");
+    assert_eq!(h.property(pt::MEMORY) & SHARED_RAM, 0);
+}
+
+/// Clause 5.1.1 item 3: "A TPM SHALL NOT return TPM_RC_OBJECT_HANDLES."
+#[test]
+fn the_response_code_the_profile_forbids_is_never_returned() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tpm/error.rs"))
+        .unwrap_or_default();
+    let _ = source;
+    // The code is defined so that a caller's value can be named, but nothing
+    // builds one. A scan of the tree is what keeps that true.
+    let mut found = Vec::new();
+    for entry in walk(concat!(env!("CARGO_MANIFEST_DIR"), "/src")) {
+        let text = std::fs::read_to_string(&entry).unwrap_or_default();
+        for (number, line) in text.lines().enumerate() {
+            if line.contains("rc::OBJECT_HANDLES") && !line.contains("pub const") {
+                found.push(format!("{}:{}", entry.display(), number + 1));
+            }
+        }
+    }
+    assert!(found.is_empty(), "TPM_RC_OBJECT_HANDLES is used at {found:?}");
+}
+
+/// Every Rust source file under `dir`.
+fn walk(dir: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(dir)];
+    while let Some(at) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 /// Clause 4.7 item 8: "the D-RTM PCR SHALL be PCR 17 and the S-HCRTM PCR SHALL

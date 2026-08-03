@@ -351,15 +351,20 @@ pub fn rewrap(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 ///
 /// This TPM implements no authenticated timers, so every ACT handle is
 /// refused rather than silently accepted.
-pub fn act_set_timeout(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
+pub fn act_set_timeout(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let _start_timeout = r.u32()?;
+    let start_timeout = r.u32()?;
     r.expect_end()?;
-    if !(crate::tpm::constants::rh::ACT_0..=crate::tpm::constants::rh::ACT_F).contains(&handle) {
+    // Part 2 TPMI_RH_ACT answers TPM_RC_VALUE for a handle that is not an ACT.
+    // The PC Client Platform TPM Profile 1.07 clause 5.1.2 asks for one
+    // instance, so every other number in the range names a timer that is not
+    // there and is refused the same way.
+    if handle != crate::tpm::constants::rh::ACT_0 {
         return Err(TpmRc(rc::VALUE).with_handle(1));
     }
-    Err(TpmRc(rc::VALUE).with_handle(1))
+    state.act.set_timeout(start_timeout);
+    respond(|_| Ok(()))
 }
 
 /// TPM2_SetCapability, Part 3 clause 30.3.

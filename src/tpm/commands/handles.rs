@@ -38,6 +38,8 @@ pub enum Kind {
     NvIndex,
     /// TPMI_RH_NV_AUTH: platform, owner or the Index itself.
     NvAuth,
+    /// TPMI_RH_ACT, an authenticated countdown timer.
+    Act,
     /// TPMI_RH_PLATFORM.
     Platform,
     /// TPMI_RH_OWNER.
@@ -97,6 +99,10 @@ const fn H(kind: Kind, nullable: bool) -> Handle {
 type Row = (u32, &'static [Handle], &'static [Role]);
 
 const ROWS: &[Row] = &[
+    // Part 3 Table 283 gives TPM2_ACT_SetTimeout one handle with Auth Role
+    // USER, whose authorization Part 1 clause 40.2 takes from platformAuth
+    // or from the timer's own policy.
+    (cc::ACT_SetTimeout, &[H(Act, false)], &[R::User]),
     (cc::ActivateCredential, &[H(Object, false), H(Object, false)], &[R::Admin, R::User]),
     (cc::Certify, &[H(Object, false), H(Object, true)], &[R::Admin, R::User]),
     (cc::CertifyCreation, &[H(Object, true), H(Object, false)], &[R::User, R::None]),
@@ -303,6 +309,9 @@ pub fn allows(handle_spec: Handle, handle: u32) -> bool {
                 || handle == rh::LOCKOUT
         }
         Kind::Pcr => (hc::PCR_FIRST..=hc::PCR_LAST).contains(&handle),
+        // Part 2 TPMI_RH_ACT covers TPM_RH_ACT_0 through TPM_RH_ACT_F. Which
+        // of them names a timer that is there is for the command to answer.
+        Kind::Act => (rh::ACT_0..=rh::ACT_F).contains(&handle),
         Kind::Context => session::is_session_handle(handle) || ObjectSlots::is_transient(handle),
         // A session handle is judged by its range alone. Whether that session
         // is loaded, and whether it is of the type the command needs, is the
@@ -392,9 +401,9 @@ mod tests {
 
     #[test]
     fn every_command_with_handles_has_an_interface_row() {
-        // The three attached component and timer commands check their own
-        // handles, because the entities they name are not implemented.
-        let exempt = [cc::AC_GetCapability, cc::AC_Send, cc::ACT_SetTimeout];
+        // The two attached component commands check their own handles,
+        // because the entities they name are not implemented.
+        let exempt = [cc::AC_GetCapability, cc::AC_Send];
         for info in crate::tpm::commands::table::COMMANDS {
             if info.handles == 0 || exempt.contains(&info.code) {
                 continue;

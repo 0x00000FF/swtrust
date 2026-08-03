@@ -205,6 +205,11 @@ pub struct TpmState {
     /// Outstanding split ECC operations, Part 1 clause 44.2. The nonce behind
     /// them is chosen at each TPM Reset, so a commit lives no longer than that.
     pub commits: crate::tpm::core::commit::Commits,
+    /// The authenticated countdown timer, Part 1 clause 40.
+    ///
+    /// The PC Client Platform TPM Profile 1.07 clause 5.1.2 asks a TPM that
+    /// implements TPM2_ACT_SetTimeout for one instance, so there is one.
+    pub act: crate::tpm::core::act::Act,
     /// Data collected between _TPM_Hash_Start and _TPM_Hash_End.
     pub hcrtm_buffer: Option<Vec<u8>>,
     /// Set by the running command to keep itself out of the command audit.
@@ -266,6 +271,7 @@ impl TpmState {
             failure_mode: false,
             self_test_done: true,
             commits: crate::tpm::core::commit::Commits::new(),
+            act: crate::tpm::core::act::Act::default(),
             test_digest: Vec::new(),
             test_failure: None,
             rng,
@@ -313,8 +319,27 @@ impl TpmState {
         if !restart {
             self.commits.reset(&mut self.rng)?;
         }
+        // Clause 40.2: "On TPM Reset or TPM Restart, all ACT timeouts are set
+        // to zero with no side effects (no event triggered)", and the policy
+        // goes back to an Empty Policy.
+        self.act.on_reset();
         self.begin_operation(!disorderly);
         Ok(())
+    }
+
+    /// Let `millis` of powered time pass.
+    ///
+    /// Part 1 clause 37.2 advances Clock whenever the TPM is powered and Time
+    /// since the last _TPM_Init, and clause 40.2 counts the ACT down once per
+    /// second over the same period. The transport calls this before each
+    /// command, which is the only moment the TPM is asked anything.
+    pub fn advance_time(&mut self, millis: u64) {
+        if millis == 0 {
+            return;
+        }
+        self.clock.clock = self.clock.clock.saturating_add(millis);
+        self.clock.time = self.clock.time.saturating_add(millis);
+        self.act.advance(millis);
     }
 
     /// Apply TPM2_Startup(TPM_SU_STATE), which is a TPM Resume.
@@ -336,6 +361,10 @@ impl TpmState {
         if !self.commits.is_ready() {
             self.commits.reset(&mut self.rng)?;
         }
+        // Clause 40.2 preserves ACT timeouts across a TPM Resume, and Part 2
+        // Table 46 copies each signaled into its preserveSignaled so a caller
+        // can tell that a reset may have been caused by a timer expiring.
+        self.act.on_resume();
         self.begin_operation(true);
         Ok(())
     }
@@ -482,12 +511,28 @@ impl TpmState {
         // and restores on the next Startup of any type. A TPM that has not
         // been started has none, and writes none, so the block is either
         // absent or complete and never half there.
+        // The block is written whenever anything follows it, so that what comes
+        // after starts at a known place. A TPM with no commit values writes an
+        // empty nonce, which is the same thing an absent block used to say.
+        let (random, count, used) = self.commits.parts();
         if self.commits.is_ready() {
-            let (random, count, used) = self.commits.parts();
             w.sized16(random);
             w.u64(count);
             w.sized16(used);
+        } else {
+            w.sized16(&[]);
+            w.u64(0);
+            w.sized16(&[]);
         }
+
+        // Part 1 clause 40.2 saves the ACT timeout on Shutdown(TPM_SU_STATE):
+        // the whole of it when TPM2_ACT_SetTimeout has been used since the last
+        // startup, and half otherwise, which stops a caller extending the timer
+        // for ever by shutting down and starting up again.
+        w.u32(self.act.saved_timeout());
+        w.u8(u8::from(self.act.signaled()));
+        w.u16(self.act.policy.hash_alg);
+        w.sized16(&self.act.policy.digest);
 
         w.finish()
     }
@@ -599,14 +644,33 @@ impl TpmState {
             // other size is a damaged file rather than an older one. Accepting
             // a short nonce would leave the TPM deriving commit values from
             // less material than clause 44.2.3 asks for.
-            if commit_random.len() != config::COMMIT_NONCE_BYTES
-                || commit_used.len() != config::MAX_COMMIT_SEQUENCES as usize / 8
-            {
-                return Err(TpmRc(rc::BAD_CONTEXT));
+            // An empty nonce says the TPM had no commit values when it was
+            // written. Anything else has one shape, so a block of another size
+            // is a damaged file rather than an older one. Accepting a short
+            // nonce would leave the TPM deriving commit values from less
+            // material than clause 44.2.3 asks for.
+            if !commit_random.is_empty() || !commit_used.is_empty() {
+                if commit_random.len() != config::COMMIT_NONCE_BYTES
+                    || commit_used.len() != config::MAX_COMMIT_SEQUENCES as usize / 8
+                {
+                    return Err(TpmRc(rc::BAD_CONTEXT));
+                }
+                state
+                    .commits
+                    .restore(commit_random, commit_count, commit_used);
             }
-            state
-                .commits
-                .restore(commit_random, commit_count, commit_used);
+        }
+
+        // The ACT block follows the commit block. A file written before it
+        // existed ends here and starts its timer at zero, which is where a TPM
+        // Reset puts it anyway.
+        if !r.is_empty() {
+            let timeout = r.u32()?;
+            let signaled = r.u8()? != 0;
+            let policy_alg = r.u16()?;
+            let policy_digest = read_sized(&mut r)?;
+            state.act.restore(timeout, signaled);
+            state.act.policy = TpmtHa::new(policy_alg, policy_digest)?;
         }
 
         if !r.is_empty() {
@@ -900,6 +964,10 @@ mod tests {
         assert_eq!(s.clock.reset_count, 0);
     }
 
+    /// Octets the timer block occupies when the policy is empty: the
+    /// timeout, the signal, the policy algorithm and an empty digest.
+    const ACT_BLOCK: usize = 4 + 1 + 2 + 2;
+
     #[test]
     fn a_state_file_without_the_commit_values_still_loads() {
         // The commit values were appended to the record after the first files
@@ -915,10 +983,10 @@ mod tests {
         s.commits.reset(&mut rng).unwrap();
         let saved = s.save().unwrap();
 
-        // Cut the record back to where the commit values begin: a nonce, a
-        // counter and an array, all at the end.
+        // Cut the record back to where the trailing blocks begin: the commit
+        // nonce, counter and array, and after them the timer.
         let (random, _, used) = s.commits.parts();
-        let tail = 2 + random.len() + 8 + 2 + used.len();
+        let tail = 2 + random.len() + 8 + 2 + used.len() + ACT_BLOCK;
         let older = &saved[..saved.len() - tail];
 
         let back = TpmState::load(older).expect("an older state file was refused");
@@ -935,7 +1003,11 @@ mod tests {
         // would leave the TPM deriving commit values from less material than
         // clause 44.2.3 asks for.
         let s = TpmState::manufacture().unwrap();
-        let base = s.save().unwrap();
+        let saved = s.save().unwrap();
+        // A manufactured TPM has no commit values, so its own block is two
+        // empty buffers and a zero counter. Strip that and the timer to get
+        // back to where a block would start.
+        let base = saved[..saved.len() - (2 + 8 + 2 + ACT_BLOCK)].to_vec();
 
         for (random, used) in [(1usize, 16usize), (64, 1), (1, 1), (63, 16), (64, 15)] {
             let mut bad = base.clone();

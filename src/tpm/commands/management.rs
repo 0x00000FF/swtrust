@@ -398,7 +398,19 @@ fn build_capability(
             Ok((more, Capabilities::AuthPolicies(TpmlTaggedPolicy { items })))
         }
         cap::ACT => {
-            let all: Vec<ActData> = Vec::new();
+            // Part 2 clause 8.12 reads TPMA_ACT with
+            // TPM2_GetCapability(TPM_CAP_ACT, TPM_RH_ACT_x). There is one timer,
+            // so the list holds one entry and a property above it selects
+            // nothing.
+            let all: Vec<ActData> = if property <= crate::tpm::constants::rh::ACT_0 {
+                vec![ActData {
+                    handle: crate::tpm::constants::rh::ACT_0,
+                    timeout: state.act.timeout(),
+                    attributes: state.act.attributes(),
+                }]
+            } else {
+                Vec::new()
+            };
             let (items, more) = take(all, count, TpmlActData::MAX);
             Ok((more, Capabilities::Act(TpmlActData { items })))
         }

@@ -224,6 +224,28 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             admin_with_policy: true,
         });
     }
+    if (rh::ACT_0..=rh::ACT_F).contains(&handle) {
+        // Part 1 clause 40.2: an ACT "has an authValue and an authPolicy. The
+        // authValue is the same as the current platformAuth and can only be
+        // used if phEnable is SET. The authPolicy is ACT-specific and is
+        // neither enabled nor disabled by phEnable."
+        let platform = state.hierarchies.get(rh::PLATFORM)?;
+        let enabled = state
+            .startup_clear
+            .has(crate::tpm::structures::attributes::StartupClearAttributes::PH_ENABLE);
+        return Ok(Entity {
+            name,
+            auth: if enabled {
+                platform.auth.clone()
+            } else {
+                Vec::new()
+            },
+            policy: policy_of(&state.act.policy),
+            uses_lockout: false,
+            user_with_auth: enabled,
+            admin_with_policy: true,
+        });
+    }
     if handle == rh::PLATFORM_NV {
         let h = state.hierarchies.get(rh::PLATFORM)?;
         return Ok(Entity {
