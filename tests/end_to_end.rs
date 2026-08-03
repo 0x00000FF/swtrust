@@ -3095,9 +3095,12 @@ fn a_template_that_can_neither_sign_nor_decrypt_is_refused() {
 
 #[test]
 fn a_derived_rsa_template_reports_the_required_error_first() {
-    // Clause 12.9.1 requires sensitiveDataOrigin to be CLEAR and only permits
-    // TPM_RC_TYPE for an RSA key ("the TPM may return"). A template that breaks
-    // both has to be answered with the one the clause requires.
+    // Part 1 clause 5 says "the order in which checks are performed is not
+    // normative", so a template that breaks two rules could be answered with
+    // either code and this test pins down the choice rather than a
+    // requirement. Clause 12.9.1 requires sensitiveDataOrigin to be CLEAR and
+    // only permits TPM_RC_TYPE for an RSA key ("the TPM may return"), so the
+    // required answer is the more useful one to give.
     let h = Harness::started("derive-order");
     let parent = load_derivation_parent(&h);
 
@@ -3119,7 +3122,7 @@ fn a_derived_rsa_template_reports_the_required_error_first() {
     assert_eq!(
         r.code,
         rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
-        "the permitted error hid the required one: {:#x}",
+        "the permitted error was chosen over the required one: {:#x}",
         r.code
     );
 }

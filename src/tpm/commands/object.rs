@@ -527,9 +527,11 @@ fn derive_object(
     // 25.3 gives the reason: the caller supplies values that steer the
     // derivation but never sets the sensitive value itself.
     //
-    // It comes before the check below because the clause requires this one and
-    // only permits that one, so a template that breaks both has to be answered
-    // with the required error.
+    // Part 1 clause 5 says "the order in which checks are performed is not
+    // normative", so a template that breaks this rule and the one below could
+    // be answered with either code. This one goes first because the clause
+    // requires it while only permitting the other, which makes it the more
+    // useful of the two answers to give.
     if template
         .object_attributes
         .has(ObjectAttributes::SENSITIVE_DATA_ORIGIN)
