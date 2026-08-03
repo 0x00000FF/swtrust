@@ -33,16 +33,20 @@ const LABEL_PRIMARY: &str = "PRIMARY";
 ///
 /// Part 1 clause 27.2 requires the same seed, template and sensitive input to
 /// rebuild the same key, so the derivation covers all three.
+///
+/// The whole template goes in, unique included. Part 3 clause 24.1.1 says "all
+/// of the bits of the template are used in the creation of the Primary Key",
+/// and that two calls with "the same inPublic parameter, inSensitive.data, and
+/// Primary Seed" give the same object. The field the caller sent is what those
+/// sentences mean by the template, not the modulus or point the TPM is about to
+/// put in its place, so leaving it out would let two templates the caller wrote
+/// differently produce one key.
 fn primary_context(
     template: &TpmtPublic,
     sensitive: &Tpm2bSensitiveCreate,
 ) -> TpmResult<Vec<u8>> {
-    // The unique field is not part of the derivation, because it is the output
-    // of the derivation for an asymmetric key.
-    let mut stripped = template.clone();
-    stripped.unique = PublicId::empty_for(template.object_type)?;
     let mut w = Writer::new();
-    stripped.marshal(&mut w);
+    template.marshal(&mut w);
     sensitive.marshal(&mut w);
     let body = w.finish()?;
     hash::digest(
@@ -807,6 +811,20 @@ mod tests {
         let mut c = SeededRng::new(alg::SHA256, &seed, LABEL_PRIMARY, &other_context);
         let (sc, _) = create_sensitive(&mut c, &other, &empty).unwrap();
         assert_ne!(sa, sc);
+
+        // Part 3 clause 24.1.1: "all of the bits of the template are used in
+        // the creation of the Primary Key". The unique field is one of them,
+        // even though nothing the caller puts there is used as a key.
+        let mut with_unique = ecc_template(ObjectAttributes::SIGN_ENCRYPT);
+        with_unique.unique = PublicId::Ecc(EccPoint {
+            x: crate::tpm::structures::base::Tpm2bEccParameter::new(vec![0u8; 32]).unwrap(),
+            y: crate::tpm::structures::base::Tpm2bEccParameter::new(vec![0u8; 32]).unwrap(),
+        });
+        let unique_context = primary_context(&with_unique, &empty).unwrap();
+        assert_ne!(
+            context, unique_context,
+            "the unique field was left out of the derivation"
+        );
     }
 
     #[test]
