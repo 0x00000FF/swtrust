@@ -16,7 +16,7 @@ use crate::tpm::structures::base::{
     Tpm2bPublicKeyRsa, Tpm2bSensitiveData, Tpm2bSymKey,
 };
 use crate::tpm::structures::keys::{
-    PublicId, PublicParms, Tpm2bPublic, Tpm2bSensitive, Tpm2bSensitiveCreate, TpmtPublic,
+    Derive, PublicId, PublicParms, Tpm2bPublic, Tpm2bSensitive, Tpm2bSensitiveCreate, TpmtPublic,
     TpmtSensitive, SensitiveComposite,
 };
 use crate::tpm::structures::lists::TpmlPcrSelection;
@@ -440,6 +440,221 @@ pub fn create(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     })
 }
 
+/// What deriving a child from a Derivation Parent needs.
+struct DerivationParent {
+    /// The hash of the parent's KDF, Part 1 clause 25.2.
+    hash_alg: u16,
+    /// The parent's sensitive value, which is the entropy of the child.
+    sensitive: Vec<u8>,
+    hierarchy: u32,
+    qualified_name: Vec<u8>,
+}
+
+/// Resolve a handle to a Derivation Parent, or nothing if it is not one.
+///
+/// A handle that names no object at all is left to the ordinary path, which
+/// reports it, so that a bad handle keeps the error it would otherwise get.
+fn derivation_parent(state: &TpmState, handle: u32) -> TpmResult<Option<DerivationParent>> {
+    let object = if crate::tpm::core::object::ObjectSlots::is_transient(handle) {
+        match state.objects.object(handle) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        }
+    } else if (crate::tpm::constants::hc::PERSISTENT_FIRST
+        ..=crate::tpm::constants::hc::PERSISTENT_LAST)
+        .contains(&handle)
+    {
+        match state.persistent.get(&handle) {
+            Some(o) => o,
+            None => return Ok(None),
+        }
+    } else {
+        return Ok(None);
+    };
+    if !object.is_derivation_parent() {
+        return Ok(None);
+    }
+
+    // Part 1 clause 25.2: "The KDF that is to be used in Object derivation is a
+    // property of the Derivation Parent and can include the hash algorithm to
+    // use in the derivation process." A keyed hash parent carries that in its
+    // scheme, and KDF1_SP800_108 is the only derivation KDF the specification
+    // defines, so a parent that names anything else can derive nothing.
+    let hash_alg = match &object.public.parameters {
+        crate::tpm::structures::keys::PublicParms::KeyedHash { scheme } => match scheme.detail {
+            crate::tpm::structures::schemes::SchemeDetail::Xor(x)
+                if scheme.scheme == alg::XOR
+                    && x.kdf == alg::KDF1_SP800_108
+                    && x.hash_alg != alg::NULL =>
+            {
+                x.hash_alg
+            }
+            _ => return Err(TpmRc(rc::TYPE).with_handle(1)),
+        },
+        _ => return Err(TpmRc(rc::TYPE).with_handle(1)),
+    };
+
+    let sensitive = match object.sensitive.as_ref().map(|s| &s.sensitive) {
+        Some(crate::tpm::structures::keys::SensitiveComposite::Bits(b)) => b.as_slice().to_vec(),
+        _ => return Err(TpmRc(rc::TYPE).with_handle(1)),
+    };
+
+    Ok(Some(DerivationParent {
+        hash_alg,
+        sensitive,
+        hierarchy: object.hierarchy,
+        qualified_name: object.qualified_name.clone(),
+    }))
+}
+
+/// Generate a Derived Object, Part 3 clause 12.9.1 and Part 1 clause 25.
+fn derive_object(
+    state: &mut TpmState,
+    parent_handle: u32,
+    parent: DerivationParent,
+    in_sensitive: &Tpm2bSensitiveCreate,
+    template_blob: &crate::tpm::structures::base::Tpm2bTemplate,
+) -> TpmResult<Response> {
+    // Part 2 clause 12.2.6: under a derivation parent the unique field is a
+    // TPMS_DERIVE rather than an object identifier.
+    let mut r = crate::tpm::marshal::Reader::new(template_blob.as_slice());
+    let template = TpmtPublic::unmarshal_with(&mut r, true).map_err(|e| e.with_parameter(2))?;
+    r.expect_end().map_err(|e| e.with_parameter(2))?;
+    object::validate_public(&template).map_err(|e| e.with_parameter(2))?;
+
+    // Clause 12.9.1: "If parentHandle references a Derivation Parent, then the
+    // TPM may return TPM_RC_TYPE if the key type to be generated is an RSA
+    // key." Deriving an RSA key means searching for primes in the KDF stream,
+    // which this TPM does not do.
+    if template.object_type == alg::RSA {
+        return Err(TpmRc(rc::TYPE).with_parameter(2));
+    }
+
+    // Clause 12.9.1 names the one input check that is specific to derivation:
+    // "when parentHandle references a Derivation Parent, then
+    // sensitiveDataOrigin in inPublic is required to be CLEAR." Part 1 clause
+    // 25.3 gives the reason: the caller supplies values that steer the
+    // derivation but never sets the sensitive value itself.
+    if template
+        .object_attributes
+        .has(ObjectAttributes::SENSITIVE_DATA_ORIGIN)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+    }
+
+    let (label, context) = label_and_context(&template, in_sensitive).map_err(|e| {
+        // A label and context that will not unmarshal came in the sensitive
+        // area, which is the first parameter.
+        e.with_parameter(1)
+    })?;
+    let mut octets = DerivedOctets::new(parent.hash_alg, &parent.sensitive, &label, &context)?;
+
+    // The caller gives no sensitive data of its own, so the authorization value
+    // is all that is taken from the sensitive area.
+    let mut without_data = in_sensitive.clone();
+    without_data.sensitive.data = Default::default();
+    let (sensitive, unique) = create_sensitive(&mut octets, &template, &without_data)?;
+
+    let mut public = template;
+    public.unique = unique;
+    let object = Object::new(
+        public.clone(),
+        Some(sensitive),
+        parent.hierarchy,
+        &parent.qualified_name,
+        true,
+    )?;
+    let name = object.name.clone();
+    let handle = state.objects.insert(Slot::Object(Box::new(object)))?;
+    let _ = parent_handle;
+    respond_with_handle(handle, move |w| {
+        // Clause 12.9.1: "If parentHandle references a Derivation Parent or a
+        // Primary Seed, then outPrivate will be an Empty Buffer." A derived
+        // object can only be derived again, never loaded.
+        Tpm2bPrivate::empty().marshal(w);
+        Tpm2bPublic {
+            public_area: public,
+        }
+        .marshal(w);
+        Tpm2bName::new(name)?.marshal(w);
+        Ok(())
+    })
+}
+
+/// The octets a Derived Object is built from, Part 1 clause 25.4.1.
+///
+/// One KDFa call fills a fixed buffer, and the derived values are taken from it
+/// "from most significant byte to least significant byte with no bytes
+/// skipped". The first digest is the most significant, which is the order KDFa
+/// already produces, so the octets are handed out from the front. Running out
+/// is not something the caller can retry differently, so it is reported as
+/// TPM_RC_NO_RESULT rather than as a failure of the generator.
+struct DerivedOctets {
+    buffer: Vec<u8>,
+    offset: usize,
+}
+
+impl DerivedOctets {
+    /// KDFa(hashAlg, sensitive, label, context, 0, 8192) of clause 25.4.1.
+    fn new(hash_alg: u16, sensitive: &[u8], label: &[u8], context: &[u8]) -> TpmResult<Self> {
+        Ok(DerivedOctets {
+            buffer: crate::tpm::crypto::hmac::kdfa_bytes(
+                hash_alg, sensitive, label, context, &[], 8192,
+            )?,
+            offset: 0,
+        })
+    }
+}
+
+impl Rng for DerivedOctets {
+    fn fill(&mut self, out: &mut [u8]) -> TpmResult<()> {
+        let end = self
+            .offset
+            .checked_add(out.len())
+            .filter(|e| *e <= self.buffer.len())
+            .ok_or(TpmRc(rc::NO_RESULT))?;
+        out.copy_from_slice(&self.buffer[self.offset..end]);
+        self.offset = end;
+        Ok(())
+    }
+}
+
+/// The label and context a Derived Object is derived with.
+///
+/// Part 2 clause 11.1.11 says "the values in the unique field of inPublic area
+/// template take precedence over the values in the inSensitive parameter", and
+/// the precedence is per field: a label given in the template is used even when
+/// the sensitive area also carries a context, and the other way round.
+fn label_and_context(
+    template: &TpmtPublic,
+    sensitive: &Tpm2bSensitiveCreate,
+) -> TpmResult<(Vec<u8>, Vec<u8>)> {
+    let from_template = match &template.unique {
+        PublicId::Derive(d) => d.clone(),
+        // The template was unmarshalled with the derivation form, so this
+        // cannot happen; an empty pair keeps the fallback below correct.
+        _ => Derive::default(),
+    };
+    let mut label = from_template.label.as_slice().to_vec();
+    let mut context = from_template.context.as_slice().to_vec();
+
+    // The sensitive area of a Derived Object holds a TPMS_DERIVE too, and
+    // supplies whichever of the two the template left empty.
+    let data = sensitive.sensitive.data.as_slice();
+    if !data.is_empty() {
+        let mut r = crate::tpm::marshal::Reader::new(data);
+        let from_sensitive = Derive::unmarshal(&mut r)?;
+        r.expect_end()?;
+        if label.is_empty() {
+            label = from_sensitive.label.as_slice().to_vec();
+        }
+        if context.is_empty() {
+            context = from_sensitive.context.as_slice().to_vec();
+        }
+    }
+    Ok((label, context))
+}
+
 /// TPM2_CreateLoaded, Part 3 clause 12.9.
 pub fn create_loaded(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     use crate::tpm::structures::base::Tpm2bTemplate;
@@ -449,6 +664,15 @@ pub fn create_loaded(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let in_sensitive = Tpm2bSensitiveCreate::unmarshal(&mut r)?;
     let template_blob = Tpm2bTemplate::unmarshal(&mut r)?;
     r.expect_end()?;
+
+    // Part 1 clause 25.3: the template is a TPM2B_TEMPLATE rather than a
+    // TPM2B_PUBLIC so that the unique field can be read "based on the type of
+    // parent and type of inPublic". Only a Derivation Parent gives it the
+    // derivation form, so the parent has to be known before it is read.
+    if let Some(parent) = derivation_parent(state, parent_handle)? {
+        return derive_object(state, parent_handle, parent, &in_sensitive, &template_blob);
+    }
+
     let template = TpmtPublic::from_bytes(template_blob.as_slice())
         .map_err(|e| e.with_parameter(2))?;
     object::validate_public(&template).map_err(|e| e.with_parameter(2))?;

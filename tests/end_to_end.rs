@@ -2496,3 +2496,337 @@ fn a_loaded_public_area_is_still_checked_against_its_key_bits() {
         r.code
     );
 }
+
+/// A Derivation Parent: a keyed hash object with the Parent Key attributes.
+///
+/// Part 1 clause 20.2 says "keyedHash objects with these attributes are
+/// Derivation Parents", and clause 25.2 puts the KDF in the parent's scheme, so
+/// the scheme is TPM_ALG_XOR naming KDF1_SP800_108 and SHA-256.
+fn derivation_parent_template() -> Vec<u8> {
+    let mut t = Writer::new();
+    t.u16(0x0008); // TPM_ALG_KEYEDHASH
+    t.u16(alg::SHA256);
+    // fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth |
+    // restricted | decrypt
+    t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0001_0000 | 0x0002_0000);
+    t.u16(0); // authPolicy
+    t.u16(0x000A); // scheme TPM_ALG_XOR
+    t.u16(alg::SHA256); // the hash of the KDF
+    t.u16(0x0022); // TPM_ALG_KDF1_SP800_108
+    t.u16(0); // unique
+    t.finish().unwrap()
+}
+
+/// An ECC template for a Derived Object, with sensitiveDataOrigin CLEAR.
+///
+/// `unique` carries the TPMS_DERIVE that Part 2 clause 12.2.6 puts there when
+/// the parent is a Derivation Parent.
+fn derived_template(attrs: u32, label: &[u8], context: &[u8]) -> Vec<u8> {
+    let mut t = Writer::new();
+    t.u16(0x0023); // TPM_ALG_ECC
+    t.u16(alg::SHA256);
+    t.u32(attrs);
+    t.u16(0); // authPolicy
+    t.u16(0x0010); // symmetric TPM_ALG_NULL
+    t.u16(0x0018); // scheme TPM_ALG_ECDSA
+    t.u16(alg::SHA256);
+    t.u16(0x0003); // curve NIST P-256
+    t.u16(0x0010); // kdf TPM_ALG_NULL
+    t.u16(label.len() as u16);
+    t.bytes(label);
+    t.u16(context.len() as u16);
+    t.bytes(context);
+    t.finish().unwrap()
+}
+
+/// Build a TPM2_CreateLoaded command.
+fn create_loaded(parent: u32, sensitive_data: &[u8], template: &[u8]) -> Vec<u8> {
+    let mut p = Writer::new();
+    p.u16((4 + sensitive_data.len()) as u16); // inSensitive
+    p.u16(0); // userAuth
+    p.u16(sensitive_data.len() as u16);
+    p.bytes(sensitive_data);
+    p.u16(template.len() as u16);
+    p.bytes(template);
+    command(
+        st::SESSIONS,
+        cc::CreateLoaded,
+        &[parent],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    )
+}
+
+/// Read outPrivate and the public area out of a TPM2_CreateLoaded response.
+fn split_created(body: &[u8]) -> (u32, Vec<u8>, Vec<u8>) {
+    let mut r = Reader::new(body);
+    let handle = r.u32().unwrap();
+    let _param_size = r.u32().unwrap();
+    let private_size = r.u16().unwrap() as usize;
+    let private = r.take(private_size).unwrap().to_vec();
+    let public_size = r.u16().unwrap() as usize;
+    let public = r.take(public_size).unwrap().to_vec();
+    (handle, private, public)
+}
+
+/// Make a Derivation Parent and return its handle.
+fn load_derivation_parent(h: &Harness) -> u32 {
+    let template = derivation_parent_template();
+    let mut p = Writer::new();
+    p.u16(4); // inSensitive
+    p.u16(0); // userAuth
+    p.u16(0); // data
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0); // outsideInfo
+    p.u32(0); // creationPCR
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "the derivation parent was refused: {:#x}",
+        r.code
+    );
+    Reader::new(&r.body).u32().unwrap()
+}
+
+/// sign | fixedTPM | fixedParent | userWithAuth, sensitiveDataOrigin CLEAR.
+const DERIVED_SIGNING: u32 = 0x0002 | 0x0010 | 0x0040 | 0x0004_0000;
+
+#[test]
+fn a_derivation_parent_derives_a_repeatable_object() {
+    // Part 3 clause 12.9.1: "if parentHandle references a Derivation Parent,
+    // then a Derived Object is generated". Part 1 clause 25.4.2 warns that "if
+    // the same Derivation Parent, label, and context are provided in two
+    // different invocations of CreateLoaded", the same object comes back, which
+    // is the property under test here.
+    let h = Harness::started("derive");
+    let parent = load_derivation_parent(&h);
+
+    let cmd = create_loaded(
+        parent,
+        &[],
+        &derived_template(DERIVED_SIGNING, b"label", b"context"),
+    );
+    let r = h.send(&cmd);
+    assert_eq!(r.code, rc::SUCCESS, "derivation failed: {:#x}", r.code);
+    let (_handle, private, public) = split_created(&r.body);
+
+    // Clause 12.9.1: "If parentHandle references a Derivation Parent or a
+    // Primary Seed, then outPrivate will be an Empty Buffer."
+    assert!(
+        private.is_empty(),
+        "a derived object cannot be loaded, so outPrivate must be empty"
+    );
+
+    // The same parent, label and context give the same object.
+    let again = h.send(&cmd);
+    assert_eq!(again.code, rc::SUCCESS);
+    let (_, _, public_again) = split_created(&again.body);
+    assert_eq!(public, public_again, "the derivation is not repeatable");
+
+    // A different label gives a different one.
+    let other = h.send(&create_loaded(
+        parent,
+        &[],
+        &derived_template(DERIVED_SIGNING, b"other", b"context"),
+    ));
+    assert_eq!(other.code, rc::SUCCESS);
+    let (_, _, public_other) = split_created(&other.body);
+    assert_ne!(public, public_other, "the label did not reach the KDF");
+
+    // So does a different context.
+    let ctx = h.send(&create_loaded(
+        parent,
+        &[],
+        &derived_template(DERIVED_SIGNING, b"label", b"other"),
+    ));
+    assert_eq!(ctx.code, rc::SUCCESS);
+    let (_, _, public_ctx) = split_created(&ctx.body);
+    assert_ne!(public, public_ctx, "the context did not reach the KDF");
+}
+
+#[test]
+fn derived_objects_with_different_attributes_share_a_key() {
+    // Part 3 clause 12.9.1: "If parentHandle references a Derivation Parent,
+    // the bits of the Label and Context are used in the creation of the key.
+    // This differs from TPM2_CreatePrimary(), where the bits of the template
+    // are used. This means that different templates (specifically, different
+    // public attributes) will result in the same key for the same Label and
+    // Context."
+    let h = Harness::started("derive-attrs");
+    let parent = load_derivation_parent(&h);
+
+    const DECRYPTING: u32 = 0x0002 | 0x0010 | 0x0040 | 0x0002_0000;
+
+    let a = h.send(&create_loaded(
+        parent,
+        &[],
+        &derived_template(DERIVED_SIGNING, b"shared", b"context"),
+    ));
+    assert_eq!(a.code, rc::SUCCESS);
+    let b = h.send(&create_loaded(
+        parent,
+        &[],
+        &derived_template(DECRYPTING, b"shared", b"context"),
+    ));
+    assert_eq!(b.code, rc::SUCCESS);
+
+    let (_, _, public_a) = split_created(&a.body);
+    let (_, _, public_b) = split_created(&b.body);
+    assert_ne!(
+        public_a, public_b,
+        "the attributes are part of the public area"
+    );
+
+    // The public areas differ only in their attributes, so the points agree.
+    // A P-256 point is two 32 octet coordinates, each behind a UINT16 size.
+    let point = |p: &[u8]| p[p.len() - 68..].to_vec();
+    assert_eq!(
+        point(&public_a),
+        point(&public_b),
+        "the attributes changed the derived key"
+    );
+}
+
+#[test]
+fn a_label_may_come_from_the_sensitive_area_instead() {
+    // Part 2 clause 11.1.11: "The values in the unique field of inPublic area
+    // template take precedence over the values in the inSensitive parameter."
+    // What the template leaves empty the sensitive area supplies.
+    let h = Harness::started("derive-sensitive");
+    let parent = load_derivation_parent(&h);
+
+    // A TPMS_DERIVE in the sensitive area carrying both values.
+    let mut s = Writer::new();
+    s.u16(5);
+    s.bytes(b"label");
+    s.u16(7);
+    s.bytes(b"context");
+    let from_sensitive = s.finish().unwrap();
+
+    let a = h.send(&create_loaded(
+        parent,
+        &from_sensitive,
+        &derived_template(DERIVED_SIGNING, b"", b""),
+    ));
+    assert_eq!(a.code, rc::SUCCESS, "derivation failed: {:#x}", a.code);
+
+    // The same values placed in the template give the same object.
+    let b = h.send(&create_loaded(
+        parent,
+        &[],
+        &derived_template(DERIVED_SIGNING, b"label", b"context"),
+    ));
+    assert_eq!(b.code, rc::SUCCESS);
+
+    let (_, _, public_a) = split_created(&a.body);
+    let (_, _, public_b) = split_created(&b.body);
+    assert_eq!(
+        public_a, public_b,
+        "the sensitive area did not supply the label and context"
+    );
+
+    // A template value wins over the one beside it in the sensitive area.
+    let c = h.send(&create_loaded(
+        parent,
+        &from_sensitive,
+        &derived_template(DERIVED_SIGNING, b"other", b""),
+    ));
+    assert_eq!(c.code, rc::SUCCESS);
+    let (_, _, public_c) = split_created(&c.body);
+    assert_ne!(
+        public_a, public_c,
+        "the template label did not take precedence"
+    );
+}
+
+#[test]
+fn a_derived_object_refuses_sensitive_data_origin_and_rsa() {
+    // Clause 12.9.1: "The input validation is the same as for TPM2_Create() and
+    // TPM2_CreatePrimary() with one exception: when parentHandle references a
+    // Derivation Parent, then sensitiveDataOrigin in inPublic is required to be
+    // CLEAR." And: "the TPM may return TPM_RC_TYPE if the key type to be
+    // generated is an RSA key."
+    let h = Harness::started("derive-refuse");
+    let parent = load_derivation_parent(&h);
+
+    const WITH_ORIGIN: u32 = 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000;
+    let r = h.send(&create_loaded(
+        parent,
+        &[],
+        &derived_template(WITH_ORIGIN, b"label", b"context"),
+    ));
+    assert_eq!(
+        r.code,
+        rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
+        "sensitiveDataOrigin was accepted on a derived object: {:#x}",
+        r.code
+    );
+
+    // An RSA template under the same parent.
+    let mut t = Writer::new();
+    t.u16(0x0001); // TPM_ALG_RSA
+    t.u16(alg::SHA256);
+    t.u32(DERIVED_SIGNING);
+    t.u16(0); // authPolicy
+    t.u16(0x0010); // symmetric TPM_ALG_NULL
+    t.u16(0x0014); // scheme TPM_ALG_RSASSA
+    t.u16(alg::SHA256);
+    t.u16(2048);
+    t.u32(0);
+    t.u16(5);
+    t.bytes(b"label");
+    t.u16(0);
+    let r = h.send(&create_loaded(parent, &[], &t.finish().unwrap()));
+    assert_eq!(
+        r.code,
+        rc::TYPE | 0x080 | 0x040 | (2 << 8),
+        "an RSA key was derived: {:#x}",
+        r.code
+    );
+}
+
+#[test]
+fn a_storage_parent_still_creates_an_ordinary_object() {
+    // Clause 12.9.1: "if parentHandle references a Storage Parent, then an
+    // Ordinary Object is created". Telling the two kinds of parent apart must
+    // not have taken the ordinary path away.
+    let h = Harness::started("create-loaded-ordinary");
+
+    let template = storage_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0); // outsideInfo
+    p.u32(0); // creationPCR
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let parent = Reader::new(&r.body).u32().unwrap();
+
+    // The sealed template has sensitiveDataOrigin CLEAR, so the data to seal
+    // comes from the caller.
+    let r = h.send(&create_loaded(parent, b"sealed", &sealed_template()));
+    assert_eq!(r.code, rc::SUCCESS, "CreateLoaded -> {:#x}", r.code);
+    let (_, private, _) = split_created(&r.body);
+    assert!(
+        !private.is_empty(),
+        "an ordinary object is loadable, so outPrivate carries it"
+    );
+}
+

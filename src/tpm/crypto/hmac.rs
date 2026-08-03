@@ -118,19 +118,38 @@ pub fn kdfa(
     context_v: &[u8],
     bits: u32,
 ) -> TpmResult<Vec<u8>> {
+    kdfa_bytes(hash_alg, key, label.as_bytes(), context_u, context_v, bits)
+}
+
+/// KDFa with a label the caller supplies as octets rather than as a string.
+///
+/// Object derivation takes its label from a TPM2B_LABEL the caller sent, which
+/// is any octet string and need not be text. Part 1 clause 11.4.10.2 describes
+/// the label as a null-terminated string, so a label that does not already end
+/// in a zero octet is given one, and one that does is left as it is rather than
+/// being terminated twice.
+pub fn kdfa_bytes(
+    hash_alg: u16,
+    key: &[u8],
+    label: &[u8],
+    context_u: &[u8],
+    context_v: &[u8],
+    bits: u32,
+) -> TpmResult<Vec<u8>> {
     let out_len = output_len(bits)?;
     let digest_len = digest_size(hash_alg)?;
     let mut out = Vec::with_capacity(out_len + digest_len);
     let mut counter: u32 = 0;
     let bits_be = bits.to_be_bytes();
+    let terminator: &[u8] = if label.last() == Some(&0) { &[] } else { &[0u8] };
     while out.len() < out_len {
         counter += 1;
         let mut mac = Hmac::new(hash_alg, key)?;
         mac.update(&counter.to_be_bytes());
-        mac.update(label.as_bytes());
+        mac.update(label);
         // The label is followed by a zero octet, which is part of the label
         // string in the specification even when the label is empty.
-        mac.update(&[0u8]);
+        mac.update(terminator);
         mac.update(context_u);
         mac.update(context_v);
         mac.update(&bits_be);

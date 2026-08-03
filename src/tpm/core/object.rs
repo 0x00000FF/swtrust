@@ -52,11 +52,28 @@ impl Object {
         self.sensitive.is_none()
     }
 
-    /// True when the object may parent other objects.
+    /// True when the object may protect the sensitive area of a child.
     ///
-    /// Part 1 clause 25.2 calls an object with both restricted and decrypt set,
-    /// and a symmetric definition, a Storage Key.
+    /// Part 1 clause 20.2 divides the objects that carry both restricted and
+    /// decrypt into two: "Asymmetric keys and symmetric keys with these
+    /// attributes are Storage Parents, and keyedHash objects with these
+    /// attributes are Derivation Parents." A Derivation Parent protects
+    /// nothing, it only supplies entropy, so it is not one of these.
     pub fn is_storage_key(&self) -> bool {
+        self.is_parent_key() && self.public.object_type != alg::KEYEDHASH
+    }
+
+    /// True when the object derives children rather than protecting them.
+    ///
+    /// The same clause 20.2 sentence names these, and Part 3 clause 12.9.1 says
+    /// that "if parentHandle references a Derivation Parent, then a Derived
+    /// Object is generated".
+    pub fn is_derivation_parent(&self) -> bool {
+        self.is_parent_key() && self.public.object_type == alg::KEYEDHASH
+    }
+
+    /// The attributes Part 1 clause 20.2 calls a Parent Key, on a loaded object.
+    fn is_parent_key(&self) -> bool {
         self.public
             .object_attributes
             .has(ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT)
