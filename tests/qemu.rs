@@ -27,16 +27,30 @@ struct Server {
     dir: std::path::PathBuf,
 }
 
+/// Lowest port the search considers.
+const SEARCH_BASE: u32 = 20000;
+/// How many ports the search may walk.
+const SEARCH_SPAN: u32 = 40000;
+
 /// Find a port such that it and the next one are both free.
+///
+/// Asking the system for any free port and then hoping the one after it is
+/// free as well fails often enough to matter, because the port it hands back
+/// comes from a range it is busy handing out. Instead a wide range is walked
+/// two at a time, from a starting point that depends on the process and the
+/// clock so that two runs at once do not walk the same ground in step.
 fn free_port_pair() -> u16 {
-    for _ in 0..64 {
-        let Ok(a) = TcpListener::bind("127.0.0.1:0") else {
-            continue;
-        };
-        let port = a.local_addr().unwrap().port();
-        if port == u16::MAX {
+    let spread = std::process::id() as u32 ^ swtrust::util::time::unix_millis_now() as u32;
+    let start = spread % SEARCH_SPAN;
+    for step in 0..SEARCH_SPAN / 2 {
+        let port = SEARCH_BASE + (start + step * 2) % SEARCH_SPAN;
+        if port + 1 > u16::MAX as u32 {
             continue;
         }
+        let port = port as u16;
+        let Ok(a) = TcpListener::bind(("127.0.0.1", port)) else {
+            continue;
+        };
         let Ok(b) = TcpListener::bind(("127.0.0.1", port + 1)) else {
             continue;
         };
@@ -44,7 +58,7 @@ fn free_port_pair() -> u16 {
         drop(b);
         return port;
     }
-    panic!("no free port pair");
+    panic!("no free port pair in {SEARCH_BASE}..{}", SEARCH_BASE + SEARCH_SPAN);
 }
 
 /// Connect within a budget, or report that nothing came up in time.
