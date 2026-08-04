@@ -124,8 +124,8 @@ pub fn pcr_read(state: &TpmState, request: &Request) -> TpmResult<Response> {
 /// TPM2_PCR_Allocate, Part 3 clause 22.5.
 pub fn pcr_allocate(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let requested = TpmlPcrSelection::unmarshal(&mut r)?;
-    r.expect_end()?;
+    let requested = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    r.expect_end().map_err(|e| e.with_parameter(1))?;
 
     let mut banks = Vec::new();
     for sel in &requested.items {

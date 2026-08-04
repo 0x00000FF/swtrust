@@ -21,7 +21,13 @@ use super::pcr::PcrBanks;
 use super::session::SessionSlots;
 
 /// Version tag of the saved state layout.
-const STATE_VERSION: u32 = 1;
+///
+/// Version 2 added the platform profile byte after the tag. A version 1 file
+/// was written before the profile existed, which was always the legacy one, so
+/// it is still read rather than being thrown away: a TPM whose state a caller
+/// depends on should not lose it because this build learned a new field.
+const STATE_VERSION: u32 = 2;
+const STATE_VERSION_WITHOUT_PROFILE: u32 = 1;
 
 /// Dictionary attack protection, Part 1 clause 19.8.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,13 +613,21 @@ impl TpmState {
     pub fn load(data: &[u8]) -> TpmResult<TpmState> {
         let mut state = TpmState::manufacture()?;
         let mut r = Reader::new(data);
-        if r.u32()? != STATE_VERSION {
+        let version = r.u32()?;
+        if version != STATE_VERSION && version != STATE_VERSION_WITHOUT_PROFILE {
             return Err(TpmRc(rc::BAD_CONTEXT));
         }
         // A TPM does not change which algorithms it has, so a file from the
         // other profile is refused rather than reinterpreted. Silently loading
         // it would leave keys and PCR banks the running TPM cannot reproduce.
-        if (r.u8()? != 0) != crate::tpm::profile::is_strict() {
+        // A file from before the profile existed was written by a TPM that had
+        // the legacy algorithms, because that is all there was.
+        let written_strict = if version == STATE_VERSION {
+            r.u8()? != 0
+        } else {
+            false
+        };
+        if written_strict != crate::tpm::profile::is_strict() {
             return Err(TpmRc(rc::BAD_CONTEXT));
         }
         state.manufactured = r.u8()? != 0;

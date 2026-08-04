@@ -16,7 +16,7 @@ use std::sync::Arc;
 use swtrust::logging::Logger;
 use swtrust::server::Device;
 use swtrust::tpm::config;
-use swtrust::tpm::constants::{alg, cap, cc, rc, st};
+use swtrust::tpm::constants::{alg, cap, cc, hc, rc, rh, st};
 use swtrust::tpm::device::Tpm;
 
 struct Harness {
@@ -49,6 +49,30 @@ impl Harness {
         buf.extend_from_slice(&code.to_be_bytes());
         buf.extend_from_slice(params);
         self.tpm.execute(0, &buf)
+    }
+
+    /// Send a command whose one handle is authorized with an empty password.
+    fn send_authorized(&self, code: u32, handle: u32, params: &[u8]) -> Vec<u8> {
+        let mut auth = rh::RS_PW.to_be_bytes().to_vec();
+        auth.extend_from_slice(&0u16.to_be_bytes()); // nonce
+        auth.push(0x01); // continueSession
+        auth.extend_from_slice(&0u16.to_be_bytes()); // password
+
+        let mut body = handle.to_be_bytes().to_vec();
+        body.extend_from_slice(&(auth.len() as u32).to_be_bytes());
+        body.extend_from_slice(&auth);
+        body.extend_from_slice(params);
+
+        let mut buf = st::SESSIONS.to_be_bytes().to_vec();
+        buf.extend_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+        buf.extend_from_slice(&code.to_be_bytes());
+        buf.extend_from_slice(&body);
+        self.tpm.execute(0, &buf)
+    }
+
+    /// The same for a command whose handle is a PCR.
+    fn send_pcr(&self, code: u32, index: u32, params: &[u8]) -> Vec<u8> {
+        self.send_authorized(code, hc::PCR_FIRST + index, params)
     }
 
     /// Every algorithm TPM2_GetCapability reports.
@@ -156,4 +180,117 @@ fn an_rsassa_signature_over_sha1_is_available() {
             0x14
         ]
     );
+}
+
+#[test]
+fn a_sha1_bank_can_be_allocated_extended_and_read() {
+    // The tables above say SHA-1 is available; this drives it through the
+    // commands that use a PCR bank, because a bank that can be named and one
+    // that works are not the same claim.
+    let h = Harness::new("bank");
+
+    // TPM2_PCR_Allocate names the banks the TPM comes up with after a reset.
+    let mut body = 2u32.to_be_bytes().to_vec();
+    for a in [alg::SHA1, alg::SHA256] {
+        body.extend_from_slice(&a.to_be_bytes());
+        body.push(3);
+        body.extend_from_slice(&[0xff, 0xff, 0xff]);
+    }
+    let r = h.send_authorized(cc::PCR_Allocate, rh::PLATFORM, &body);
+    assert_eq!(
+        code_of(&r),
+        rc::SUCCESS,
+        "a SHA-1 bank was refused: {:#x}",
+        code_of(&r)
+    );
+
+    // The allocation takes effect at the next reset, so the TPM is restarted.
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(cc::Startup, &[0x00, 0x00]);
+    assert_eq!(code_of(&r), rc::SUCCESS);
+
+    // Extend PCR 11 in the SHA-1 bank, which is what BitLocker reads.
+    let mut body = 1u32.to_be_bytes().to_vec();
+    body.extend_from_slice(&alg::SHA1.to_be_bytes());
+    body.extend_from_slice(&[0xab; 20]);
+    let r = h.send_pcr(cc::PCR_Extend, 11, &body);
+    assert_eq!(
+        code_of(&r),
+        rc::SUCCESS,
+        "a SHA-1 extend was refused: {:#x}",
+        code_of(&r)
+    );
+
+    // Read it back and check the register moved.
+    let mut body = 1u32.to_be_bytes().to_vec();
+    body.extend_from_slice(&alg::SHA1.to_be_bytes());
+    body.push(3);
+    body.extend_from_slice(&[0x00, 0x08, 0x00]);
+    let r = h.send(cc::PCR_Read, &body);
+    assert_eq!(code_of(&r), rc::SUCCESS);
+    // pcrUpdateCounter, the selection echoed back, then the digest list.
+    let digest = &r[r.len() - 20..];
+    assert_ne!(digest, [0u8; 20], "the SHA-1 register did not change");
+}
+
+#[test]
+fn an_object_may_be_named_with_sha1_and_sign_with_it() {
+    // The nameAlg of BitLocker's sealed object is TPM_ALG_SHA1 and the key a
+    // virtual smart card certifies itself with signs RSASSA over SHA-1. Both
+    // go through TPM2_CreatePrimary and TPM2_Sign here rather than through the
+    // encoder alone.
+    let h = Harness::new("sha1-key");
+
+    let mut t = Vec::new();
+    t.extend_from_slice(&0x0001u16.to_be_bytes()); // TPM_ALG_RSA
+    t.extend_from_slice(&alg::SHA1.to_be_bytes()); // nameAlg
+    // fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth | sign
+    t.extend_from_slice(&0x0004_0072u32.to_be_bytes());
+    t.extend_from_slice(&0u16.to_be_bytes()); // authPolicy
+    t.extend_from_slice(&0x0010u16.to_be_bytes()); // symmetric TPM_ALG_NULL
+    t.extend_from_slice(&0x0014u16.to_be_bytes()); // scheme TPM_ALG_RSASSA
+    t.extend_from_slice(&alg::SHA1.to_be_bytes()); // over SHA-1
+    t.extend_from_slice(&2048u16.to_be_bytes());
+    t.extend_from_slice(&0u32.to_be_bytes()); // exponent
+    t.extend_from_slice(&0u16.to_be_bytes()); // unique
+
+    let mut body = 4u16.to_be_bytes().to_vec(); // inSensitive
+    body.extend_from_slice(&0u16.to_be_bytes()); // userAuth
+    body.extend_from_slice(&0u16.to_be_bytes()); // data
+    body.extend_from_slice(&(t.len() as u16).to_be_bytes());
+    body.extend_from_slice(&t);
+    body.extend_from_slice(&0u16.to_be_bytes()); // outsideInfo
+    body.extend_from_slice(&0u32.to_be_bytes()); // creationPCR
+    let r = h.send_authorized(cc::CreatePrimary, rh::OWNER, &body);
+    assert_eq!(
+        code_of(&r),
+        rc::SUCCESS,
+        "a key named with SHA-1 was refused: {:#x}",
+        code_of(&r)
+    );
+    let handle = u32::from_be_bytes([r[10], r[11], r[12], r[13]]);
+    assert_eq!(handle >> 24, 0x80, "a transient handle was expected");
+
+    // Sign a SHA-1 digest with it, which is the path that needed the
+    // DigestInfo prefix.
+    let mut body = 20u16.to_be_bytes().to_vec();
+    body.extend_from_slice(&[0xcd; 20]);
+    body.extend_from_slice(&0x0010u16.to_be_bytes()); // inScheme TPM_ALG_NULL
+    body.extend_from_slice(&0x8024u16.to_be_bytes()); // a null validation ticket
+    body.extend_from_slice(&rh::NULL.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    let r = h.send_authorized(cc::Sign, handle, &body);
+    assert_eq!(
+        code_of(&r),
+        rc::SUCCESS,
+        "an RSASSA signature over SHA-1 was refused: {:#x}",
+        code_of(&r)
+    );
+    // A response to a command with sessions carries parameterSize before the
+    // parameters, so the TPMT_SIGNATURE starts four octets further in: the
+    // algorithm, its hash, then the signature.
+    assert_eq!(u16::from_be_bytes([r[14], r[15]]), 0x0014);
+    assert_eq!(u16::from_be_bytes([r[16], r[17]]), alg::SHA1);
+    assert_eq!(u16::from_be_bytes([r[18], r[19]]), 256);
 }

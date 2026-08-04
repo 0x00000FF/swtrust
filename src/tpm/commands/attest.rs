@@ -15,7 +15,7 @@ use crate::tpm::structures::lists::TpmlPcrSelection;
 use crate::tpm::structures::schemes::Scheme;
 use crate::tpm::structures::signature::TpmtSignature;
 
-use super::crypto::{sign_digest, signing_scheme};
+use super::crypto::{sign_digest, signing_scheme_at};
 use super::dispatch::{Request, Response};
 use super::execute::respond;
 use super::management::clock_info;
@@ -76,7 +76,7 @@ fn attest_and_sign(
     } else {
         let object =
             signing_object(state, sign_handle).map_err(|e| e.with_handle(sign_handle_number))?;
-        let scheme = signing_scheme(&object, in_scheme)?;
+        let scheme = signing_scheme_at(&object, in_scheme, scheme_parameter)?;
         (Some(object), Some(scheme))
     };
 
@@ -237,10 +237,10 @@ pub fn certify_creation(state: &mut TpmState, request: &Request) -> TpmResult<Re
 pub fn quote(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let sign_handle = request.handle(0)?;
     let mut r = request.reader();
-    let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
-    let selection = TpmlPcrSelection::unmarshal(&mut r)?;
-    r.expect_end()?;
+    let qualifying_data = Tpm2bData::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r).map_err(|e| e.with_parameter(2))?;
+    let selection = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+    r.expect_end().map_err(|e| e.with_parameter(3))?;
 
     // The digest uses the nameAlg of the signing key, as clause 18.4.3 says.
     let name_alg = if sign_handle == rh::NULL {

@@ -499,16 +499,30 @@ pub fn event_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRe
 
 /// The signing scheme a command uses: the object's when it has one, otherwise
 /// the caller's.
+///
+/// A scheme the command cannot use is a fault in the parameter that carried it,
+/// and Part 2 clause 6.6.2 wants that parameter named. The commands do not
+/// agree on where inScheme sits, so [`signing_scheme_at`] takes the number and
+/// this is the common case of it being the second parameter.
 pub fn signing_scheme(object: &Object, supplied: &Scheme) -> TpmResult<Scheme> {
+    signing_scheme_at(object, supplied, 2)
+}
+
+/// [`signing_scheme`] for a command whose inScheme is not the second parameter.
+pub fn signing_scheme_at(
+    object: &Object,
+    supplied: &Scheme,
+    scheme_parameter: usize,
+) -> TpmResult<Scheme> {
     let object_scheme = object.public.scheme().copied().unwrap_or_default();
     if object_scheme.is_null() {
         if supplied.is_null() {
-            return Err(TpmRc(rc::SCHEME).with_parameter(2));
+            return Err(TpmRc(rc::SCHEME).with_parameter(scheme_parameter));
         }
         Ok(*supplied)
     } else {
         if !supplied.is_null() && supplied.scheme != object_scheme.scheme {
-            return Err(TpmRc(rc::SCHEME).with_parameter(2));
+            return Err(TpmRc(rc::SCHEME).with_parameter(scheme_parameter));
         }
         // The commit counter is not part of the key. It says which
         // TPM2_Commit this signature completes, so it comes from the caller
@@ -595,7 +609,7 @@ pub fn sign_digest(
                 // carries, and using it here spends it.
                 alg::ECDAA => {
                     let SchemeDetail::Ecdaa(detail) = scheme.detail else {
-                        return Err(TpmRc(rc::SCHEME).with_parameter(2));
+                        return Err(TpmRc(rc::SCHEME));
                     };
                     let order = curve.order()?;
                     let bits = ((order.bits() + 7) / 8 * 8) as u32;

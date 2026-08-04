@@ -671,9 +671,9 @@ pub fn policy_or(state: &mut TpmState, request: &Request) -> TpmResult<Response>
 pub fn policy_pcr(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let expected = Tpm2bDigest::unmarshal(&mut r)?;
-    let selection = TpmlPcrSelection::unmarshal(&mut r)?;
-    r.expect_end()?;
+    let expected = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let selection = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    r.expect_end().map_err(|e| e.with_parameter(2))?;
 
     let auth_hash = policy_session(state, handle)?.auth_hash;
     let filtered = state.pcr.filter_selection(&selection);

@@ -385,6 +385,21 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
         return Err(TpmRc(rc::ATTRIBUTES));
     }
 
+    // Part 3 clause 18.1: "For a restricted signing key, the key's scheme
+    // cannot be TPM_ALG_NULL and cannot be overridden." A restricted key signs
+    // only what the TPM itself produced, and the scheme is part of what the
+    // verifier is told to expect, so leaving it open would let the caller
+    // choose it later and the restriction would say nothing.
+    if sign && attrs.has(ObjectAttributes::RESTRICTED) {
+        let scheme_is_null = public
+            .scheme()
+            .map(|s| s.is_null())
+            .unwrap_or(true);
+        if scheme_is_null {
+            return Err(TpmRc(rc::SCHEME));
+        }
+    }
+
     // The name algorithm must be a hash unless the object cannot be a parent.
     if public.name_alg == alg::NULL
         && attrs.has(ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT)
