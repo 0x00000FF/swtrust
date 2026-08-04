@@ -62,9 +62,12 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     }
 
     // Every handle that carries an authorization is checked in order.
+    // Part 3 clause 5.3 resolves the handle area before the command runs, so a
+    // handle that names nothing is reported from here. Part 2 clause 6.6.2 puts
+    // the handle number in the N field, and this is where the number is known.
     let mut names: Vec<Vec<u8>> = Vec::with_capacity(request.handles.len());
-    for h in &request.handles {
-        names.push(dispatch::handle_name(state, *h)?);
+    for (index, h) in request.handles.iter().enumerate() {
+        names.push(dispatch::handle_name(state, *h).map_err(|e| e.with_handle(index + 1))?);
     }
 
     // Part 3 clause 5.5 checks that the sessions ask for a consistent set of

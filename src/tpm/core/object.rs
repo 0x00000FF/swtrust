@@ -415,13 +415,23 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
     // other cases (TPM_RC_KDF)". Part 1 clause 44.4.1 makes that same field
     // what says the key is a KEM key, so a key that names one without being
     // able to use it describes nothing.
-    if let crate::tpm::structures::keys::PublicParms::Ecc { scheme, kdf, .. } = &public.parameters {
-        if !kdf.is_null()
-            && (attrs.has(ObjectAttributes::RESTRICTED)
-                || !decrypt
-                || scheme.scheme != alg::ECDH)
-        {
-            return Err(TpmRc(rc::KDF));
+    if let crate::tpm::structures::keys::PublicParms::Ecc {
+        scheme,
+        curve_id,
+        kdf,
+        ..
+    } = &public.parameters
+    {
+        if !kdf.is_null() {
+            if attrs.has(ObjectAttributes::RESTRICTED) || !decrypt || scheme.scheme != alg::ECDH {
+                return Err(TpmRc(rc::KDF));
+            }
+            // The field names a KEM, so it has to name one this TPM can run on
+            // this curve. Table 229 answers a KDF the TPM does not support with
+            // TPM_RC_KDF at the point the key is described.
+            if !crate::tpm::crypto::dhkem::is_kem_suite(*curve_id, kdf) {
+                return Err(TpmRc(rc::KDF));
+            }
         }
     }
 

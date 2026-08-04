@@ -879,6 +879,185 @@ fn the_platform_may_remove_a_persistent_object_the_owner_made() {
 }
 
 #[test]
+fn a_reset_invalidates_every_context_and_a_restart_only_the_state_clear_ones() {
+    // Part 1 Equation 52 puts resetValue in front of every context and adds
+    // clearCount only for a saved handle of 80 00 00 02. resetValue "increments
+    // on each TPM Reset", clearCount "is incremented on each TPM Restart", and
+    // Part 2 clause 8.3.3.3 says a saved context of an object without stClear
+    // survives when "the TPM received TPM2_Shutdown(TPM_SU_STATE)".
+    let h = Harness::started("resetvalue");
+    let plain = ask_for_ecc_key(&h, 0x0004_0072, alg::ECDSA, None);
+    assert_eq!(plain.code, rc::SUCCESS);
+    let plain = u32::from_be_bytes([plain.body[0], plain.body[1], plain.body[2], plain.body[3]]);
+    let stc = ask_for_ecc_key(&h, 0x0004_0076, alg::ECDSA, None);
+    assert_eq!(stc.code, rc::SUCCESS);
+    let stc = u32::from_be_bytes([stc.body[0], stc.body[1], stc.body[2], stc.body[3]]);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[plain], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let plain_context = r.body.clone();
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[stc], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let stc_context = r.body.clone();
+
+    // A TPM Restart: Shutdown(STATE) then Startup(CLEAR).
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &plain_context));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a restart invalidated an ordinary context -> {:08x}",
+        r.code
+    );
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &stc_context));
+    assert_ne!(
+        r.code,
+        rc::SUCCESS,
+        "a stateClear context survived a restart"
+    );
+
+    // A TPM Reset takes the other one with it.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &plain_context));
+    assert_ne!(
+        r.code,
+        rc::SUCCESS,
+        "an ordinary context survived a reset"
+    );
+}
+
+#[test]
+fn a_child_of_a_state_clear_parent_carries_the_property() {
+    // Part 1 clause 30.4.2: "an Object has the stateClear property when stClear
+    // is SET in the Object or in any of its ancestor keys." The child below
+    // does not say stClear itself, so only inheritance can give it the
+    // property, and TPM2_EvictControl is where that shows.
+    let h = Harness::started("inherit");
+    // A storage key with stClear, to be the parent. A storage key names a
+    // symmetric algorithm, which is what makes it able to protect a child.
+    let mut t = Writer::new();
+    t.u16(alg::ECC);
+    t.u16(alg::SHA256);
+    t.u32(0x0003_0076); // fixedTPM fixedParent sensitiveDataOrigin userWithAuth
+                        // restricted decrypt, with stClear
+    t.u16(0); // authPolicy
+    t.u16(alg::AES);
+    t.u16(128);
+    t.u16(alg::CFB);
+    t.u16(alg::NULL); // scheme
+    t.u16(swtrust::tpm::constants::curve::NIST_P256);
+    t.u16(alg::NULL); // kdf
+    t.u16(0);
+    t.u16(0);
+    let template = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "the parent -> {:08x}", r.code);
+    let parent = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    // TPM2_CreateLoaded makes the child under it in one step.
+    let mut t = Writer::new();
+    t.u16(alg::ECC);
+    t.u16(alg::SHA256);
+    t.u32(0x0004_0072); // fixedTPM fixedParent userWithAuth sign, no stClear
+    t.u16(0); // authPolicy
+    t.u16(alg::NULL); // symmetric
+    t.u16(alg::ECDSA);
+    t.u16(alg::SHA256);
+    t.u16(swtrust::tpm::constants::curve::NIST_P256);
+    t.u16(alg::NULL); // kdf
+    t.u16(0);
+    t.u16(0);
+    let template = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(4); // inSensitive
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreateLoaded,
+        &[parent],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreateLoaded -> {:08x}", r.code);
+    let child = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    // Part 3 clause 28.5.1 rule 1.2 refuses an object when stClear is set "in
+    // the object or in an ancestor key".
+    let mut p = Writer::new();
+    p.u32(0x8100_0040);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::EvictControl,
+        &[rh::OWNER, child],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::ATTRIBUTES | (2 << 8),
+        "the child did not inherit stateClear -> {:08x}",
+        r.code
+    );
+
+    // Its saved context says so too.
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[child], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let saved_handle =
+        u32::from_be_bytes([r.body[8], r.body[9], r.body[10], r.body[11]]);
+    assert_eq!(
+        saved_handle, 0x8000_0002,
+        "the context does not say stateClear"
+    );
+}
+
+#[test]
+fn a_kem_key_names_the_hash_its_curve_is_registered_with() {
+    // Part 2 Table 229 makes the KEM "equivalent to DHKEM(curveID, kdf) from
+    // RFC 9180", which registers one hash per curve, and answers a KDF the TPM
+    // does not support with TPM_RC_KDF where the key is described.
+    let h = Harness::started("kemsuite");
+    let r = ask_for_ecc_key(&h, 0x0002_0072, alg::ECDH, Some(alg::SHA384));
+    assert_eq!(
+        r.code,
+        rc::KDF | 0x040 | (2 << 8),
+        "P-256 took SHA-384 -> {:08x}",
+        r.code
+    );
+    let r = ask_for_ecc_key(&h, 0x0002_0072, alg::ECDH, Some(alg::SHA256));
+    assert_eq!(r.code, rc::SUCCESS, "P-256 with SHA-256 -> {:08x}", r.code);
+}
+
+#[test]
 fn ecc_parameters_describe_p256() {
     let h = Harness::started("eccparms");
     let mut p = Writer::new();

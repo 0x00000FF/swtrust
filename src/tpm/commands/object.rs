@@ -452,6 +452,8 @@ pub fn create(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 
 /// What deriving a child from a Derivation Parent needs.
 struct DerivationParent {
+    /// The stateClear property of Part 1 clause 30.4.2, which a child inherits.
+    state_clear: bool,
     /// The hash of the parent's KDF, Part 1 clause 25.2.
     hash_alg: u16,
     /// The parent's sensitive value, which is the entropy of the child.
@@ -504,6 +506,7 @@ fn derivation_parent_of(object: &Object) -> TpmResult<DerivationParent> {
     };
 
     Ok(DerivationParent {
+        state_clear: object.state_clear,
         hash_alg,
         sensitive,
         hierarchy: object.hierarchy,
@@ -562,13 +565,16 @@ fn derive_object(
 
     let mut public = template;
     public.unique = unique;
-    let object = Object::new(
+    let mut object = Object::new(
         public.clone(),
         Some(sensitive),
         parent.hierarchy,
         &parent.qualified_name,
         true,
     )?;
+    // Part 1 clause 30.4.2: the property comes from the object or from any of
+    // its ancestors, and the parent carries what its own ancestors gave it.
+    object.state_clear |= parent.state_clear;
     let name = object.name.clone();
     let handle = state.objects.insert(Slot::Object(Box::new(object)))?;
     let _ = parent_handle;
@@ -853,13 +859,14 @@ pub fn create_loaded(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         &object_name,
         &sensitive.to_bytes(),
     )?;
-    let object = Object::new(
+    let mut object = Object::new(
         public.clone(),
         Some(sensitive),
         parent.hierarchy,
         &parent.qualified_name,
         true,
     )?;
+    object.state_clear |= parent.state_clear;
     let name = object.name.clone();
     let handle = state.objects.insert(Slot::Object(Box::new(object)))?;
     respond_with_handle(handle, move |w| {

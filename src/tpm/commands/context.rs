@@ -44,19 +44,21 @@ fn context_keys(state: &TpmState, hierarchy: u32, sequence: u64) -> TpmResult<(V
 }
 
 /// Encrypt and authenticate a marshalled context.
-/// What the integrity value of a context covers beyond the blob itself.
+/// The values Part 1 Equation 52 puts in front of the context.
 ///
-/// Part 1 clause 30.4.2 says "objects that have the stateClear property are
-/// invalidated by Startup(CLEAR). To enforce this, the TPM will include
-/// clearCount in the integrity value of the Object." The count advances on
-/// every Startup(CLEAR), so a context that carries it stops verifying once one
-/// has happened, which is what invalidates it.
-fn clear_count(state: &TpmState, saved_handle: u32) -> u32 {
+///   data := resetValue {||clearCount} || sequence || handle || encContext
+///
+/// resetValue "increments on each TPM Reset and is not reset over the lifetime
+/// of the TPM", which is what invalidates every saved context on a Reset.
+/// clearCount "is incremented on each TPM Restart" and "is only included if the
+/// handle value is 80 00 00 02", which is the value a saved object carries when
+/// it has the stateClear property.
+fn context_counters(state: &TpmState, saved_handle: u32) -> Vec<u8> {
+    let mut out = state.clock.total_reset_count.to_be_bytes().to_vec();
     if saved_handle == saved::TRANSIENT_STCLEAR {
-        state.clock.reset_count
-    } else {
-        0
+        out.extend_from_slice(&state.clock.clear_count.to_be_bytes());
     }
+    out
 }
 
 fn seal_context(
@@ -69,17 +71,17 @@ fn seal_context(
     let (sym_key, hmac_key) = context_keys(state, hierarchy, sequence)?;
     let iv = vec![0u8; sym::block_size(config::CONTEXT_ENCRYPT_ALG)?];
     let encrypted = sym::cfb_encrypt(&sym_key, &iv, body)?;
-    // The integrity value covers the encrypted blob and the values that name
-    // the context, so a context cannot be replayed under a different handle.
+    // The hierarchy is not among them: Equation 52 takes hProof "as selected by
+    // the hierarchy parameter of the TPMS_CONTEXT" as the HMAC key, so the
+    // hierarchy is already what the key is.
     let integrity = mac::hmac_parts(
         config::CONTEXT_INTEGRITY_HASH_ALG,
         &hmac_key,
         &[
-            &encrypted,
+            &context_counters(state, saved_handle),
             &sequence.to_be_bytes(),
             &saved_handle.to_be_bytes(),
-            &hierarchy.to_be_bytes(),
-            &clear_count(state, saved_handle).to_be_bytes(),
+            &encrypted,
         ],
     )?;
     let data = ContextData {
@@ -98,11 +100,10 @@ fn open_context(state: &TpmState, context: &Context) -> TpmResult<Vec<u8>> {
         config::CONTEXT_INTEGRITY_HASH_ALG,
         &hmac_key,
         &[
-            data.encrypted.as_slice(),
+            &context_counters(state, context.saved_handle),
             &context.sequence.to_be_bytes(),
             &context.saved_handle.to_be_bytes(),
-            &context.hierarchy.to_be_bytes(),
-            &clear_count(state, context.saved_handle).to_be_bytes(),
+            data.encrypted.as_slice(),
         ],
     )?;
     if !crate::tpm::core::protect::constant_time_eq(&expected, data.integrity.as_slice()) {
@@ -424,6 +425,7 @@ pub fn evict_control(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         .object(object_handle)
         .map_err(|e| e.with_handle(2))?
         .clone();
+
     // Part 3 clause 28.5.1 lists what a transient object may not be: it may not
     // be "in the hierarchy of TPM_RH_NULL or a firmware-limited or SVN-limited
     // hierarchy", and stClear may not be set in it or in an ancestor. The

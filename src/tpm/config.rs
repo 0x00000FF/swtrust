@@ -311,6 +311,7 @@ const ALGORITHMS_LEGACY: &[u16] = &[
     alg::ECDH,
     alg::ECDAA,
     alg::ECSCHNORR,
+    alg::HKDF,
     alg::KDF1_SP800_56A,
     alg::KDF2,
     alg::KDF1_SP800_108,

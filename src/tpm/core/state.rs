@@ -27,11 +27,15 @@ use super::session::SessionSlots;
 /// it is still read rather than being thrown away: a TPM whose state a caller
 /// depends on should not lose it because this build learned a new field.
 ///
+/// Version 3 added the clearCount of Part 1 Equation 52 to the clock.
+///
 /// One build wrote the profile byte while still tagging the record version 1.
 /// It was never released, so version 1 means the layout that came before the
 /// byte and nothing else. A file of the other shape can only have been written
 /// by a developer running that build, and is not one this reads.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
+/// Version 2 recorded the profile but not the clearCount of Part 1 Equation 52.
+const STATE_VERSION_WITHOUT_CLEAR_COUNT: u32 = 2;
 const STATE_VERSION_WITHOUT_PROFILE: u32 = 1;
 
 /// Dictionary attack protection, Part 1 clause 19.8.
@@ -99,6 +103,13 @@ pub struct ClockState {
     pub reset_count: u32,
     /// TPM Restarts and Resumes since the last TPM Reset.
     pub restart_count: u32,
+    /// The clearCount of Part 1 Equation 52: "a counter value that is
+    /// incremented on each TPM Restart and may be incremented or set to zero on
+    /// TPM Reset". It is its own counter because restartCount also advances on
+    /// a TPM Resume, and Part 2 clause 8.3.3.3 says a saved context of an
+    /// stClear object is invalidated on TPM2_Startup(TPM_SU_CLEAR) rather than
+    /// on a resume.
+    pub clear_count: u32,
     /// False when Clock may have gone backwards.
     pub safe: bool,
     /// Resets over the life of the TPM, which never clears.
@@ -123,6 +134,7 @@ impl Marshal for ClockState {
         w.u64(self.clock);
         w.u32(self.reset_count);
         w.u32(self.restart_count);
+        w.u32(self.clear_count);
         w.u8(u8::from(self.safe));
         w.u32(self.total_reset_count);
         w.u64(self.time_epoch);
@@ -131,11 +143,26 @@ impl Marshal for ClockState {
 
 impl Unmarshal for ClockState {
     fn unmarshal(r: &mut Reader<'_>) -> TpmResult<Self> {
+        ClockState::read(r, true)
+    }
+}
+
+impl ClockState {
+    /// Read the counters, with `has_clear_count` false for a record written
+    /// before that one was kept. A file from then names contexts that this
+    /// build would no longer verify anyway, so starting the counter at zero
+    /// loses nothing a caller had.
+    fn read(r: &mut Reader<'_>, has_clear_count: bool) -> TpmResult<ClockState> {
+        let clock = r.u64()?;
+        let reset_count = r.u32()?;
+        let restart_count = r.u32()?;
+        let clear_count = if has_clear_count { r.u32()? } else { 0 };
         Ok(ClockState {
-            clock: r.u64()?,
+            clock,
             time: 0,
-            reset_count: r.u32()?,
-            restart_count: r.u32()?,
+            reset_count,
+            restart_count,
+            clear_count,
             safe: r.u8()? != 0,
             total_reset_count: r.u32()?,
             time_epoch: r.u64()?,
@@ -331,6 +358,7 @@ impl TpmState {
         self.objects.clear();
         self.sessions.clear();
         self.nv.on_startup_clear_with(disorderly);
+        self.clock.clear_count = self.clock.clear_count.wrapping_add(1);
         if restart {
             self.clock.restart_count = self.clock.restart_count.wrapping_add(1);
         } else {
@@ -619,7 +647,10 @@ impl TpmState {
         let mut state = TpmState::manufacture()?;
         let mut r = Reader::new(data);
         let version = r.u32()?;
-        if version != STATE_VERSION && version != STATE_VERSION_WITHOUT_PROFILE {
+        if !matches!(
+            version,
+            STATE_VERSION | STATE_VERSION_WITHOUT_CLEAR_COUNT | STATE_VERSION_WITHOUT_PROFILE
+        ) {
             return Err(TpmRc(rc::BAD_CONTEXT));
         }
         // A TPM does not change which algorithms it has, so a file from the
@@ -627,7 +658,7 @@ impl TpmState {
         // it would leave keys and PCR banks the running TPM cannot reproduce.
         // A file from before the profile existed was written by a TPM that had
         // the legacy algorithms, because that is all there was.
-        let written_strict = if version == STATE_VERSION {
+        let written_strict = if version != STATE_VERSION_WITHOUT_PROFILE {
             // Only zero and one are profiles. Taking anything else as strict
             // would accept a file whose remaining fields cannot be trusted.
             match r.u8()? {
@@ -665,7 +696,7 @@ impl TpmState {
 
         state.lockout = LockoutState::unmarshal(&mut r)?;
         state.permanent = PermanentAttributes::unmarshal(&mut r)?;
-        state.clock = ClockState::unmarshal(&mut r)?;
+        state.clock = ClockState::read(&mut r, version == STATE_VERSION)?;
         state.algorithm_set = r.u32()?;
         state.lockout_auth = read_sized(&mut r)?;
         state.lockout_policy = TpmtHa::unmarshal(&mut r)?;

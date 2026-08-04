@@ -856,7 +856,9 @@ pub fn encapsulate(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     // TPM does not verify the objectAttributes of the key". Part 1 clause
     // 44.4.1 says which ECC keys those are: one "can be used as a Key
     // Encapsulation Mechanism (KEM) key" if its kdf is not TPM_ALG_NULL.
-    let hash_alg = dhkem::kem_hash(kdf).map_err(|_| TpmRc(rc::KEY).with_handle(1))?;
+    if !dhkem::is_kem_suite(*curve_id, kdf) {
+        return Err(TpmRc(rc::KEY).with_handle(1));
+    }
 
     // Part 1 clause 44.4.2 walks the DHKEM Encaps function of RFC 9180.
     let ephemeral = ecc::generate(*curve_id, &mut state.rng)?;
@@ -870,7 +872,7 @@ pub fn encapsulate(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     let pk_r = dhkem::serialize_point(*curve_id, point.x.as_slice(), point.y.as_slice())?;
     let mut kem_context = pk_e.clone();
     kem_context.extend_from_slice(&pk_r);
-    let secret = dhkem::extract_and_expand(hash_alg, *curve_id, &dh, &kem_context)?;
+    let secret = dhkem::extract_and_expand(*curve_id, &dh, &kem_context)?;
 
     respond(move |w| {
         Tpm2bSharedSecret::new(secret)?.marshal(w);
@@ -920,7 +922,9 @@ pub fn decapsulate(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let PublicId::Ecc(point) = &object.public.unique else {
         return Err(TpmRc(rc::TYPE));
     };
-    let hash_alg = dhkem::kem_hash(kdf).map_err(|_| TpmRc(rc::KEY).with_handle(1))?;
+    if !dhkem::is_kem_suite(*curve_id, kdf) {
+        return Err(TpmRc(rc::KEY).with_handle(1));
+    }
 
     // Part 1 clause 44.4.3: the ciphertext is pkE_serialized, so it is read
     // back the way clause 44.4.2 item 3 wrote it.
@@ -932,7 +936,7 @@ pub fn decapsulate(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let pk_r = dhkem::serialize_point(*curve_id, point.x.as_slice(), point.y.as_slice())?;
     let mut kem_context = ciphertext.clone();
     kem_context.extend_from_slice(&pk_r);
-    let secret = dhkem::extract_and_expand(hash_alg, *curve_id, &dh, &kem_context)?;
+    let secret = dhkem::extract_and_expand(*curve_id, &dh, &kem_context)?;
     respond(move |w| {
         Tpm2bSharedSecret::new(secret)?.marshal(w);
         Ok(())

@@ -14,16 +14,35 @@ use crate::tpm::error::{TpmRc, TpmResult};
 /// RFC 9180 clause 5.1 prefixes every label with the version of the suite.
 const VERSION: &[u8] = b"HPKE-v1";
 
-/// What RFC 9180 clause 7.1 registers for the curve, as (kem_id, Nsecret).
+/// What RFC 9180 clause 7.1 registers for the curve, as (kem_id, hash,
+/// Nsecret).
 ///
-/// Nsecret is the length of the shared secret the KEM produces, which clause
-/// 4.1 fixes for the KEM rather than taking from the KDF.
-fn suite(curve_id: u16) -> TpmResult<(u16, usize)> {
+/// Part 2 Table 229 says the KEM "is equivalent to DHKEM(curveID, kdf) from
+/// RFC 9180", and RFC 9180 registers one identifier per pair of curve and
+/// hash: DHKEM(P-256, HKDF-SHA256) is 0x0010, DHKEM(P-384, HKDF-SHA384) is
+/// 0x0011 and DHKEM(P-521, HKDF-SHA512) is 0x0012. A curve is therefore not
+/// enough to name a suite, and a curve with the wrong hash names none: the
+/// identifier that goes into the derivation would say a hash the key does not
+/// use. Nsecret comes from the same registry rather than from the hash.
+fn suite(curve_id: u16) -> TpmResult<(u16, u16, usize)> {
     match curve_id {
-        curve::NIST_P256 => Ok((0x0010, 32)),
-        curve::NIST_P384 => Ok((0x0011, 48)),
-        curve::NIST_P521 => Ok((0x0012, 64)),
-        _ => Err(TpmRc(rc::CURVE)),
+        curve::NIST_P256 => Ok((0x0010, alg::SHA256, 32)),
+        curve::NIST_P384 => Ok((0x0011, alg::SHA384, 48)),
+        curve::NIST_P521 => Ok((0x0012, alg::SHA512, 64)),
+        _ => Err(TpmRc(rc::KDF)),
+    }
+}
+
+/// True when a kdf describes a KEM the TPM can run on this curve.
+///
+/// Part 2 Table 229 says of the kdf field that "in the context of object
+/// creation, TPM2_LoadExternal(), or TPM2_TestParms(), TPM_RC_KDF indicates the
+/// TPM does not support the requested KDF", so a key that could never
+/// encapsulate is refused when it is described rather than when it is used.
+pub fn is_kem_suite(curve_id: u16, kdf: &crate::tpm::structures::schemes::Scheme) -> bool {
+    match (suite(curve_id), kem_hash(kdf)) {
+        (Ok((_, hash, _)), Ok(chosen)) => hash == chosen,
+        _ => false,
     }
 }
 
@@ -135,13 +154,8 @@ pub fn deserialize_point(curve_id: u16, serialized: &[u8]) -> TpmResult<(Vec<u8>
 /// Part 1 clause 44.4.2 item 5 and clause 44.4.3 item 4 both name this function
 /// and give it the same two inputs, so encapsulation and decapsulation reach
 /// the same secret from the two sides of the same Diffie-Hellman.
-pub fn extract_and_expand(
-    hash_alg: u16,
-    curve_id: u16,
-    dh: &[u8],
-    kem_context: &[u8],
-) -> TpmResult<Vec<u8>> {
-    let (kem_id, n_secret) = suite(curve_id)?;
+pub fn extract_and_expand(curve_id: u16, dh: &[u8], kem_context: &[u8]) -> TpmResult<Vec<u8>> {
+    let (kem_id, hash_alg, n_secret) = suite(curve_id)?;
     let suite = suite_id(kem_id);
     let prk = labeled_extract(hash_alg, &suite, &[], b"eae_prk", dh)?;
     labeled_expand(
@@ -291,23 +305,54 @@ mod tests {
         let expected = hmac::hmac(alg::SHA256, &prk, &block).unwrap();
 
         assert_eq!(
-            extract_and_expand(alg::SHA256, curve::NIST_P256, &dh, &kem_context).unwrap(),
+            extract_and_expand(curve::NIST_P256, &dh, &kem_context).unwrap(),
             expected
         );
     }
 
     #[test]
-    fn each_curve_carries_its_own_registered_suite() {
+    fn a_suite_is_a_curve_and_the_hash_registered_with_it() {
         // RFC 9180 clause 7.1 registers one identifier and one secret length
         // per curve, so two curves cannot reach the same secret from the same
         // inputs.
         let dh = vec![0x11u8; 32];
         let context = vec![0x22u8; 10];
-        let p256 = extract_and_expand(alg::SHA256, curve::NIST_P256, &dh, &context).unwrap();
-        let p384 = extract_and_expand(alg::SHA256, curve::NIST_P384, &dh, &context).unwrap();
+        let p256 = extract_and_expand(curve::NIST_P256, &dh, &context).unwrap();
+        let p384 = extract_and_expand(curve::NIST_P384, &dh, &context).unwrap();
         assert_eq!(p256.len(), 32);
         assert_eq!(p384.len(), 48);
         assert_ne!(p256[..], p384[..32]);
+        // A curve with no registered suite is not one this TPM encapsulates
+        // with, and Part 2 Table 229 answers a KDF the TPM does not support
+        // with TPM_RC_KDF.
+        assert_eq!(
+            extract_and_expand(curve::NIST_P224, &dh, &context).unwrap_err(),
+            TpmRc(rc::KDF)
+        );
+
+        // The hash is not the caller's to pick: RFC 9180 registers one per
+        // curve, and the identifier that goes into the derivation names it.
+        use crate::tpm::structures::schemes::Scheme;
+        assert!(is_kem_suite(
+            curve::NIST_P256,
+            &Scheme::hash(alg::HKDF, alg::SHA256)
+        ));
+        assert!(!is_kem_suite(
+            curve::NIST_P384,
+            &Scheme::hash(alg::HKDF, alg::SHA256)
+        ));
+        assert!(is_kem_suite(
+            curve::NIST_P384,
+            &Scheme::hash(alg::HKDF, alg::SHA384)
+        ));
+        assert!(!is_kem_suite(
+            curve::NIST_P224,
+            &Scheme::hash(alg::HKDF, alg::SHA256)
+        ));
+        assert!(!is_kem_suite(
+            curve::NIST_P256,
+            &Scheme::hash(alg::KDF1_SP800_56A, alg::SHA256)
+        ));
     }
 
     #[test]
