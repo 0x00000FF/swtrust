@@ -74,8 +74,12 @@ pub fn pcr_event(state: &mut TpmState, request: &Request) -> TpmResult<Response>
 /// TPM2_PCR_Read, Part 3 clause 22.4.
 pub fn pcr_read(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let requested = TpmlPcrSelection::unmarshal(&mut r)?;
-    r.expect_end()?;
+    // Part 2 clause 6.6.2 puts the parameter number in the N field of a
+    // response code that belongs to a parameter, and the selection is the only
+    // parameter this command has. A hash the TPM does not implement is refused
+    // while the selection is being read, so the error comes from here.
+    let requested = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    r.expect_end().map_err(|e| e.with_parameter(1))?;
 
     // Part 3 clause 22.4.3 returns as many values as fit in one response and
     // reports which ones those were.

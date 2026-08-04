@@ -126,12 +126,18 @@ pub fn "),
                 if !body.contains("request.reader()") {
                     continue;
                 }
-                match body.find("r.expect_end()?;") {
+                // The call is what matters, not how its error is decorated: a
+                // command may qualify the failure with a parameter number.
+                match body.find("r.expect_end()") {
                     None => problems.push(format!("{file}::{name} never checks")),
                     Some(at) => {
                         // No parameter may be read after the check, or the
                         // check would pass while octets are still unread.
-                        let after = &body[at + "r.expect_end()?;".len()..];
+                        let statement_end = body[at..]
+                            .find(';')
+                            .map(|i| at + i + 1)
+                            .unwrap_or(body.len());
+                        let after = &body[statement_end..];
                         if reads_from_r(after) {
                             problems.push(format!("{file}::{name} checks too early"));
                         }

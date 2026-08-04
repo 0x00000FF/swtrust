@@ -491,6 +491,10 @@ impl TpmState {
     pub fn save(&self) -> TpmResult<Vec<u8>> {
         let mut w = Writer::new();
         w.u32(STATE_VERSION);
+        // Which profile made this state. The algorithm set decides what PCR
+        // banks exist and what keys and Names could have been made, so a file
+        // written by one profile does not describe a TPM running the other.
+        w.u8(u8::from(crate::tpm::profile::is_strict()));
         w.u8(u8::from(self.manufactured));
 
         for h in [
@@ -604,6 +608,12 @@ impl TpmState {
         let mut state = TpmState::manufacture()?;
         let mut r = Reader::new(data);
         if r.u32()? != STATE_VERSION {
+            return Err(TpmRc(rc::BAD_CONTEXT));
+        }
+        // A TPM does not change which algorithms it has, so a file from the
+        // other profile is refused rather than reinterpreted. Silently loading
+        // it would leave keys and PCR banks the running TPM cannot reproduce.
+        if (r.u8()? != 0) != crate::tpm::profile::is_strict() {
             return Err(TpmRc(rc::BAD_CONTEXT));
         }
         state.manufactured = r.u8()? != 0;

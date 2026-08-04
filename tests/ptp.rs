@@ -220,6 +220,22 @@ fn no_algorithm_the_profile_forbids_is_supported() {
     body.extend_from_slice(&0x4000_0007u32.to_be_bytes());
     let r = h.send(cc::Hash, &body);
     assert_ne!(code_of(&r), rc::SUCCESS, "TPM2_Hash accepted SHA-1");
+
+    // Part 2 clause 6.6.2: "When an error is associated with a parameter,
+    // TPM_RC_P ... is added and N is set to the parameter number." Refusing an
+    // algorithm while a parameter is being read is such an error, so the
+    // selection TPM2_PCR_Read was given is named.
+    let mut body = 1u32.to_be_bytes().to_vec();
+    body.extend_from_slice(&alg::SHA1.to_be_bytes());
+    body.push(3);
+    body.extend_from_slice(&[0x00, 0x08, 0x00]);
+    let r = h.send(cc::PCR_Read, &body);
+    assert_eq!(
+        code_of(&r),
+        rc::HASH | 0x080 | 0x040 | (1 << 8),
+        "a selection naming SHA-1 was refused without saying which parameter: {:#x}",
+        code_of(&r)
+    );
 }
 
 /// Clause 4.3 Table 3: the algorithms marked Mandatory (M) that this TPM

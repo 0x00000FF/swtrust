@@ -83,11 +83,16 @@ pub fn run(config: Config) -> io::Result<()> {
     // The profile decides which algorithms exist, so it is fixed before the TPM
     // is built and before any state is read: a manufactured TPM allocates PCR
     // banks from the set the profile allows.
-    crate::tpm::profile::set(if config.ptp {
+    let wanted = if config.ptp {
         crate::tpm::profile::Profile::Strict
     } else {
         crate::tpm::profile::Profile::Legacy
-    });
+    };
+    if crate::tpm::profile::set(wanted) != wanted {
+        return Err(io::Error::other(
+            "the platform profile was already chosen in this process",
+        ));
+    }
 
     let logger = Arc::new(Logger::new(&config.log_dir, config.verbose)?);
     let tpm = Arc::new(Tpm::new(&config.state_dir, logger.clone())?);

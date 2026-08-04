@@ -29,28 +29,42 @@ pub enum Profile {
     Strict,
 }
 
-const LEGACY: u8 = 0;
-const STRICT: u8 = 1;
+const UNSET: u8 = 0;
+const LEGACY: u8 = 1;
+const STRICT: u8 = 2;
 
-static CURRENT: AtomicU8 = AtomicU8::new(LEGACY);
+static CURRENT: AtomicU8 = AtomicU8::new(UNSET);
 
-/// Choose the profile. Call once, before the TPM accepts a command.
-pub fn set(profile: Profile) {
-    CURRENT.store(
-        match profile {
-            Profile::Legacy => LEGACY,
-            Profile::Strict => STRICT,
-        },
-        Ordering::SeqCst,
-    );
+/// Choose the profile. The first call decides; later ones are ignored.
+///
+/// It cannot be a value that changes while the TPM runs. The algorithm set is
+/// what a caller builds keys and PCR banks on, so moving it underneath one
+/// would invalidate what it already holds, and nothing in the specification
+/// lets a TPM stop implementing an algorithm it has been reporting.
+///
+/// Returns the profile in force, which is the one asked for unless the choice
+/// had already been made.
+pub fn set(profile: Profile) -> Profile {
+    let wanted = match profile {
+        Profile::Legacy => LEGACY,
+        Profile::Strict => STRICT,
+    };
+    match CURRENT.compare_exchange(UNSET, wanted, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => profile,
+        Err(existing) => decode(existing),
+    }
 }
 
-/// The profile in force.
-pub fn current() -> Profile {
-    match CURRENT.load(Ordering::SeqCst) {
+fn decode(value: u8) -> Profile {
+    match value {
         STRICT => Profile::Strict,
         _ => Profile::Legacy,
     }
+}
+
+/// The profile in force, which is the legacy one until a choice is made.
+pub fn current() -> Profile {
+    decode(CURRENT.load(Ordering::SeqCst))
 }
 
 /// True when the profile is followed as written, so SHA-1 is absent.
@@ -68,5 +82,16 @@ mod tests {
         // a caller gets when the daemon is started without `--ptp`.
         assert_eq!(current(), Profile::Legacy);
         assert!(!is_strict());
+    }
+
+    #[test]
+    fn the_first_choice_is_the_one_that_stands() {
+        // The unit tests share a process, so this one settles the value for all
+        // of them. It asks for the default, which is what they already see.
+        assert_eq!(set(Profile::Legacy), Profile::Legacy);
+        // A later call cannot move it, and says so by returning what is really
+        // in force rather than what it was asked for.
+        assert_eq!(set(Profile::Strict), Profile::Legacy);
+        assert_eq!(current(), Profile::Legacy);
     }
 }
