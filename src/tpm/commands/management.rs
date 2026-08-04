@@ -28,7 +28,7 @@ use super::table;
 /// TPM2_Startup, Part 3 clause 9.3.
 pub fn startup(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let startup_type = r.u16()?;
+    let startup_type = r.u16().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     // PC Client Platform TPM Profile 1.07 clause 5.3.2 item 1: "The TPM2_Startup
     // command SHALL come from Locality 0 or 3, else a TPM SHALL return
@@ -57,7 +57,7 @@ pub fn startup(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 /// TPM2_Shutdown, Part 3 clause 9.4.
 pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let shutdown_type = r.u16()?;
+    let shutdown_type = r.u16().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     match shutdown_type {
         su::CLEAR | su::STATE => {
@@ -99,7 +99,7 @@ pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
 /// cryptographic output is produced.
 pub fn self_test(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let full_test = r.u8()?;
+    let full_test = r.u8().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     // Part 2 Table 48 makes TPMI_YES_NO a choice of exactly NO and YES, and
     // gives TPM_RC_VALUE for anything else.
@@ -148,7 +148,7 @@ pub fn run_self_tests(state: &mut TpmState) -> TpmResult<()> {
 /// for an algorithm this TPM does not cover.
 pub fn incremental_self_test(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let to_test = TpmlAlg::unmarshal(&mut r)?;
+    let to_test = TpmlAlg::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     for a in &to_test.items {
         if !config::implemented_algorithms().contains(a) {
@@ -192,7 +192,7 @@ pub fn get_test_result(state: &TpmState, _request: &Request) -> TpmResult<Respon
 /// TPM2_GetRandom, Part 3 clause 16.1.
 pub fn get_random(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let requested = r.u16()? as usize;
+    let requested = r.u16().map_err(|e| e.with_parameter(1))? as usize;
     r.expect_end()?;
     // Part 3 clause 16.1.3 caps the answer at the size of the largest digest.
     let size = requested.min(crate::tpm::structures::base::MAX_DIGEST_SIZE);
@@ -206,7 +206,7 @@ pub fn get_random(state: &mut TpmState, request: &Request) -> TpmResult<Response
 /// TPM2_StirRandom, Part 3 clause 16.2.
 pub fn stir_random(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let data = Tpm2bDigest::unmarshal(&mut r)?;
+    let data = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     if data.len() > config::MAX_RNG_ENTROPY_SIZE {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
@@ -239,7 +239,7 @@ pub fn clock_info(state: &TpmState) -> crate::tpm::structures::attest::ClockInfo
 /// TPM2_ClockSet, Part 3 clause 36.2.
 pub fn clock_set(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let new_time = r.u64()?;
+    let new_time = r.u64().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     // Part 3 clause 29.2.1: "The command will fail if newTime is less than the
     // current value of Clock or if the new time is greater than
@@ -290,7 +290,7 @@ pub fn test_parms(_state: &TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     // Unmarshalling already applies every interface type check, so a structure
     // that parses is one the TPM supports.
-    let _parms = PublicParmsTagged::unmarshal(&mut r)?;
+    let _parms = PublicParmsTagged::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     respond(|_| Ok(()))
 }
@@ -300,7 +300,7 @@ pub fn ecc_parameters(_state: &TpmState, request: &Request) -> TpmResult<Respons
     use crate::tpm::structures::base::Tpm2bEccParameter;
 
     let mut r = request.reader();
-    let curve_id = r.u16()?;
+    let curve_id = r.u16().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     let c = ecc::Curve::new(curve_id).map_err(|_| TpmRc(rc::CURVE).with_parameter(1))?;
     let (p, a, b) = c.parameters()?;
@@ -329,9 +329,9 @@ pub fn ecc_parameters(_state: &TpmState, request: &Request) -> TpmResult<Respons
 /// TPM2_GetCapability, Part 3 clause 30.2.
 pub fn get_capability(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let capability = r.u32()?;
-    let property = r.u32()?;
-    let count = r.u32()? as usize;
+    let capability = r.u32().map_err(|e| e.with_parameter(1))?;
+    let property = r.u32().map_err(|e| e.with_parameter(2))?;
+    let count = r.u32().map_err(|e| e.with_parameter(3))? as usize;
     r.expect_end()?;
 
     let (more, data) = build_capability(state, capability, property, count)?;
@@ -727,7 +727,7 @@ fn pcr_properties(property: u32) -> Vec<TaggedPcrSelect> {
 pub fn vendor_tcg_test(_state: &TpmState, request: &Request) -> TpmResult<Response> {
     use crate::tpm::structures::base::Tpm2bData;
     let mut r = request.reader();
-    let data = Tpm2bData::unmarshal(&mut r)?;
+    let data = Tpm2bData::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     respond(move |w| {
         data.marshal(w);

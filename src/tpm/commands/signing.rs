@@ -93,9 +93,10 @@ fn scheme_with_counter(object: &Object, counter: Option<u16>) -> TpmResult<Schem
 pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
-    let digest = Tpm2bDigest::unmarshal(&mut r)?;
-    let validation = Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK])?;
+    let context = Tpm2bSignatureCtx::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let digest = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let validation =
+        Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK]).map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle)
@@ -135,9 +136,9 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
 pub fn verify_digest_signature(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
-    let digest = Tpm2bDigest::unmarshal(&mut r)?;
-    let signature = TpmtSignature::unmarshal(&mut r)?;
+    let context = Tpm2bSignatureCtx::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let digest = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let signature = TpmtSignature::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
     check_no_context(&context, 1)?;
 
@@ -192,8 +193,8 @@ pub fn verify_digest_signature(state: &TpmState, request: &Request) -> TpmResult
 pub fn sign_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let auth = Tpm2bDigest::unmarshal(&mut r)?;
-    let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
+    let auth = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let context = Tpm2bSignatureCtx::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle)
@@ -271,7 +272,7 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
     let sequence_handle = request.handle(0)?;
     let key_handle = request.handle(1)?;
     let mut r = request.reader();
-    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
+    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     let sequence = state
@@ -322,9 +323,9 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
 pub fn verify_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let auth = Tpm2bDigest::unmarshal(&mut r)?;
-    let hint = Tpm2bSignatureHint::unmarshal(&mut r)?;
-    let context = Tpm2bSignatureCtx::unmarshal(&mut r)?;
+    let auth = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let hint = Tpm2bSignatureHint::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let context = Tpm2bSignatureCtx::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
     // Part 2 Table 222 gives a hint only to EdDSA, which is not implemented.
     if !hint.is_empty() {
@@ -362,7 +363,7 @@ pub fn verify_sequence_complete(state: &mut TpmState, request: &Request) -> TpmR
     let sequence_handle = request.handle(0)?;
     let key_handle = request.handle(1)?;
     let mut r = request.reader();
-    let signature = TpmtSignature::unmarshal(&mut r)?;
+    let signature = TpmtSignature::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     let sequence = state
@@ -427,8 +428,8 @@ pub fn verify_sequence_complete(state: &mut TpmState, request: &Request) -> TpmR
 pub fn ecc_encrypt(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let plain = Tpm2bMaxBuffer::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_kdf(&mut r)?;
+    let plain = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_kdf(&mut r).map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle)
@@ -481,10 +482,10 @@ pub fn ecc_encrypt(state: &mut TpmState, request: &Request) -> TpmResult<Respons
 pub fn ecc_decrypt(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let c1 = Tpm2bEccPoint::unmarshal(&mut r)?;
-    let c2 = Tpm2bMaxBuffer::unmarshal(&mut r)?;
-    let c3 = Tpm2bDigest::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_kdf(&mut r)?;
+    let c1 = Tpm2bEccPoint::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let c2 = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let c3 = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+    let in_scheme = Scheme::unmarshal_kdf(&mut r).map_err(|e| e.with_parameter(4))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
@@ -560,9 +561,9 @@ fn ecc_kem_key(
 pub fn commit(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let p1 = Tpm2bEccPoint::unmarshal(&mut r)?;
-    let s2 = Tpm2bSensitiveData::unmarshal(&mut r)?;
-    let y2 = Tpm2bEccParameter::unmarshal(&mut r)?;
+    let p1 = Tpm2bEccPoint::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let s2 = Tpm2bSensitiveData::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let y2 = Tpm2bEccParameter::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle)
@@ -677,10 +678,10 @@ pub fn commit(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 pub fn zgen_2phase(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let in_qs_b = Tpm2bEccPoint::unmarshal(&mut r)?;
-    let in_qe_b = Tpm2bEccPoint::unmarshal(&mut r)?;
-    let in_scheme = r.u16()?;
-    let counter = r.u16()?;
+    let in_qs_b = Tpm2bEccPoint::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_qe_b = Tpm2bEccPoint::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let in_scheme = r.u16().map_err(|e| e.with_parameter(3))?;
+    let counter = r.u16().map_err(|e| e.with_parameter(4))?;
     r.expect_end()?;
 
     if !matches!(in_scheme, alg::ECDH | alg::ECMQV) {
@@ -886,7 +887,7 @@ pub fn decapsulate(state: &TpmState, request: &Request) -> TpmResult<Response> {
 
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let size = r.u16()? as usize;
+    let size = r.u16().map_err(|e| e.with_parameter(1))? as usize;
     let mut inner = r.sub(size)?;
     r.expect_end()?;
     let ciphertext = Tpm2bEccPoint::unmarshal(&mut inner)?;

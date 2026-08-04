@@ -97,8 +97,8 @@ pub fn duplicate(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let object_handle = request.handle(0)?;
     let new_parent_handle = request.handle(1)?;
     let mut r = request.reader();
-    let encryption_key_in = Tpm2bSymKey::unmarshal(&mut r)?;
-    let symmetric_alg = SymDef::unmarshal_sym_def_object(&mut r)?;
+    let encryption_key_in = Tpm2bSymKey::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let symmetric_alg = SymDef::unmarshal_sym_def_object(&mut r).map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     let object = object_of(state, object_handle)
@@ -194,11 +194,12 @@ pub fn duplicate(state: &mut TpmState, request: &Request) -> TpmResult<Response>
 pub fn import(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let parent_handle = request.handle(0)?;
     let mut r = request.reader();
-    let encryption_key = Tpm2bSymKey::unmarshal(&mut r)?;
-    let object_public = Tpm2bPublic::unmarshal(&mut r)?;
-    let duplicate_blob = Tpm2bPrivate::unmarshal(&mut r)?;
-    let in_symmetric_seed = Tpm2bEncryptedSecret::unmarshal(&mut r)?;
-    let symmetric_alg = SymDef::unmarshal_sym_def_object(&mut r)?;
+    let encryption_key = Tpm2bSymKey::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let object_public = Tpm2bPublic::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let duplicate_blob = Tpm2bPrivate::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+    let in_symmetric_seed =
+        Tpm2bEncryptedSecret::unmarshal(&mut r).map_err(|e| e.with_parameter(4))?;
+    let symmetric_alg = SymDef::unmarshal_sym_def_object(&mut r).map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
     let parent = object_of(state, parent_handle)
@@ -286,9 +287,9 @@ pub fn rewrap(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let old_parent = request.handle(0)?;
     let new_parent = request.handle(1)?;
     let mut r = request.reader();
-    let in_duplicate = Tpm2bPrivate::unmarshal(&mut r)?;
-    let name = Tpm2bName::unmarshal(&mut r)?;
-    let in_secret = Tpm2bEncryptedSecret::unmarshal(&mut r)?;
+    let in_duplicate = Tpm2bPrivate::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let in_secret = Tpm2bEncryptedSecret::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     // Remove the old parent's outer wrap.
@@ -354,7 +355,7 @@ pub fn rewrap(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 pub fn act_set_timeout(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let start_timeout = r.u32()?;
+    let start_timeout = r.u32().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     // Part 2 TPMI_RH_ACT answers TPM_RC_VALUE for a handle that is not an ACT.
     // The PC Client Platform TPM Profile 1.07 clause 5.1.2 asks for one
@@ -374,8 +375,8 @@ pub fn act_set_timeout(state: &mut TpmState, request: &Request) -> TpmResult<Res
 /// No attached component is present, so the list is always empty.
 pub fn ac_get_capability(_state: &TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let _capability = r.u32()?;
-    let _count = r.u32()?;
+    let _capability = r.u32().map_err(|e| e.with_parameter(1))?;
+    let _count = r.u32().map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
     respond(|w| {
         w.u8(0);

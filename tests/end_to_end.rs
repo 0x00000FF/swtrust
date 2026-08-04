@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use swtrust::logging::Logger;
 use swtrust::server::Device;
-use swtrust::tpm::constants::{alg, cap, cc, hc, pt, rc, rh, st};
+use swtrust::tpm::constants::{alg, cap, cc, hc, pt, rc, rh, se, st};
 use swtrust::tpm::device::Tpm;
 use swtrust::tpm::marshal::{Reader, Writer};
 
@@ -1815,6 +1815,50 @@ fn a_dup_role_handle_needs_a_policy_session() {
         r.code & 0x03f,
         rc::AUTH_TYPE & 0x03f,
         "TPM2_Duplicate accepted a password -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
+fn an_error_in_a_parameter_carries_its_number() {
+    // Part 2 clause 6.6.2 works the example through: startupType is the first
+    // parameter, so TPM_RC_1 (0x100) plus TPM_RC_P (0x040) is 0x140, and
+    // TPM_RC_VALUE (0x080 + 0x004) with it is 0x1c4.
+    let h = Harness::new("numbered");
+    h.tpm.power_on();
+    let mut p = Writer::new();
+    p.u16(0x00ff);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::Startup,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, 0x1c4, "TPM2_Startup -> {:08x}", r.code);
+
+    // A parameter that cannot be unmarshalled is that parameter's error too,
+    // not an unattributed one. TPM2_StartAuthSession names TPM_ALG_AES in its
+    // symmetric, the fourth parameter, and then stops before its keyBits, so
+    // the TPM runs out of octets inside that one parameter.
+    let h = Harness::started("numbered2");
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0u8; 16]); // nonceCaller
+    p.u16(0); // encryptedSalt
+    p.u8(se::HMAC);
+    p.u16(alg::AES); // symmetric, cut short of keyBits and mode
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::INSUFFICIENT | 0x040 | (4 << 8),
+        "TPM2_StartAuthSession -> {:08x}",
         r.code
     );
 }

@@ -25,8 +25,9 @@ fn yes_no(value: u8) -> TpmResult<bool> {
 pub fn hierarchy_control(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let auth_handle = request.handle(0)?;
     let mut r = request.reader();
-    let enable = r.u32()?;
-    let new_state = yes_no(r.u8()?).map_err(|e| e.with_parameter(2))?;
+    let enable = r.u32().map_err(|e| e.with_parameter(1))?;
+    let new_state = yes_no(r.u8().map_err(|e| e.with_parameter(2))?)
+        .map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     // Only the platform may turn a hierarchy back on, and only the platform
@@ -84,8 +85,8 @@ pub fn hierarchy_control(state: &mut TpmState, request: &Request) -> TpmResult<R
 pub fn set_primary_policy(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let auth_handle = request.handle(0)?;
     let mut r = request.reader();
-    let policy = Tpm2bDigest::unmarshal(&mut r)?;
-    let hash_alg = r.u16()?;
+    let policy = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let hash_alg = r.u16().map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     if hash_alg == alg::NULL {
@@ -156,7 +157,8 @@ pub fn clear(state: &mut TpmState, _request: &Request) -> TpmResult<Response> {
 pub fn clear_control(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let auth_handle = request.handle(0)?;
     let mut r = request.reader();
-    let disable = yes_no(r.u8()?).map_err(|e| e.with_parameter(1))?;
+    let disable = yes_no(r.u8().map_err(|e| e.with_parameter(1))?)
+        .map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     // Only the platform may re-enable TPM2_Clear.
@@ -173,7 +175,7 @@ pub fn clear_control(state: &mut TpmState, request: &Request) -> TpmResult<Respo
 pub fn hierarchy_change_auth(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let auth_handle = request.handle(0)?;
     let mut r = request.reader();
-    let new_auth = Tpm2bDigest::unmarshal(&mut r)?;
+    let new_auth = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     // Part 3 clause 24.9.2 bounds a new authorization value by the digest size
@@ -208,9 +210,9 @@ pub fn dictionary_attack_parameters(
     request: &Request,
 ) -> TpmResult<Response> {
     let mut r = request.reader();
-    let max_tries = r.u32()?;
-    let recovery_time = r.u32()?;
-    let lockout_recovery = r.u32()?;
+    let max_tries = r.u32().map_err(|e| e.with_parameter(1))?;
+    let recovery_time = r.u32().map_err(|e| e.with_parameter(2))?;
+    let lockout_recovery = r.u32().map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     state.lockout.max_tries = max_tries;
@@ -228,8 +230,8 @@ pub fn dictionary_attack_parameters(
 /// TPM2_PP_Commands, Part 3 clause 26.2.
 pub fn pp_commands(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let set = TpmlCc::unmarshal(&mut r)?;
-    let clear = TpmlCc::unmarshal(&mut r)?;
+    let set = TpmlCc::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let clear = TpmlCc::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     // Part 3 clause 26.2.1 discards a command that cannot be gated rather than
@@ -253,7 +255,7 @@ pub fn pp_commands(state: &mut TpmState, request: &Request) -> TpmResult<Respons
 /// TPM2_SetAlgorithmSet, Part 3 clause 26.3.
 pub fn set_algorithm_set(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let algorithm_set = r.u32()?;
+    let algorithm_set = r.u32().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     state.algorithm_set = algorithm_set;
     respond(|_| Ok(()))
@@ -262,7 +264,8 @@ pub fn set_algorithm_set(state: &mut TpmState, request: &Request) -> TpmResult<R
 /// TPM2_ReadOnlyControl, Part 3 clause 26.4.
 pub fn read_only_control(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let read_only = yes_no(r.u8()?).map_err(|e| e.with_parameter(1))?;
+    let read_only = yes_no(r.u8().map_err(|e| e.with_parameter(1))?)
+        .map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     state
         .startup_clear

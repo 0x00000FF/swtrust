@@ -317,7 +317,7 @@ pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Respon
 /// TPM2_ContextLoad, Part 3 clause 28.3.
 pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let context = Context::unmarshal(&mut r)?;
+    let context = Context::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     if context.sequence > state.sessions.context_counter() {
@@ -353,7 +353,7 @@ pub fn evict_control(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let auth = request.handle(0)?;
     let object_handle = request.handle(1)?;
     let mut r = request.reader();
-    let persistent_handle = r.u32()?;
+    let persistent_handle = r.u32().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     if !(hc::PERSISTENT_FIRST..=hc::PERSISTENT_LAST).contains(&persistent_handle) {

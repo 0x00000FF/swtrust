@@ -41,9 +41,9 @@ fn object_of(state: &TpmState, handle: u32) -> TpmResult<&Object> {
 /// TPM2_Hash, Part 3 clause 15.4.
 pub fn hash_command(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let data = Tpm2bMaxBuffer::unmarshal(&mut r)?;
-    let hash_alg = r.u16()?;
-    let hierarchy = r.u32()?;
+    let data = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let hash_alg = r.u16().map_err(|e| e.with_parameter(2))?;
+    let hierarchy = r.u32().map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     let digest = hash::digest(hash_alg, data.as_slice())
@@ -308,8 +308,8 @@ pub fn verified_ticket_hmac(
 pub fn hmac_command(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
-    let requested = r.u16()?;
+    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let requested = r.u16().map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     let (key, hash_alg) = hmac_key(state, handle, requested)?;
@@ -362,8 +362,8 @@ fn hmac_key(state: &TpmState, handle: u32, requested: u16) -> TpmResult<(Vec<u8>
 /// TPM2_HashSequenceStart, Part 3 clause 17.3.
 pub fn hash_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let auth = Tpm2bDigest::unmarshal(&mut r)?;
-    let hash_alg = r.u16()?;
+    let auth = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let hash_alg = r.u16().map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     // TPM_ALG_NULL starts an event sequence, which feeds every PCR bank.
@@ -387,8 +387,8 @@ pub fn hash_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
 pub fn hmac_start(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let auth = Tpm2bDigest::unmarshal(&mut r)?;
-    let requested = r.u16()?;
+    let auth = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let requested = r.u16().map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     let (key, hash_alg) = hmac_key(state, key_handle, requested)?;
@@ -404,7 +404,7 @@ pub fn hmac_start(state: &mut TpmState, request: &Request) -> TpmResult<Response
 pub fn sequence_update(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
+    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     state
         .objects
@@ -419,8 +419,8 @@ pub fn sequence_update(state: &mut TpmState, request: &Request) -> TpmResult<Res
 pub fn sequence_complete(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
-    let hierarchy = r.u32()?;
+    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let hierarchy = r.u32().map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     let sequence = state
@@ -461,7 +461,7 @@ pub fn event_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRe
     let pcr_handle = request.handle(0)?;
     let sequence_handle = request.handle(1)?;
     let mut r = request.reader();
-    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r)?;
+    let buffer = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     let sequence = state
@@ -747,9 +747,10 @@ fn verify_digest(object: &Object, digest: &[u8], signature: &TpmtSignature) -> T
 pub fn sign(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let digest = Tpm2bDigest::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
-    let validation = Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK])?;
+    let digest = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r).map_err(|e| e.with_parameter(2))?;
+    let validation =
+        Ticket::unmarshal_tagged(&mut r, &[st::HASHCHECK]).map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle)
@@ -783,8 +784,8 @@ pub fn sign(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 pub fn verify_signature(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let digest = Tpm2bDigest::unmarshal(&mut r)?;
-    let signature = TpmtSignature::unmarshal(&mut r)?;
+    let digest = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let signature = TpmtSignature::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
@@ -820,9 +821,10 @@ pub fn verify_signature(state: &TpmState, request: &Request) -> TpmResult<Respon
 pub fn rsa_encrypt(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let message = Tpm2bPublicKeyRsa::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_rsa_decrypt(&mut r)?;
-    let label = crate::tpm::structures::base::Tpm2bData::unmarshal(&mut r)?;
+    let message = Tpm2bPublicKeyRsa::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_rsa_decrypt(&mut r).map_err(|e| e.with_parameter(2))?;
+    let label = crate::tpm::structures::base::Tpm2bData::unmarshal(&mut r)
+        .map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle)
@@ -879,9 +881,10 @@ pub fn rsa_encrypt(state: &mut TpmState, request: &Request) -> TpmResult<Respons
 pub fn rsa_decrypt(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let cipher = Tpm2bPublicKeyRsa::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_rsa_decrypt(&mut r)?;
-    let label = crate::tpm::structures::base::Tpm2bData::unmarshal(&mut r)?;
+    let cipher = Tpm2bPublicKeyRsa::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_rsa_decrypt(&mut r).map_err(|e| e.with_parameter(2))?;
+    let label = crate::tpm::structures::base::Tpm2bData::unmarshal(&mut r)
+        .map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
@@ -982,7 +985,7 @@ pub fn ecdh_key_gen(state: &mut TpmState, request: &Request) -> TpmResult<Respon
 pub fn ecdh_zgen(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let in_point = Tpm2bEccPoint::unmarshal(&mut r)?;
+    let in_point = Tpm2bEccPoint::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
@@ -1033,23 +1036,28 @@ pub fn encrypt_decrypt(
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
     let (decrypt_flag, mode, iv, data) = if data_first {
-        let data = Tpm2bMaxBuffer::unmarshal(&mut r)?;
-        let decrypt = r.u8()?;
-        let mode = r.u16()?;
-        let iv = Tpm2bIv::unmarshal(&mut r)?;
+        let data = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+        let decrypt = r.u8().map_err(|e| e.with_parameter(2))?;
+        let mode = r.u16().map_err(|e| e.with_parameter(3))?;
+        let iv = Tpm2bIv::unmarshal(&mut r).map_err(|e| e.with_parameter(4))?;
         (decrypt, mode, iv, data)
     } else {
-        let decrypt = r.u8()?;
-        let mode = r.u16()?;
-        let iv = Tpm2bIv::unmarshal(&mut r)?;
-        let data = Tpm2bMaxBuffer::unmarshal(&mut r)?;
+        let decrypt = r.u8().map_err(|e| e.with_parameter(1))?;
+        let mode = r.u16().map_err(|e| e.with_parameter(2))?;
+        let iv = Tpm2bIv::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+        let data = Tpm2bMaxBuffer::unmarshal(&mut r).map_err(|e| e.with_parameter(4))?;
         (decrypt, mode, iv, data)
     };
     r.expect_end()?;
+    // TPM2_EncryptDecrypt puts decrypt first, Part 3 clause 15.2, and
+    // TPM2_EncryptDecrypt2 puts inData first, clause 15.3, so the same field
+    // is a different parameter in each.
+    let decrypt_parameter = if data_first { 2 } else { 1 };
+    let mode_parameter = if data_first { 3 } else { 2 };
     let decrypt = match decrypt_flag {
         0 => false,
         1 => true,
-        _ => return Err(TpmRc(rc::VALUE).with_parameter(2)),
+        _ => return Err(TpmRc(rc::VALUE).with_parameter(decrypt_parameter)),
     };
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
@@ -1072,7 +1080,7 @@ pub fn encrypt_decrypt(
     // TPM_ALG_NULL means the mode fixed by the key.
     let mode = if mode == alg::NULL { sym.mode } else { mode };
     if sym.mode != alg::NULL && mode != sym.mode {
-        return Err(TpmRc(rc::VALUE).with_parameter(3));
+        return Err(TpmRc(rc::VALUE).with_parameter(mode_parameter));
     }
 
     let mut iv_buf = iv.as_slice().to_vec();
@@ -1105,8 +1113,9 @@ pub fn make_credential(state: &mut TpmState, request: &Request) -> TpmResult<Res
 
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
-    let credential = Tpm2bDigest::unmarshal(&mut r)?;
-    let object_name = crate::tpm::structures::base::Tpm2bName::unmarshal(&mut r)?;
+    let credential = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let object_name = crate::tpm::structures::base::Tpm2bName::unmarshal(&mut r)
+        .map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     let object = object_of(state, key_handle)
@@ -1160,8 +1169,8 @@ pub fn activate_credential(state: &TpmState, request: &Request) -> TpmResult<Res
     let activate_handle = request.handle(0)?;
     let key_handle = request.handle(1)?;
     let mut r = request.reader();
-    let credential_blob = Tpm2bIdObject::unmarshal(&mut r)?;
-    let secret = Tpm2bEncryptedSecret::unmarshal(&mut r)?;
+    let credential_blob = Tpm2bIdObject::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let secret = Tpm2bEncryptedSecret::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     let key = object_of(state, key_handle).map_err(|e| e.with_handle(2))?;
@@ -1212,7 +1221,7 @@ pub fn activate_credential(state: &TpmState, request: &Request) -> TpmResult<Res
 /// TPM2_EC_Ephemeral, Part 3 clause 19.4.
 pub fn ec_ephemeral(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let curve_id = r.u16()?;
+    let curve_id = r.u16().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     // Part 2 Table 201 gives TPM_RC_CURVE to a curve the TPM does not offer.
     // Curve::new answers exactly that, so nothing else is relabelled as it.

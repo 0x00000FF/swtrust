@@ -30,6 +30,11 @@ impl<'a> Reader<'a> {
     /// parameter octets. A command calls this once it has read what its
     /// schematic defines and before it changes anything, so clause 5.6 leaves
     /// the TPM alone.
+    ///
+    /// The code carries no parameter number. Every parameter the schematic
+    /// defines was read, so the octets left over belong to none of them, and
+    /// Part 2 clause 6.6.2 says that when the TPM cannot designate what is in
+    /// error the P and N fields are zero.
     pub fn expect_end(&self) -> TpmResult<()> {
         if self.remaining() == 0 {
             Ok(())

@@ -27,7 +27,7 @@ pub fn pcr_extend(state: &mut TpmState, request: &Request) -> TpmResult<Response
     // does not have is refused while the list is being read, so the number
     // belongs on the unmarshalling error too.
     let digests = TpmlDigestValues::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
-    r.expect_end().map_err(|e| e.with_parameter(1))?;
+    r.expect_end()?;
 
     let mut pairs = Vec::with_capacity(digests.len());
     for d in &digests.items {
@@ -48,7 +48,7 @@ pub fn pcr_event(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let handle = request.handle(0)?;
     let mut r = request.reader();
     let event = Tpm2bEvent::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
-    r.expect_end().map_err(|e| e.with_parameter(1))?;
+    r.expect_end()?;
 
     // A null handle means the event is only hashed, not recorded.
     let digests = if handle == crate::tpm::constants::rh::NULL {
@@ -82,7 +82,7 @@ pub fn pcr_read(state: &TpmState, request: &Request) -> TpmResult<Response> {
     // parameter this command has. A hash the TPM does not implement is refused
     // while the selection is being read, so the error comes from here.
     let requested = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
-    r.expect_end().map_err(|e| e.with_parameter(1))?;
+    r.expect_end()?;
 
     // Part 3 clause 22.4.3 returns as many values as fit in one response and
     // reports which ones those were.
@@ -128,7 +128,7 @@ pub fn pcr_read(state: &TpmState, request: &Request) -> TpmResult<Response> {
 pub fn pcr_allocate(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let requested = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
-    r.expect_end().map_err(|e| e.with_parameter(1))?;
+    r.expect_end()?;
 
     let mut banks = Vec::new();
     for sel in &requested.items {
@@ -175,7 +175,7 @@ pub fn pcr_set_auth_policy(_state: &mut TpmState, request: &Request) -> TpmResul
     let _policy = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     let _hash_alg = r.u16().map_err(|e| e.with_parameter(2))?;
     let _pcr_handle = r.u32().map_err(|e| e.with_parameter(3))?;
-    r.expect_end().map_err(|e| e.with_parameter(3))?;
+    r.expect_end()?;
     Err(TpmRc(rc::VALUE).with_parameter(3))
 }
 
@@ -186,7 +186,7 @@ pub fn pcr_set_auth_policy(_state: &mut TpmState, request: &Request) -> TpmResul
 pub fn pcr_set_auth_value(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let _auth = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
-    r.expect_end().map_err(|e| e.with_parameter(1))?;
+    r.expect_end()?;
     Err(TpmRc(rc::VALUE).with_handle(1))
 }
 

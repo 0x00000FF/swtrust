@@ -22,11 +22,11 @@ pub fn start_auth_session(state: &mut TpmState, request: &Request) -> TpmResult<
     let tpm_key = request.handle(0)?;
     let bind = request.handle(1)?;
     let mut r = request.reader();
-    let nonce_caller = Tpm2bNonce::unmarshal(&mut r)?;
-    let encrypted_salt = Tpm2bEncryptedSecret::unmarshal(&mut r)?;
-    let session_type = r.u8()?;
-    let symmetric = SymDef::unmarshal_sym_def(&mut r)?;
-    let auth_hash = r.u16()?;
+    let nonce_caller = Tpm2bNonce::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let encrypted_salt = Tpm2bEncryptedSecret::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let session_type = r.u8().map_err(|e| e.with_parameter(3))?;
+    let symmetric = SymDef::unmarshal_sym_def(&mut r).map_err(|e| e.with_parameter(4))?;
+    let auth_hash = r.u16().map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
     if !session::is_session_type(session_type) {
@@ -422,12 +422,13 @@ pub fn policy_signed(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let auth_object = request.handle(0)?;
     let policy_session_handle = request.handle(1)?;
     let mut r = request.reader();
-    let nonce_tpm = Tpm2bNonce::unmarshal(&mut r)?;
-    let cp_hash_a = Tpm2bDigest::unmarshal(&mut r)?;
-    let policy_ref = Tpm2bNonce::unmarshal(&mut r)?;
-    let expiration = r.u32()? as i32;
+    let nonce_tpm = Tpm2bNonce::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let cp_hash_a = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let policy_ref = Tpm2bNonce::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+    let expiration = r.u32().map_err(|e| e.with_parameter(4))? as i32;
     let signature =
-        crate::tpm::structures::signature::TpmtSignature::unmarshal(&mut r)?;
+        crate::tpm::structures::signature::TpmtSignature::unmarshal(&mut r)
+            .map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
     let auth_name = super::dispatch::handle_name(state, auth_object)
@@ -518,10 +519,10 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let auth_handle = request.handle(0)?;
     let policy_session_handle = request.handle(1)?;
     let mut r = request.reader();
-    let nonce_tpm = Tpm2bNonce::unmarshal(&mut r)?;
-    let cp_hash_a = Tpm2bDigest::unmarshal(&mut r)?;
-    let policy_ref = Tpm2bNonce::unmarshal(&mut r)?;
-    let expiration = r.u32()? as i32;
+    let nonce_tpm = Tpm2bNonce::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let cp_hash_a = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let policy_ref = Tpm2bNonce::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+    let expiration = r.u32().map_err(|e| e.with_parameter(4))? as i32;
     r.expect_end()?;
 
     let auth_name = super::dispatch::handle_name(state, auth_handle)
@@ -580,11 +581,12 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
 pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let policy_session_handle = request.handle(0)?;
     let mut r = request.reader();
-    let _timeout = Tpm2bTimeout::unmarshal(&mut r)?;
-    let cp_hash_a = Tpm2bDigest::unmarshal(&mut r)?;
-    let policy_ref = Tpm2bNonce::unmarshal(&mut r)?;
-    let auth_name = Tpm2bName::unmarshal(&mut r)?;
-    let ticket = Ticket::unmarshal_tagged(&mut r, &[st::AUTH_SIGNED, st::AUTH_SECRET])?;
+    let _timeout = Tpm2bTimeout::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let cp_hash_a = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let policy_ref = Tpm2bNonce::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+    let auth_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(4))?;
+    let ticket = Ticket::unmarshal_tagged(&mut r, &[st::AUTH_SIGNED, st::AUTH_SECRET])
+        .map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
     // A null ticket carries no proof, so it authorizes nothing.
@@ -639,7 +641,7 @@ pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Respo
 pub fn policy_or(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let list = TpmlDigest::unmarshal(&mut r)?;
+    let list = TpmlDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
@@ -673,7 +675,7 @@ pub fn policy_pcr(state: &mut TpmState, request: &Request) -> TpmResult<Response
     let mut r = request.reader();
     let expected = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     let selection = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
-    r.expect_end().map_err(|e| e.with_parameter(2))?;
+    r.expect_end()?;
 
     let auth_hash = policy_session(state, handle)?.auth_hash;
     let filtered = state.pcr.filter_selection(&selection);
@@ -702,7 +704,7 @@ pub fn policy_pcr(state: &mut TpmState, request: &Request) -> TpmResult<Response
 pub fn policy_locality(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let locality = LocalityAttributes::unmarshal(&mut r)?;
+    let locality = LocalityAttributes::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     if locality.0 == 0 {
         return Err(TpmRc(rc::RANGE).with_parameter(1));
@@ -729,7 +731,7 @@ pub fn policy_locality(state: &mut TpmState, request: &Request) -> TpmResult<Res
 pub fn policy_command_code(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let code = r.u32()?;
+    let code = r.u32().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     if super::table::lookup(code).is_none() {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
@@ -758,7 +760,7 @@ pub fn policy_physical_presence(state: &mut TpmState, request: &Request) -> TpmR
 pub fn policy_cp_hash(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let cp_hash_a = Tpm2bDigest::unmarshal(&mut r)?;
+    let cp_hash_a = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
@@ -779,7 +781,7 @@ pub fn policy_cp_hash(state: &mut TpmState, request: &Request) -> TpmResult<Resp
 pub fn policy_name_hash(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let name_hash = Tpm2bDigest::unmarshal(&mut r)?;
+    let name_hash = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
@@ -831,7 +833,7 @@ pub fn policy_get_digest(state: &mut TpmState, request: &Request) -> TpmResult<R
 pub fn policy_nv_written(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let written = match r.u8()? {
+    let written = match r.u8().map_err(|e| e.with_parameter(1))? {
         0 => false,
         1 => true,
         _ => return Err(TpmRc(rc::VALUE).with_parameter(1)),
@@ -852,7 +854,7 @@ pub fn policy_nv_written(state: &mut TpmState, request: &Request) -> TpmResult<R
 pub fn policy_template(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let template_hash = Tpm2bDigest::unmarshal(&mut r)?;
+    let template_hash = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
@@ -873,9 +875,9 @@ pub fn policy_counter_timer(state: &mut TpmState, request: &Request) -> TpmResul
 
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let operand_b = Tpm2bOperand::unmarshal(&mut r)?;
-    let offset = r.u16()?;
-    let operation = r.u16()?;
+    let operand_b = Tpm2bOperand::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let offset = r.u16().map_err(|e| e.with_parameter(2))?;
+    let operation = r.u16().map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     // The comparison is against the marshalled TPMS_TIME_INFO.
@@ -958,12 +960,12 @@ fn compare(a: &[u8], b: &[u8], operation: u16) -> Option<bool> {
 pub fn policy_authorize(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let approved_policy = Tpm2bDigest::unmarshal(&mut r)?;
-    let policy_ref = Tpm2bNonce::unmarshal(&mut r)?;
-    let key_sign = Tpm2bName::unmarshal(&mut r)?;
+    let approved_policy = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let policy_ref = Tpm2bNonce::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let key_sign = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
     // Version 185 has three commands that produce a TPMT_TK_VERIFIED, each
     // with its own tag, and Part 3 clause 23.16.1 takes any of them.
-    let check_ticket = VerifiedTicket::unmarshal(&mut r)?;
+    let check_ticket = VerifiedTicket::unmarshal(&mut r).map_err(|e| e.with_parameter(4))?;
     r.expect_end()?;
 
     // Part 3 clause 23.16.1 requires keySign to be a well formed Name: a hash
@@ -1048,9 +1050,9 @@ pub fn policy_duplication_select(
 ) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let object_name = Tpm2bName::unmarshal(&mut r)?;
-    let new_parent_name = Tpm2bName::unmarshal(&mut r)?;
-    let include_object = match r.u8()? {
+    let object_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let new_parent_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let include_object = match r.u8().map_err(|e| e.with_parameter(3))? {
         0 => false,
         1 => true,
         _ => return Err(TpmRc(rc::VALUE).with_parameter(3)),
@@ -1084,9 +1086,9 @@ pub fn policy_nv(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let nv_handle = request.handle(1)?;
     let handle = request.handle(2)?;
     let mut r = request.reader();
-    let operand_b = Tpm2bOperand::unmarshal(&mut r)?;
-    let offset = r.u16()?;
-    let operation = r.u16()?;
+    let operand_b = Tpm2bOperand::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let offset = r.u16().map_err(|e| e.with_parameter(2))?;
+    let operation = r.u16().map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
@@ -1150,11 +1152,11 @@ pub fn policy_authorize_nv(state: &mut TpmState, request: &Request) -> TpmResult
 pub fn policy_capability(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let operand_b = Tpm2bOperand::unmarshal(&mut r)?;
-    let offset = r.u16()?;
-    let operation = r.u16()?;
-    let capability = r.u32()?;
-    let property = r.u32()?;
+    let operand_b = Tpm2bOperand::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let offset = r.u16().map_err(|e| e.with_parameter(2))?;
+    let operation = r.u16().map_err(|e| e.with_parameter(3))?;
+    let capability = r.u32().map_err(|e| e.with_parameter(4))?;
+    let property = r.u32().map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
     let auth_hash = policy_session(state, handle)?.auth_hash;
@@ -1177,7 +1179,7 @@ pub fn policy_capability(state: &mut TpmState, request: &Request) -> TpmResult<R
 pub fn policy_parameters(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let p_hash = Tpm2bDigest::unmarshal(&mut r)?;
+    let p_hash = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
@@ -1196,8 +1198,8 @@ pub fn policy_parameters(state: &mut TpmState, request: &Request) -> TpmResult<R
 pub fn policy_transport_spdm(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let req_key_name = Tpm2bName::unmarshal(&mut r)?;
-    let tpm_key_name = Tpm2bName::unmarshal(&mut r)?;
+    let req_key_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let tpm_key_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
     // A Name that is given has to be a well formed one, Part 3 clause 23.25.1.
@@ -1257,10 +1259,10 @@ fn check_key_name(name: &[u8]) -> TpmResult<()> {
 pub fn policy_ac_send_select(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();
-    let object_name = Tpm2bName::unmarshal(&mut r)?;
-    let auth_handle_name = Tpm2bName::unmarshal(&mut r)?;
-    let ac_name = Tpm2bName::unmarshal(&mut r)?;
-    let include_object = match r.u8()? {
+    let object_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let auth_handle_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let ac_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+    let include_object = match r.u8().map_err(|e| e.with_parameter(4))? {
         0 => false,
         1 => true,
         _ => return Err(TpmRc(rc::VALUE).with_parameter(4)),
@@ -1283,7 +1285,7 @@ pub fn policy_ac_send_select(state: &mut TpmState, request: &Request) -> TpmResu
 /// TPM2_FlushContext, Part 3 clause 28.4.
 pub fn flush_context(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let handle = r.u32()?;
+    let handle = r.u32().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
     // Part 3 clause 28.4.1 ignores the upper octet of a session handle, so a
