@@ -396,6 +396,12 @@ pub fn pkcs1v15_encrypt_unpad(encoded: &[u8]) -> TpmResult<Vec<u8>> {
 fn digest_info_prefix(hash_alg: u16) -> TpmResult<&'static [u8]> {
     use crate::tpm::constants::alg;
     Ok(match hash_alg {
+        // SHA-1 names its algorithm with the OID 1.3.14.3.2.26 rather than one
+        // under the NIST arc, so its prefix is not the shape of the others.
+        alg::SHA1 => &[
+            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
+            0x14,
+        ],
         alg::SHA256 => &[
             0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
             0x01, 0x05, 0x00, 0x04, 0x20,
@@ -885,5 +891,58 @@ mod tests {
         let ct = public_op(&key.public, &em).unwrap();
         let pt = private_op(&key, &ct).unwrap();
         assert_eq!(oaep_decode(alg::SHA256, &pt, b"IDENTITY\0").unwrap(), msg);
+    }
+
+    #[test]
+    fn the_sha1_digest_info_prefix_is_the_one_rfc_8017_gives() {
+        // RFC 8017 section 9.2 note 1 lists the DigestInfo encoding for each
+        // hash. SHA-1 is named by the OID 1.3.14.3.2.26, which is shorter than
+        // the NIST arc the SHA-2 and SHA-3 families sit under, so its prefix
+        // has a different length and cannot be derived from the others.
+        //
+        // Windows signs with RSASSA over SHA-1: the key a TPM virtual smart
+        // card certifies itself with carries that scheme, and without the
+        // prefix here TPM2_CertifyCreation answered TPM_RC_HASH.
+        let digest = vec![0xabu8; 20];
+        let encoded = pkcs1v15_sign_encode(alg::SHA1, &digest, 256).unwrap();
+        assert_eq!(encoded.len(), 256);
+        assert_eq!(&encoded[..2], &[0x00, 0x01]);
+
+        // The DigestInfo is the last 35 octets: a 15 octet prefix and the
+        // 20 octet digest, with a zero separator before it.
+        let t = &encoded[256 - 35..];
+        assert_eq!(encoded[256 - 36], 0x00);
+        assert_eq!(
+            &t[..15],
+            &[
+                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
+                0x04, 0x14
+            ]
+        );
+        assert_eq!(&t[15..], &digest[..]);
+        // Everything between the header and the separator is padding.
+        assert!(encoded[2..256 - 36].iter().all(|b| *b == 0xff));
+    }
+
+    #[test]
+    fn an_rsassa_signature_over_sha1_round_trips() {
+        // The whole path, so the encoding above is exercised through a real key
+        // rather than only as octets. RSASSA signs the encoded block with the
+        // private operation, and the public operation recovers it.
+        let mut rng = crate::tpm::crypto::rand::Drbg::new(&[0x5au8; 48], b"sha1").unwrap();
+        let key = generate(&mut rng, 2048, 0).unwrap();
+        let digest = crate::tpm::crypto::hash::digest(alg::SHA1, b"swtrust").unwrap();
+
+        let encoded = pkcs1v15_sign_encode(alg::SHA1, &digest, key.size()).unwrap();
+        let signature = private_op(&key, &encoded).unwrap();
+        assert_eq!(public_op(&key.public, &signature).unwrap(), encoded);
+
+        // A different message encodes to something else, so the signature over
+        // one does not stand for the other.
+        let other = crate::tpm::crypto::hash::digest(alg::SHA1, b"swtrus").unwrap();
+        assert_ne!(
+            pkcs1v15_sign_encode(alg::SHA1, &other, key.size()).unwrap(),
+            encoded
+        );
     }
 }
