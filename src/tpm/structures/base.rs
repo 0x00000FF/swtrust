@@ -46,6 +46,11 @@ pub const MAX_PRIVATE_SIZE: usize = (2 + MAX_DIGEST_SIZE) + 2 + MAX_SENSITIVE_SI
 
 /// The digest size for `hash_alg`, or `None` when the algorithm is not a hash.
 pub fn digest_size(hash_alg: u16) -> Option<usize> {
+    // A structure may not name a hash the TPM does not have, and under the
+    // strict profile SHA-1 is one of those. See `crate::tpm::profile`.
+    if hash_alg == alg::SHA1 && crate::tpm::profile::is_strict() {
+        return None;
+    }
     Some(match hash_alg {
         alg::SHA1 => 20,
         alg::SHA256 | alg::SHA3_256 => 32,
@@ -58,7 +63,7 @@ pub fn digest_size(hash_alg: u16) -> Option<usize> {
 
 /// True when `hash_alg` names a hash this TPM implements.
 pub fn is_implemented_hash(hash_alg: u16) -> bool {
-    config::IMPLEMENTED_HASHES.contains(&hash_alg)
+    config::implemented_hashes().contains(&hash_alg)
 }
 
 macro_rules! tpm2b {

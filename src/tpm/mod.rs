@@ -14,4 +14,5 @@ pub mod error;
 pub mod fips;
 pub mod marshal;
 pub mod persist;
+pub mod profile;
 pub mod structures;

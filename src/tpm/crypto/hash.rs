@@ -11,19 +11,16 @@ use crate::tpm::error::{TpmRc, TpmResult};
 
 /// The aws-lc-rs algorithm for a TPM_ALG_ID.
 ///
-/// SHA-1 is present, which is a departure from the PC Client Platform TPM
-/// Profile 1.07. Clause 4.3 Table 3 lists TPM_ALG_SHA1 as Not Allowed and item
-/// 5 of that clause says such an algorithm "SHALL NOT be supported". The TPM
-/// 2.0 Library Specification and the TCG Algorithm Registry both still define
-/// it, every shipping PC Client TPM implements it, and software that runs on
-/// those TPMs relies on it: BitLocker seals its volume master key in an object
-/// whose nameAlg is TPM_ALG_SHA1, and a TPM without it answers TPM_RC_HASH and
-/// cannot protect a drive at all.
+/// Whether SHA-1 is here depends on the profile, and this function is what
+/// makes the choice real: every use of a hash in this TPM goes through it, so
+/// a hash refused here is refused everywhere. See `crate::tpm::profile`.
 ///
-/// SHA-1 is therefore available to a caller that asks for it by name, and is
-/// kept out of the PCR banks this TPM allocates by default, which clause 4.7
-/// item 3 fixes as SHA-256 and SHA-384.
+/// SHA-1 is never among the PCR banks allocated by default whichever profile
+/// is in force, because clause 4.7 item 3 fixes those as SHA-256 and SHA-384.
 pub fn algorithm(hash_alg: u16) -> TpmResult<&'static digest::Algorithm> {
+    if hash_alg == alg::SHA1 && crate::tpm::profile::is_strict() {
+        return Err(TpmRc(rc::HASH));
+    }
     Ok(match hash_alg {
         alg::SHA1 => &digest::SHA1_FOR_LEGACY_USE_ONLY,
         alg::SHA256 => &digest::SHA256,
@@ -46,6 +43,9 @@ pub fn digest_size(hash_alg: u16) -> TpmResult<usize> {
 ///
 /// For the SHA-3 family this is the sponge rate.
 pub fn block_size(hash_alg: u16) -> TpmResult<usize> {
+    if hash_alg == alg::SHA1 && crate::tpm::profile::is_strict() {
+        return Err(TpmRc(rc::HASH));
+    }
     Ok(match hash_alg {
         alg::SHA1 | alg::SHA256 => 64,
         alg::SHA384 | alg::SHA512 => 128,
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn incremental_matches_one_shot() {
         let data: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
-        for a in crate::tpm::config::IMPLEMENTED_HASHES.iter().copied() {
+        for a in crate::tpm::config::implemented_hashes().iter().copied() {
             let mut h = Hasher::new(a).unwrap();
             for chunk in data.chunks(37) {
                 h.update(chunk);

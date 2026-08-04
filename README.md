@@ -30,7 +30,19 @@ swtrust [OPTIONS]
   -l, --log-dir <dir>            Directory for YYYY-MM-DD.log files. Default: .
   -v, --verbose                  Also print command logs to stdout
   -c, --console                  Run the debug console on stdin
+      --ptp                      Follow the PC Client Platform TPM Profile 1.07
+                                 as written, which takes SHA-1 away
 ```
+
+### Platform profile
+
+Without `--ptp` the TPM implements everything the Library Specification
+defines, which is what shipping PC Client TPMs do and what callers expect. With
+`--ptp` it implements only what the PC Client Platform TPM Profile 1.07 allows.
+The two differ in one algorithm, SHA-1; the reasoning is under Algorithms
+below. The choice is fixed when the daemon starts and cannot change while it
+runs, because a TPM whose algorithm set moved underneath a caller would
+invalidate keys and PCR banks already in use.
 
 ### Transports
 
@@ -92,7 +104,9 @@ guidance, clause 10, ask for three kinds of test. All three are in
 `src/tpm/fips.rs`.
 
 A pre-operational software integrity test runs at power on, before any
-command is accepted. Known answer tests cover SHA-1, SHA-256, SHA-384, HMAC,
+command is accepted. Known answer tests cover every hash the profile in
+force implements, so SHA-1 is tested when it is present and is neither
+tested nor reported as tested when it is not. They also cover HMAC,
 AES in CFB mode both ways, KDFa, KDFe, the DRBG across instantiate, generate
 and reseed, ECDH, ECDSA and RSA. A pair-wise consistency test runs on every
 key pair the TPM generates, inside TPM2_Create and TPM2_CreatePrimary.
@@ -140,6 +154,8 @@ src/
     commands/            the command table, dispatch and the commands
 tests/
   end_to_end.rs          drives the TPM through real command buffers
+  ptp.rs                 the platform profile as written, under --ptp
+  legacy.rs              the default profile, which keeps SHA-1
 ```
 
 ## Implemented commands
@@ -239,15 +255,23 @@ Symmetric: AES with 128, 192 and 256 bit keys in CTR, OFB, CBC, CFB and ECB.
 Asymmetric: RSA 2048, 3072 and 4096 with RSASSA, RSAPSS, RSAES and OAEP; ECC on
 NIST P-224, P-256, P-384 and P-521 with ECDSA, ECDH, ECDAA and EC Schnorr.
 
-SHA-1 is a deliberate departure from the profile. Clause 4.3 Table 3 lists
-TPM_ALG_SHA1 as Not Allowed and item 5 of that clause says such an algorithm
-"SHALL NOT be supported", but every shipping PC Client TPM has it and callers
-depend on that. BitLocker seals its volume master key in an object whose
-nameAlg is TPM_ALG_SHA1; against a TPM that answers TPM_RC_HASH there, a drive
-cannot be protected at all. SHA-1 is therefore available to a caller that names
-it, and is not among the PCR banks allocated by default, which clause 4.7 item
-3 fixes as SHA-256 and SHA-384. The test that used to assert its absence now
-asserts its presence and says why.
+SHA-1 is where the two profiles part. Clause 4.3 Table 3 lists TPM_ALG_SHA1 as
+Not Allowed and item 5 of that clause says such an algorithm "SHALL NOT be
+supported", but software that runs on real TPMs has not followed. BitLocker
+seals its volume master key in an object whose nameAlg is TPM_ALG_SHA1, and the
+key a TPM virtual smart card certifies itself with is signed with RSASSA over
+SHA-1. Both were seen to fail against a TPM without it.
+
+So both readings are offered. Started with no flag, the TPM keeps SHA-1, which
+is what every shipping PC Client TPM does. Started with `--ptp`, it does not
+implement SHA-1 at all: the algorithm is not reported, no structure may name
+it, and no digest, HMAC or signature can be computed over it. Either way SHA-1
+is never among the PCR banks allocated by default, which clause 4.7 item 3
+fixes as SHA-256 and SHA-384.
+
+The two are measured separately: `tests/ptp.rs` runs under `--ptp` and checks
+the profile as written, `tests/legacy.rs` runs under the default and checks
+that the algorithms callers depend on are there.
 
 NIST P-192 is not offered because the underlying library does not build that
 group. SM2, SM3, SM4, Camellia, TDES, ML-KEM and ML-DSA are not implemented.

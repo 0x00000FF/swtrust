@@ -128,7 +128,7 @@ pub fn pcr_allocate(state: &mut TpmState, request: &Request) -> TpmResult<Respon
         if sel.select.is_empty_selection() {
             continue;
         }
-        if !config::IMPLEMENTED_PCR_BANKS.contains(&sel.hash_alg) {
+        if !config::implemented_pcr_banks().contains(&sel.hash_alg) {
             return Err(TpmRc(rc::HASH).with_parameter(1));
         }
         if !banks.contains(&sel.hash_alg) {

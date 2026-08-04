@@ -202,11 +202,9 @@ pub const MANUFACTURER_STRING: &str = "SWT";
 
 /// Hash algorithms the TPM implements, in the order reported by GetCapability.
 ///
-/// SHA-1 is here even though the PC Client Platform TPM Profile 1.07 clause 4.3
-/// Table 3 lists it as Not Allowed. The reason is in `crypto::hash::algorithm`:
-/// callers on real hardware still ask for it, and BitLocker cannot protect a
-/// drive without it.
-pub const IMPLEMENTED_HASHES: &[u16] = &[
+/// SHA-1 is the one difference between the two profiles; see
+/// `crate::tpm::profile`.
+const HASHES_LEGACY: &[u16] = &[
     alg::SHA1,
     alg::SHA256,
     alg::SHA384,
@@ -215,6 +213,23 @@ pub const IMPLEMENTED_HASHES: &[u16] = &[
     alg::SHA3_384,
     alg::SHA3_512,
 ];
+const HASHES_STRICT: &[u16] = &[
+    alg::SHA256,
+    alg::SHA384,
+    alg::SHA512,
+    alg::SHA3_256,
+    alg::SHA3_384,
+    alg::SHA3_512,
+];
+
+/// Hash algorithms the TPM implements, in the order reported by GetCapability.
+pub fn implemented_hashes() -> &'static [u16] {
+    if crate::tpm::profile::is_strict() {
+        HASHES_STRICT
+    } else {
+        HASHES_LEGACY
+    }
+}
 
 /// PCR banks that are allocated after TPM2_Clear.
 /// The PC Client Platform TPM Profile 1.07 clause 4.7 item 3 requires SHA-256
@@ -222,12 +237,7 @@ pub const IMPLEMENTED_HASHES: &[u16] = &[
 /// enabled by default.
 pub const DEFAULT_PCR_BANKS: &[u16] = &[alg::SHA256, alg::SHA384];
 
-/// PCR banks that may be allocated.
-///
-/// SHA-1 may be allocated but is not among the defaults, so a platform that
-/// wants the bank asks for it with TPM2_PCR_Allocate. Clause 4.7 item 3.b.ii
-/// allows any supported hash to back a bank.
-pub const IMPLEMENTED_PCR_BANKS: &[u16] = &[
+const BANKS_LEGACY: &[u16] = &[
     alg::SHA1,
     alg::SHA256,
     alg::SHA384,
@@ -236,6 +246,27 @@ pub const IMPLEMENTED_PCR_BANKS: &[u16] = &[
     alg::SHA3_384,
     alg::SHA3_512,
 ];
+const BANKS_STRICT: &[u16] = &[
+    alg::SHA256,
+    alg::SHA384,
+    alg::SHA512,
+    alg::SHA3_256,
+    alg::SHA3_384,
+    alg::SHA3_512,
+];
+
+/// PCR banks that may be allocated.
+///
+/// SHA-1 may be allocated but is never one of the defaults, so a platform that
+/// wants the bank asks for it with TPM2_PCR_Allocate. Clause 4.7 item 3.b.ii
+/// allows any supported hash to back a bank.
+pub fn implemented_pcr_banks() -> &'static [u16] {
+    if crate::tpm::profile::is_strict() {
+        BANKS_STRICT
+    } else {
+        BANKS_LEGACY
+    }
+}
 
 /// ECC curves the TPM implements.
 ///
@@ -260,7 +291,7 @@ pub const IMPLEMENTED_RSA_KEY_BITS: &[u16] = &[2048, 3072, 4096];
 pub const IMPLEMENTED_AES_KEY_BITS: &[u16] = &[128, 192, 256];
 
 /// Every algorithm identifier the TPM implements, reported by TPM_CAP_ALGS.
-pub const IMPLEMENTED_ALGORITHMS: &[u16] = &[
+const ALGORITHMS_LEGACY: &[u16] = &[
     alg::RSA,
     alg::SHA1,
     alg::HMAC,
@@ -295,6 +326,22 @@ pub const IMPLEMENTED_ALGORITHMS: &[u16] = &[
     alg::ECB,
 ];
 
+/// Every algorithm identifier the TPM implements, reported by TPM_CAP_ALGS.
+///
+/// The strict profile is the legacy list without SHA-1, which is the only
+/// entry the two disagree about.
+pub fn implemented_algorithms() -> Vec<u16> {
+    if crate::tpm::profile::is_strict() {
+        ALGORITHMS_LEGACY
+            .iter()
+            .copied()
+            .filter(|a| *a != alg::SHA1)
+            .collect()
+    } else {
+        ALGORITHMS_LEGACY.to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,7 +371,7 @@ mod tests {
 
     #[test]
     fn algorithm_list_has_no_duplicates() {
-        let mut v = IMPLEMENTED_ALGORITHMS.to_vec();
+        let mut v = ALGORITHMS_LEGACY.to_vec();
         v.sort_unstable();
         let len = v.len();
         v.dedup();

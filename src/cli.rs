@@ -45,6 +45,9 @@ pub struct Config {
     pub verbose: bool,
     /// Run the debug console on stdin alongside the transport.
     pub console: bool,
+    /// Follow the PC Client Platform TPM Profile as written, which takes
+    /// away the algorithms it deprecated. See `crate::tpm::profile`.
+    pub ptp: bool,
 }
 
 impl Default for Config {
@@ -58,6 +61,7 @@ impl Default for Config {
             log_dir: PathBuf::from("."),
             verbose: false,
             console: false,
+            ptp: false,
         }
     }
 }
@@ -91,8 +95,11 @@ pub const HELP: &str = concat!(
     "    -s, --state <dir>              Directory holding the TPM state file. Default: ./state\n",
     "    -l, --log-dir <dir>            Directory for YYYY-MM-DD.log files. Default: .\n",
     "    -v, --verbose                  Also print command logs to stdout\n",
-    "    -c, --console                  Run the debug console on stdin
-",
+    "    -c, --console                  Run the debug console on stdin\n",
+    "        --ptp                      Follow the PC Client Platform TPM Profile 1.07 as\n",
+    "                                   written. SHA-1 is then not implemented, which is\n",
+    "                                   what the profile requires and what BitLocker and\n",
+    "                                   TPM virtual smart cards cannot work without.\n",
     "    -h, --help                     Print this help\n",
     "    -V, --version                  Print version\n",
 );
@@ -134,6 +141,7 @@ where
             "-h" | "--help" => return Ok(ParseOutcome::Help),
             "-V" | "--version" => return Ok(ParseOutcome::Version),
             "-v" | "--verbose" => cfg.verbose = true,
+            "--ptp" => cfg.ptp = true,
             "-c" | "--console" => cfg.console = true,
             "-i" | "--interface" => {
                 let v = value(&args, &mut idx, inline, "--interface")?;

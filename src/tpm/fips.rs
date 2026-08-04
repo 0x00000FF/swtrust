@@ -187,7 +187,7 @@ const KAT_MESSAGE: &[u8] = b"abc";
 ///
 /// TPM2_IncrementalSelfTest reports what is left to do from this list, and
 /// TPM2_GetCapability(TPM_CAP_ALGS) is a superset of it.
-pub const TESTED_ALGORITHMS: &[u16] = &[
+const TESTED_LEGACY: &[u16] = &[
     alg::SHA1,
     alg::SHA256,
     alg::SHA384,
@@ -206,6 +206,18 @@ pub const TESTED_ALGORITHMS: &[u16] = &[
     alg::ECDSA,
     alg::ECDH,
 ];
+
+/// Every algorithm a full self test covers under the profile in force.
+///
+/// A hash the profile does not have is not tested and is not reported as
+/// tested, so TPM2_IncrementalSelfTest never claims a test it did not run.
+pub fn tested_algorithms() -> Vec<u16> {
+    TESTED_LEGACY
+        .iter()
+        .copied()
+        .filter(|a| *a != alg::SHA1 || crate::tpm::crypto::hash::is_supported(alg::SHA1))
+        .collect()
+}
 
 /// The vector each digest is tested against, as a name, an algorithm and the
 /// digest of "abc".
@@ -230,6 +242,12 @@ const HASH_KATS: &[(&str, u16, &str)] = &[
 /// unchecked while the module reported that its tests had passed.
 pub fn hash_kats() -> TestResult {
     for (name, hash_alg, want) in HASH_KATS.iter().copied() {
+        // A hash the profile in force does not have is not tested, because
+        // there is nothing to test: the vector is kept so that the other
+        // profile still has one. See `crate::tpm::profile`.
+        if !hash::is_supported(hash_alg) {
+            continue;
+        }
         let want = vector(name, want)?;
         let got = hash::digest(hash_alg, KAT_MESSAGE).map_err(|_| Failure(name))?;
         expect(name, &got, &want)?;
@@ -718,19 +736,19 @@ mod tests {
                 "hash {alg_id:#06x} is implemented but hash_kats has no vector for it"
             );
             assert!(
-                TESTED_ALGORITHMS.contains(&alg_id),
+                tested_algorithms().contains(&alg_id),
                 "hash {alg_id:#06x} is implemented but is not reported as tested"
             );
         }
         assert_eq!(
             found,
-            crate::tpm::config::IMPLEMENTED_HASHES.len(),
+            crate::tpm::config::implemented_hashes().len(),
             "the scan found a different set of hashes than the one reported"
         );
         // The list must also not name a hash that is not there to test.
-        for alg_id in TESTED_ALGORITHMS {
-            if hash::digest_size(*alg_id).is_ok() {
-                assert!(hash::is_supported(*alg_id));
+        for alg_id in tested_algorithms() {
+            if hash::digest_size(alg_id).is_ok() {
+                assert!(hash::is_supported(alg_id));
             }
         }
     }

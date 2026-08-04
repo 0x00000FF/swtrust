@@ -648,7 +648,7 @@ impl TpmState {
         state.pcr_allocation = saved_allocation
             .iter()
             .copied()
-            .filter(|a| config::IMPLEMENTED_PCR_BANKS.contains(a))
+            .filter(|a| config::implemented_pcr_banks().contains(a))
             .collect();
         // Dropping every bank would leave a TPM with no PCR at all, so the
         // allocation a manufactured TPM has is used instead.

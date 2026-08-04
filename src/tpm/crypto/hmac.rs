@@ -337,7 +337,7 @@ mod tests {
     fn incremental_hmac_matches_one_shot() {
         let key = b"a key";
         let data: Vec<u8> = (0u8..=255).cycle().take(500).collect();
-        for a in crate::tpm::config::IMPLEMENTED_HASHES.iter().copied() {
+        for a in crate::tpm::config::implemented_hashes().iter().copied() {
             let mut m = Hmac::new(a, key).unwrap();
             for c in data.chunks(13) {
                 m.update(c);

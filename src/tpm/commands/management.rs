@@ -151,7 +151,7 @@ pub fn incremental_self_test(state: &mut TpmState, request: &Request) -> TpmResu
     let to_test = TpmlAlg::unmarshal(&mut r)?;
     r.expect_end()?;
     for a in &to_test.items {
-        if !config::IMPLEMENTED_ALGORITHMS.contains(a) {
+        if !config::implemented_algorithms().contains(a) {
             return Err(TpmRc(rc::VALUE).with_parameter(1));
         }
     }
@@ -164,7 +164,7 @@ pub fn incremental_self_test(state: &mut TpmState, request: &Request) -> TpmResu
         .items
         .iter()
         .copied()
-        .filter(|a| !fips::TESTED_ALGORITHMS.contains(a))
+        .filter(|a| !fips::tested_algorithms().contains(a))
         .collect();
     respond(move |w| {
         TpmlAlg::new(remaining)?.marshal(w);
@@ -353,8 +353,8 @@ fn build_capability(
         cap::ALGS => {
             let mut items = Vec::new();
             let mut more = false;
-            for a in config::IMPLEMENTED_ALGORITHMS {
-                if (*a as u32) < property {
+            for a in config::implemented_algorithms() {
+                if (a as u32) < property {
                     continue;
                 }
                 if items.len() >= count.min(TpmlAlgProperty::MAX) {
@@ -362,7 +362,7 @@ fn build_capability(
                     break;
                 }
                 items.push(AlgProperty {
-                    alg: *a,
+                    alg: a,
                     alg_properties: 0,
                 });
             }
@@ -737,7 +737,7 @@ pub fn vendor_tcg_test(_state: &TpmState, request: &Request) -> TpmResult<Respon
 
 /// True when `alg_id` names something this TPM implements.
 pub fn is_implemented_algorithm(alg_id: u16) -> bool {
-    config::IMPLEMENTED_ALGORITHMS.contains(&alg_id)
+    config::implemented_algorithms().contains(&alg_id)
         || hash::is_supported(alg_id)
         || sym::is_supported_mode(alg_id)
 }
