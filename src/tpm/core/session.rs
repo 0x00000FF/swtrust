@@ -1,4 +1,4 @@
-//! Authorization sessions, Part 1 clauses 19 and 21.
+﻿//! Authorization sessions, Part 1 clauses 19 and 21.
 //!
 //! A session carries a rolling pair of nonces, a session key derived when it
 //! was started, and either an HMAC state or a policy digest. The HMAC that
@@ -328,9 +328,22 @@ impl Session {
     }
 
     /// The HMAC key for authorizing an entity with this Name and authValue.
+    ///
+    /// Part 1 clause 16.6.9 gives two different rules and which applies turns
+    /// on the session type. For an HMAC session the authValue is left out when
+    /// "the authorization is for the entity to which the session is bound". For
+    /// a policy session binding does not come into it: the value is included
+    /// when "the session has isAuthValueNeeded SET (by TPM_PolicyAuthValue())"
+    /// and left out otherwise. Using the binding rule on a policy session gives
+    /// a bound session that called TPM2_PolicyAuthValue the wrong key.
     pub fn hmac_key(&self, entity_name: &[u8], auth_value: &[u8]) -> Vec<u8> {
         let mut key = self.session_key.clone();
-        if !self.is_bound_to(entity_name, auth_value) {
+        let wants_auth = if self.is_policy() {
+            self.policy.auth_value_needed
+        } else {
+            !self.is_bound_to(entity_name, auth_value)
+        };
+        if wants_auth {
             // Trailing zero octets of an authValue are removed before use, as
             // Part 1 clause 19.6.4.3 requires, so that an authValue padded to
             // the digest size gives the same HMAC as the unpadded value.
@@ -385,6 +398,27 @@ pub fn trim_auth(auth: &[u8]) -> &[u8] {
         end -= 1;
     }
     &auth[..end]
+}
+
+/// Does a supplied authorization HMAC prove the caller knew the key?
+///
+/// Part 1 clause 16.6.16 lets the caller leave the HMAC out when the key would
+/// be an Empty Buffer: "the caller has the option of either providing the
+/// results of the authHMAC computation, or not. If authHMAC is provided, it
+/// will be computed as shown in Equation 17 with an Empty Buffer as the HMAC
+/// key and the TPM will validate that the value in hmac matches the internally
+/// calculated value. If authHMAC is not provided, the size of hmac will be zero
+/// and the TPM will accept this value of hmac as providing valid authorization
+/// for the object."
+///
+/// So an empty HMAC is only ever accepted when the key is empty too, and a
+/// value that was supplied is always checked. A caller that sends the wrong
+/// HMAC is refused whether or not it could have sent none.
+pub fn auth_hmac_accepted(key: &[u8], expected: &[u8], supplied: &[u8]) -> bool {
+    if key.is_empty() && supplied.is_empty() {
+        return true;
+    }
+    crate::tpm::core::protect::constant_time_eq(expected, supplied)
 }
 
 /// Derive the session key at TPM2_StartAuthSession.
@@ -1212,5 +1246,68 @@ mod tests {
         assert!(!is_valid_auth_hash(alg::NULL));
         assert!(!is_valid_auth_hash(alg::RSA));
         assert_eq!(empty_policy(alg::SHA384).unwrap(), vec![0u8; 48]);
+    }
+
+    #[test]
+    fn a_policy_session_keys_on_what_the_policy_asked_for_not_on_binding() {
+        // Part 1 clause 16.6.9 gives two rules. For an HMAC session the
+        // authValue is left out when "the authorization is for the entity to
+        // which the session is bound". For a policy session it is included when
+        // "the session has isAuthValueNeeded SET (by TPM_PolicyAuthValue())"
+        // and left out otherwise, and binding does not come into it. A bound
+        // policy session that called TPM2_PolicyAuthValue therefore keys on
+        // sessionKey || authValue, where a bound HMAC session would not.
+        let name = b"an entity name".to_vec();
+        let auth = b"an authorization value".to_vec();
+
+        let mut hmac_session = session(se::HMAC);
+        hmac_session.session_key = b"a session key".to_vec();
+        hmac_session.bind = rh::OWNER;
+        hmac_session.bind_name = Session::bind_id(&name, &auth);
+        assert_eq!(
+            hmac_session.hmac_key(&name, &auth),
+            b"a session key".to_vec(),
+            "a bound HMAC session leaves the authorization value out"
+        );
+
+        let mut policy = session(se::POLICY);
+        policy.session_key = b"a session key".to_vec();
+        policy.bind = rh::OWNER;
+        policy.bind_name = Session::bind_id(&name, &auth);
+        assert_eq!(
+            policy.hmac_key(&name, &auth),
+            b"a session key".to_vec(),
+            "a policy that did not ask for the value leaves it out"
+        );
+        policy.policy.auth_value_needed = true;
+        let mut want = b"a session key".to_vec();
+        want.extend_from_slice(&auth);
+        assert_eq!(
+            policy.hmac_key(&name, &auth),
+            want,
+            "TPM2_PolicyAuthValue folds the value in even when the session is bound"
+        );
+    }
+
+    #[test]
+    fn an_authorization_hmac_may_be_omitted_only_when_the_key_is_empty() {
+        // Part 1 clause 16.6.16: when the HMAC key would be an Empty Buffer
+        // "the caller has the option of either providing the results of the
+        // authHMAC computation, or not. If authHMAC is provided ... the TPM
+        // will validate that the value in hmac matches the internally
+        // calculated value. If authHMAC is not provided, the size of hmac will
+        // be zero and the TPM will accept this value".
+        let expected = vec![0xaau8; 32];
+
+        // With no key, an omitted HMAC stands and a correct one still passes.
+        assert!(auth_hmac_accepted(b"", &expected, &[]));
+        assert!(auth_hmac_accepted(b"", &expected, &expected));
+        // A value that was supplied is always checked, so a wrong one fails
+        // even though none at all would have been accepted.
+        assert!(!auth_hmac_accepted(b"", &expected, &[0xbbu8; 32]));
+
+        // With a key there is no option: the HMAC has to be there and right.
+        assert!(!auth_hmac_accepted(b"key", &expected, &[]));
+        assert!(auth_hmac_accepted(b"key", &expected, &expected));
     }
 }

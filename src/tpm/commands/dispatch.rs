@@ -678,7 +678,7 @@ pub fn check_authorization(
             &nonce_encrypt,
             input.attributes,
         )?;
-        if !constant_time_eq(&expected, &input.hmac) {
+        if !session::auth_hmac_accepted(&key, &expected, &input.hmac) {
             return record_failure(state, protected)
                 .and(Err(TpmRc(rc::AUTH_FAIL).with_session(position)));
         }
@@ -978,37 +978,30 @@ fn check_policy(
         return compare_auth(state, &input.hmac, &entity.auth, protected)
             .map_err(|e| e.with_session(position));
     }
-    // A bound or salted policy session holds a session key, and Part 1 clause
-    // 19.6.16 requires it to prove that key even when the policy itself does
-    // not call for the authorization value. TPM2_PolicyAuthValue additionally
-    // folds the entity value into the key.
-    let needs_hmac = s.policy.auth_value_needed || !s.session_key.is_empty();
-    if needs_hmac {
-        let key = if s.policy.auth_value_needed {
-            let mut k = s.session_key.clone();
-            k.extend_from_slice(session::trim_auth(&entity.auth));
-            k
-        } else {
-            s.session_key.clone()
-        };
-        let (nonce_decrypt, nonce_encrypt) = auxiliary_nonces(state, request, index);
-        let expected = session::auth_hmac_with_nonces(
-            s.auth_hash,
-            &key,
-            cp_hash,
-            &input.nonce_caller,
-            &s.nonce_tpm,
-            &nonce_decrypt,
-            &nonce_encrypt,
-            input.attributes,
-        )?;
-        if !constant_time_eq(&expected, &input.hmac) {
-            record_failure(state, protected)?;
-            return Err(TpmRc(rc::AUTH_FAIL).with_session(position));
-        }
-        if protected {
-            clear_failures(state);
-        }
+    // Part 1 clause 16.6.9 gives the key for a policy session:
+    // TPM2_PolicyAuthValue folds the entity value in, and without it the key is
+    // the session key alone. Clause 16.6.16 then says when the caller may leave
+    // the HMAC out: only when that key is empty, and even then a value that was
+    // supplied is checked. Skipping the check whenever the key came out empty
+    // would take any octets at all as authorization.
+    let key = s.hmac_key(&entity.name, &entity.auth);
+    let (nonce_decrypt, nonce_encrypt) = auxiliary_nonces(state, request, index);
+    let expected = session::auth_hmac_with_nonces(
+        s.auth_hash,
+        &key,
+        cp_hash,
+        &input.nonce_caller,
+        &s.nonce_tpm,
+        &nonce_decrypt,
+        &nonce_encrypt,
+        input.attributes,
+    )?;
+    if !session::auth_hmac_accepted(&key, &expected, &input.hmac) {
+        record_failure(state, protected)?;
+        return Err(TpmRc(rc::AUTH_FAIL).with_session(position));
+    }
+    if protected {
+        clear_failures(state);
     }
     Ok(())
 }
@@ -1287,12 +1280,15 @@ pub fn build_response_sessions(
 
         let auth_hash = s.auth_hash;
         let rp = session::rp_hash(auth_hash, response_code, request.code, parameters)?;
-        // The response HMAC uses the same key as the command HMAC. A policy
-        // session that proved nothing but its policy answers with none.
-        let carries_hmac = !s.is_policy()
-            || s.policy.auth_value_needed
-            || s.policy.password_needed
-            || !s.session_key.is_empty();
+        // The response HMAC uses the same key as the command HMAC, and Part 1
+        // clause 16.6.16 says which shape it takes: "The TPM will use the same
+        // formulation in the response as was in the command. This is, if hmac
+        // was non-zero in the command, the TPM will compute authHMAC as shown
+        // in Equation 17 and use the result as hmac. If hmac was an Empty
+        // Buffer in the command, it will be an Empty Buffer in the response."
+        // So it follows what the caller sent rather than being worked out again
+        // from the session, which could differ from what the caller chose.
+        let carries_hmac = !input.hmac.is_empty();
         let hmac = if carries_hmac {
             let context = contexts.get(index).cloned().unwrap_or_default();
             let s = state.sessions.get(input.handle)?;
