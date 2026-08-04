@@ -288,7 +288,12 @@ impl Device for Tpm {
             let mut state = self.locked();
             state.started = false;
             state.objects.clear();
-            state.sessions.clear();
+            // Only what was in TPM memory goes away with the power. Part 1
+            // clause 27.5 keeps a saved session context across a TPM Restart
+            // and a TPM Resume, both of which pass through here, and it is the
+            // startup type that decides whether this was one of those or a TPM
+            // Reset.
+            state.sessions.flush_loaded();
             state.physical_presence = false;
             state.failure_mode = false;
             state.clock.time = 0;
@@ -317,7 +322,11 @@ impl Device for Tpm {
             let mut state = self.locked();
             state.started = false;
             state.objects.clear();
-            state.sessions.clear();
+            // The record of which sessions have saved contexts is written to
+            // the state file above and kept here, because Part 1 clause 27.5
+            // lets those contexts be reloaded after the power comes back if
+            // the startup that follows is a TPM Restart or a TPM Resume.
+            state.sessions.flush_loaded();
         }
         self.logger.line("power off");
     }

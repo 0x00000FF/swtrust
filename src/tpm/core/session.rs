@@ -756,6 +756,29 @@ impl SessionSlots {
         self.context_counter = 1;
     }
 
+    /// The handles of the saved sessions and the identifier each was given.
+    pub fn saved_contexts(&self) -> Vec<(u32, u64)> {
+        self.saved.iter().map(|(h, id)| (*h, *id)).collect()
+    }
+
+    /// Put back what [`saved_contexts`] gave, after a TPM Restart or Resume.
+    pub fn restore_saved_contexts(&mut self, saved: Vec<(u32, u64)>, counter: u64) {
+        self.saved = saved.into_iter().collect();
+        self.context_counter = counter;
+    }
+
+    /// Drop the sessions in TPM memory and keep the record of the saved ones.
+    ///
+    /// Part 1 clause 27.5: "session contexts in TPM RAM are flushed on any
+    /// TPM2_Startup(). Saved session contexts are not invalidated and may be
+    /// reloaded after a TPM Restart or TPM Resume. Saved session contexts are
+    /// invalidated on a TPM Reset." A saved session is only reloadable while
+    /// the TPM still remembers that its handle was assigned, so that record
+    /// outlives a restart with it.
+    pub fn flush_loaded(&mut self) {
+        self.sessions.clear();
+    }
+
     /// Drop every session bound to `handle`, which happens when the entity the
     /// session is bound to goes away.
     pub fn flush_bound_to(&mut self, handle: u32) {

@@ -46,6 +46,16 @@ impl Hierarchy {
         Ok(())
     }
 
+    /// Give the hierarchy a new proof value while its seed stands.
+    ///
+    /// TPM2_Clear changes ehProof without changing the Endorsement Primary
+    /// Seed, so the keys of that hierarchy stay reproducible while the tickets
+    /// and saved contexts that named the old proof stop verifying.
+    pub fn regenerate_proof(&mut self, rng: &mut dyn Rng) -> TpmResult<()> {
+        self.proof = rng.bytes(config::PRIMARY_SEED_SIZE)?;
+        Ok(())
+    }
+
     /// Clear the authorization value and policy.
     pub fn clear_authorization(&mut self) {
         self.auth.clear();
@@ -124,13 +134,21 @@ impl Hierarchies {
         }
     }
 
-    /// Reset the volatile parts on a TPM Reset.
+    /// Reset the volatile parts on a Startup(CLEAR).
     ///
-    /// The NULL hierarchy gets a new seed and proof, and every hierarchy is
-    /// re-enabled because TPMA_STARTUP_CLEAR is cleared by a Startup(CLEAR).
-    pub fn on_reset(&mut self, rng: &mut dyn Rng) -> TpmResult<()> {
-        self.null.regenerate(rng)?;
-        self.null.clear_authorization();
+    /// Every hierarchy is re-enabled because TPMA_STARTUP_CLEAR is cleared by a
+    /// Startup(CLEAR). The NULL hierarchy gets a new seed and proof on a TPM
+    /// Reset only: Part 1 clause 27.5 says "saved session contexts are not
+    /// invalidated and may be reloaded after a TPM Restart or TPM Resume.
+    /// Saved session contexts are invalidated on a TPM Reset", and clause
+    /// 27.3.2 says sessions, sequences and Temporary Objects are protected
+    /// under the NULL hierarchy, so changing nullProof on a restart would
+    /// invalidate contexts that have to survive one.
+    pub fn on_reset(&mut self, rng: &mut dyn Rng, full_reset: bool) -> TpmResult<()> {
+        if full_reset {
+            self.null.regenerate(rng)?;
+            self.null.clear_authorization();
+        }
         self.platform.enabled = true;
         self.owner.enabled = true;
         self.endorsement.enabled = true;
@@ -140,11 +158,18 @@ impl Hierarchies {
         Ok(())
     }
 
-    /// Apply TPM2_Clear: the storage and endorsement hierarchies get new seeds
-    /// and every authorization but the platform's is dropped.
+    /// Apply TPM2_Clear.
+    ///
+    /// Part 3 clause 24.6.1 says the operation will "change the storage primary
+    /// seed (SPS) to a new value from the TPM's random number generator (RNG)"
+    /// and "change shProof and ehProof". The Endorsement Primary Seed is not in
+    /// that list, so the endorsement hierarchy keeps its seed and its keys, and
+    /// only its proof changes, which is what makes its tickets and saved
+    /// contexts stop verifying.
     pub fn on_clear(&mut self, rng: &mut dyn Rng) -> TpmResult<()> {
         self.owner.regenerate(rng)?;
         self.owner.clear_authorization();
+        self.endorsement.regenerate_proof(rng)?;
         self.endorsement.clear_authorization();
         Ok(())
     }
@@ -223,7 +248,7 @@ mod tests {
         let mut h = Hierarchies::new(&mut r).unwrap();
         let before = h.clone();
         h.get_mut(rh::OWNER).unwrap().enabled = false;
-        h.on_reset(&mut r).unwrap();
+        h.on_reset(&mut r, true).unwrap();
         assert_ne!(h.null.seed, before.null.seed);
         assert_ne!(h.null.proof, before.null.proof);
         assert_eq!(h.owner.seed, before.owner.seed);
@@ -239,7 +264,7 @@ mod tests {
         let mut h = Hierarchies::new(&mut r).unwrap();
         h.platform.auth = b"platform".to_vec();
         h.owner.auth = b"owner".to_vec();
-        h.on_reset(&mut r).unwrap();
+        h.on_reset(&mut r, true).unwrap();
         assert!(!h.platform.has_auth());
         assert_eq!(h.owner.auth, b"owner");
     }

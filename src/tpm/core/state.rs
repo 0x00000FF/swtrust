@@ -27,13 +27,19 @@ use super::session::SessionSlots;
 /// it is still read rather than being thrown away: a TPM whose state a caller
 /// depends on should not lose it because this build learned a new field.
 ///
+/// Version 4 added the saved session contexts, which Part 1 clause 27.5 keeps
+/// across a TPM Restart and a TPM Resume, both of which pass through a power
+/// cycle.
+///
 /// Version 3 added the clearCount of Part 1 Equation 52 to the clock.
 ///
 /// One build wrote the profile byte while still tagging the record version 1.
 /// It was never released, so version 1 means the layout that came before the
 /// byte and nothing else. A file of the other shape can only have been written
 /// by a developer running that build, and is not one this reads.
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 4;
+/// Version 3 did not record which session contexts had been saved.
+const STATE_VERSION_WITHOUT_SESSIONS: u32 = 3;
 /// Version 2 recorded the profile but not the clearCount of Part 1 Equation 52.
 const STATE_VERSION_WITHOUT_CLEAR_COUNT: u32 = 2;
 const STATE_VERSION_WITHOUT_PROFILE: u32 = 1;
@@ -352,11 +358,17 @@ impl TpmState {
         // it has already moved on by the time this runs.
         let ever_started =
             self.ever_started || self.clock.reset_count > 0 || self.clock.restart_count > 0;
-        self.hierarchies.on_reset(&mut self.rng)?;
+        self.hierarchies.on_reset(&mut self.rng, !restart)?;
         self.pcr.allocate(&self.pcr_allocation.clone())?;
         self.pcr.reset_update_counter();
         self.objects.clear();
-        self.sessions.clear();
+        // Only a TPM Reset invalidates a saved session context; a TPM Restart
+        // flushes what is in memory and leaves the saved ones reloadable.
+        if restart {
+            self.sessions.flush_loaded();
+        } else {
+            self.sessions.clear();
+        }
         self.nv.on_startup_clear_with(disorderly);
         self.clock.clear_count = self.clock.clear_count.wrapping_add(1);
         if restart {
@@ -438,6 +450,9 @@ impl TpmState {
     /// Resume still discards are cleared.
     pub fn on_startup_state(&mut self) -> TpmResult<()> {
         self.objects.flush_st_clear();
+        // Clause 27.5 flushes the sessions in TPM memory on any startup and
+        // leaves the saved ones reloadable after a resume.
+        self.sessions.flush_loaded();
         // Part 1 clause 8.6.2 keeps the Resume PCR and puts every other
         // register back to its initial value. The NV STCLEAR locks are not
         // touched, because they go away on a TPM Reset or a TPM Restart only.
@@ -599,6 +614,10 @@ impl TpmState {
             w.u32(*handle);
             w.u32(object.hierarchy);
             w.u8(u8::from(object.tpm_generated));
+            // The stateClear property of Part 1 clause 30.4.2 comes from the
+            // object's ancestors as much as from itself, and they are gone by
+            // the time the record is read, so it is written down.
+            w.u8(u8::from(object.state_clear));
             object.public.marshal(&mut w);
             match &object.sensitive {
                 Some(s) => {
@@ -638,6 +657,17 @@ impl TpmState {
         w.sized16(&self.act.policy.digest);
         w.u8(u8::from(self.ever_started));
 
+        // Part 1 clause 27.5 keeps a saved session context across a TPM Restart
+        // and a TPM Resume, and both of those go through a power cycle, so the
+        // record of which handles were assigned goes with the state.
+        let saved = self.sessions.saved_contexts();
+        w.u32(saved.len() as u32);
+        for (handle, id) in &saved {
+            w.u32(*handle);
+            w.u64(*id);
+        }
+        w.u64(self.sessions.context_counter());
+
         w.finish()
     }
 
@@ -649,7 +679,10 @@ impl TpmState {
         let version = r.u32()?;
         if !matches!(
             version,
-            STATE_VERSION | STATE_VERSION_WITHOUT_CLEAR_COUNT | STATE_VERSION_WITHOUT_PROFILE
+            STATE_VERSION
+                | STATE_VERSION_WITHOUT_SESSIONS
+                | STATE_VERSION_WITHOUT_CLEAR_COUNT
+                | STATE_VERSION_WITHOUT_PROFILE
         ) {
             return Err(TpmRc(rc::BAD_CONTEXT));
         }
@@ -696,7 +729,10 @@ impl TpmState {
 
         state.lockout = LockoutState::unmarshal(&mut r)?;
         state.permanent = PermanentAttributes::unmarshal(&mut r)?;
-        state.clock = ClockState::read(&mut r, version == STATE_VERSION)?;
+        state.clock = ClockState::read(
+            &mut r,
+            matches!(version, STATE_VERSION | STATE_VERSION_WITHOUT_SESSIONS),
+        )?;
         state.algorithm_set = r.u32()?;
         state.lockout_auth = read_sized(&mut r)?;
         state.lockout_policy = TpmtHa::unmarshal(&mut r)?;
@@ -759,6 +795,14 @@ impl TpmState {
             let handle = r.u32()?;
             let hierarchy = r.u32()?;
             let tpm_generated = r.u8()? != 0;
+            // A record from before the property was written down says nothing
+            // about the ancestors of the object it holds, so only the object's
+            // own attribute is left to go on, which is read below.
+            let recorded_state_clear = if version >= STATE_VERSION_WITHOUT_SESSIONS {
+                Some(r.u8()? != 0)
+            } else {
+                None
+            };
             let public = crate::tpm::structures::keys::TpmtPublic::unmarshal(&mut r)?;
             let sensitive = if r.u8()? != 0 {
                 Some(crate::tpm::structures::keys::TpmtSensitive::unmarshal(
@@ -771,6 +815,20 @@ impl TpmState {
             // object that comes back has to pass what TPM2_Load would apply to
             // it today rather than be trusted for having been saved.
             super::object::validate_restored(&public, sensitive.as_ref())?;
+            // Part 3 clause 28.5.1 rule 1.2 refuses to make an object
+            // persistent when "the stClear is SET in the object or in an
+            // ancestor key", so an object that has the property was never
+            // allowed to be here. A file that says otherwise describes a TPM
+            // this one cannot be, and is refused the way any other record that
+            // cannot be trusted is.
+            let state_clear = recorded_state_clear.unwrap_or_else(|| {
+                public
+                    .object_attributes
+                    .has(crate::tpm::structures::attributes::ObjectAttributes::ST_CLEAR)
+            });
+            if state_clear {
+                return Err(TpmRc(rc::BAD_CONTEXT));
+            }
             // A persistent object keeps the qualified name it had when it was
             // made persistent, which is rebuilt from its hierarchy.
             let parent_qn = super::names::handle_name(hierarchy);
@@ -843,6 +901,24 @@ impl TpmState {
                     _ => return Err(TpmRc(rc::BAD_CONTEXT)),
                 }
             };
+        }
+
+        // Part 1 clause 27.5 keeps a saved session context across a TPM Restart
+        // and a TPM Resume. A record from before this was written down names
+        // none, so a session saved by that build is not reloadable, which is
+        // what a TPM Reset would have done to it anyway.
+        // Like the blocks before it, a record that ends here is read as having
+        // none rather than being refused.
+        if version >= STATE_VERSION && !r.is_empty() {
+            let count = bounded_count(&mut r, config::MAX_ACTIVE_SESSIONS as usize)?;
+            let mut saved = Vec::with_capacity(count);
+            for _ in 0..count {
+                let handle = r.u32()?;
+                let id = r.u64()?;
+                saved.push((handle, id));
+            }
+            let counter = r.u64()?;
+            state.sessions.restore_saved_contexts(saved, counter);
         }
 
         if !r.is_empty() {
@@ -1221,9 +1297,9 @@ mod tests {
         s.act.set_timeout(90);
         let saved = s.save().unwrap();
 
-        // The flag is the last octet of the record, so a build that did not
-        // write it produced this.
-        let older = &saved[..saved.len() - 1];
+        // The flag comes just before the saved session block, so a build that
+        // wrote neither produced this.
+        let older = &saved[..saved.len() - 1 - SESSION_BLOCK];
         let back = TpmState::load(older).expect("a record without the flag was refused");
         assert_eq!(back.act.timeout(), 90, "the timer still comes back");
         assert!(
@@ -1247,6 +1323,8 @@ mod tests {
     /// Octets the timer block occupies when the policy is empty: the
     /// timeout, the signal, the policy algorithm and an empty digest.
     const ACT_BLOCK: usize = 4 + 1 + 2 + 2 + 1;
+    /// A saved session block with nothing in it: the count and the counter.
+    const SESSION_BLOCK: usize = 4 + 8;
 
     #[test]
     fn a_state_file_without_the_commit_values_still_loads() {
@@ -1266,7 +1344,7 @@ mod tests {
         // Cut the record back to where the trailing blocks begin: the commit
         // nonce, counter and array, and after them the timer.
         let (random, _, used) = s.commits.parts();
-        let tail = 2 + random.len() + 8 + 2 + used.len() + ACT_BLOCK;
+        let tail = 2 + random.len() + 8 + 2 + used.len() + ACT_BLOCK + SESSION_BLOCK;
         let older = &saved[..saved.len() - tail];
 
         let back = TpmState::load(older).expect("an older state file was refused");
@@ -1287,7 +1365,7 @@ mod tests {
         // A manufactured TPM has no commit values, so its own block is two
         // empty buffers and a zero counter. Strip that and the timer to get
         // back to where a block would start.
-        let base = saved[..saved.len() - (2 + 8 + 2 + ACT_BLOCK)].to_vec();
+        let base = saved[..saved.len() - (2 + 8 + 2 + ACT_BLOCK + SESSION_BLOCK)].to_vec();
 
         for (random, used) in [(1usize, 16usize), (64, 1), (1, 1), (63, 16), (64, 15)] {
             let mut bad = base.clone();

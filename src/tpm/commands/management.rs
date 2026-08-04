@@ -288,10 +288,20 @@ pub fn clock_rate_adjust(_state: &mut TpmState, request: &Request) -> TpmResult<
 /// TPM2_TestParms, Part 3 clause 12.9.
 pub fn test_parms(_state: &TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    // Unmarshalling already applies every interface type check, so a structure
-    // that parses is one the TPM supports.
-    let _parms = PublicParmsTagged::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    // Unmarshalling applies every interface type check, so a structure that
+    // parses names algorithms the TPM has.
+    let parms = PublicParmsTagged::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
+    // Whether they go together is a separate question. Part 2 Table 229 says
+    // of an ECC key's kdf that "in the context of object creation,
+    // TPM2_LoadExternal(), or TPM2_TestParms(), TPM_RC_KDF indicates the TPM
+    // does not support the requested KDF", and a KEM is named by a curve and a
+    // hash together, so this command has to answer for the pair.
+    if let crate::tpm::structures::keys::PublicParms::Ecc { curve_id, kdf, .. } = parms.parms {
+        if !kdf.is_null() && !crate::tpm::crypto::dhkem::is_kem_suite(curve_id, &kdf) {
+            return Err(TpmRc(rc::KDF).with_parameter(1));
+        }
+    }
     respond(|_| Ok(()))
 }
 

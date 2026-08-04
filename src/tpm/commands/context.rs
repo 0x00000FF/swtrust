@@ -6,7 +6,7 @@ use crate::tpm::core::object::{Object, Sequence, SequenceKind, Slot};
 use crate::tpm::structures::context::saved;
 use crate::tpm::core::session::Session;
 use crate::tpm::core::state::TpmState;
-use crate::tpm::crypto::{hash, hmac as mac, sym};
+use crate::tpm::crypto::{hmac as mac, sym};
 use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Reader, Unmarshal, Writer};
 use crate::tpm::structures::base::{Tpm2bContextData, Tpm2bDigest};
@@ -17,30 +17,37 @@ use super::execute::{respond, respond_with_handle};
 
 /// The label of the key that encrypts a saved context.
 const LABEL_CONTEXT: &str = "CONTEXT";
-/// The label of the key that covers a saved context with an HMAC.
-const LABEL_INTEGRITY: &str = "INTEGRITY";
-
-/// The keys that protect a context saved under `hierarchy`.
-fn context_keys(state: &TpmState, hierarchy: u32, sequence: u64) -> TpmResult<(Vec<u8>, Vec<u8>)> {
+/// The symmetric key and IV that hide a saved context, Part 1 Equation 50.
+///
+///   (symKey, symIv) := KDFa(hashAlg, hProof, vendorString, sequence, handle,
+///                           bits)
+///
+/// One call produces both, so the IV is derived rather than assumed, and both
+/// depend on the handle as well as the sequence. Clause 27.3.1 says they "are
+/// regenerated when a context is loaded" and that they must not be generated
+/// "until the context integrity has been validated", so this is called only
+/// after the HMAC has been checked.
+fn context_encryption(
+    state: &TpmState,
+    hierarchy: u32,
+    sequence: u64,
+    saved_handle: u32,
+) -> TpmResult<(Vec<u8>, Vec<u8>)> {
     let proof = state.hierarchy_proof(hierarchy)?.to_vec();
-    let alg_id = config::CONTEXT_INTEGRITY_HASH_ALG;
-    let sym_key = mac::kdfa(
-        alg_id,
+    let key_octets = config::CONTEXT_ENCRYPT_KEY_BITS as usize / 8;
+    let iv_octets = sym::block_size(config::CONTEXT_ENCRYPT_ALG)?;
+    let material = mac::kdfa(
+        config::CONTEXT_INTEGRITY_HASH_ALG,
         &proof,
         LABEL_CONTEXT,
         &sequence.to_be_bytes(),
-        &[],
-        config::CONTEXT_ENCRYPT_KEY_BITS as u32,
+        &saved_handle.to_be_bytes(),
+        ((key_octets + iv_octets) * 8) as u32,
     )?;
-    let hmac_key = mac::kdfa(
-        alg_id,
-        &proof,
-        LABEL_INTEGRITY,
-        &sequence.to_be_bytes(),
-        &[],
-        (hash::digest_size(alg_id)? * 8) as u32,
-    )?;
-    Ok((sym_key, hmac_key))
+    Ok((
+        material[..key_octets].to_vec(),
+        material[key_octets..].to_vec(),
+    ))
 }
 
 /// Encrypt and authenticate a marshalled context.
@@ -68,15 +75,20 @@ fn seal_context(
     saved_handle: u32,
     body: &[u8],
 ) -> TpmResult<Tpm2bContextData> {
-    let (sym_key, hmac_key) = context_keys(state, hierarchy, sequence)?;
-    let iv = vec![0u8; sym::block_size(config::CONTEXT_ENCRYPT_ALG)?];
-    let encrypted = sym::cfb_encrypt(&sym_key, &iv, body)?;
-    // The hierarchy is not among them: Equation 52 takes hProof "as selected by
-    // the hierarchy parameter of the TPMS_CONTEXT" as the HMAC key, so the
-    // hierarchy is already what the key is.
+    let (sym_key, iv) = context_encryption(state, hierarchy, sequence, saved_handle)?;
+    // Clause 27.3.1: "when the context is created by TPM2_ContextSave(), the
+    // value of sequence is stored in the TPM2B_CONTEXT_SENSITIVE context before
+    // it is encrypted", so that loading can compare the two.
+    let mut plain = sequence.to_be_bytes().to_vec();
+    plain.extend_from_slice(body);
+    let encrypted = sym::cfb_encrypt(&sym_key, &iv, &plain)?;
+    // Equation 52 is contextHMAC := HMAC(hProof, data), so the proof itself is
+    // the key. The hierarchy is not among the data because Equation 52 takes
+    // hProof "as selected by the hierarchy parameter of the TPMS_CONTEXT", so
+    // the hierarchy is already what the key is.
     let integrity = mac::hmac_parts(
         config::CONTEXT_INTEGRITY_HASH_ALG,
-        &hmac_key,
+        state.hierarchy_proof(hierarchy)?,
         &[
             &context_counters(state, saved_handle),
             &sequence.to_be_bytes(),
@@ -92,13 +104,16 @@ fn seal_context(
 }
 
 /// Check and decrypt a saved context.
-fn open_context(state: &TpmState, context: &Context) -> TpmResult<Vec<u8>> {
-    let (sym_key, hmac_key) = context_keys(state, context.hierarchy, context.sequence)?;
+///
+/// Part 1 clause 27.3.1 requires "that the symmetric key and IV not be
+/// generated until the context integrity has been validated", so nothing is
+/// derived for decryption before the HMAC has been compared.
+fn open_context(state: &mut TpmState, context: &Context) -> TpmResult<Vec<u8>> {
     let data = ContextData::from_bytes(context.context_blob.as_slice())
         .map_err(|_| TpmRc(rc::BAD_CONTEXT).with_parameter(1))?;
     let expected = mac::hmac_parts(
         config::CONTEXT_INTEGRITY_HASH_ALG,
-        &hmac_key,
+        state.hierarchy_proof(context.hierarchy)?,
         &[
             &context_counters(state, context.saved_handle),
             &context.sequence.to_be_bytes(),
@@ -109,8 +124,28 @@ fn open_context(state: &TpmState, context: &Context) -> TpmResult<Vec<u8>> {
     if !crate::tpm::core::protect::constant_time_eq(&expected, data.integrity.as_slice()) {
         return Err(TpmRc(rc::INTEGRITY).with_parameter(1));
     }
-    let iv = vec![0u8; sym::block_size(config::CONTEXT_ENCRYPT_ALG)?];
-    sym::cfb_decrypt(&sym_key, &iv, data.encrypted.as_slice())
+    let (sym_key, iv) = context_encryption(
+        state,
+        context.hierarchy,
+        context.sequence,
+        context.saved_handle,
+    )?;
+    let plain = sym::cfb_decrypt(&sym_key, &iv, data.encrypted.as_slice())?;
+    if plain.len() < 8 {
+        return Err(TpmRc(rc::BAD_CONTEXT).with_parameter(1));
+    }
+    // Clause 27.3.1: "when the context is loaded, the value of sequence is
+    // compared to the value in the loaded TPM2B_CONTEXT_SENSITIVE context after
+    // it is decrypted. If the values are not the same, then the TPM will enter
+    // failure mode as this is symptomatic of a specific type of power analysis
+    // attack." The integrity value already covers both, so a mismatch here is
+    // not something a caller can produce by editing the blob.
+    let carried = u64::from_be_bytes(plain[..8].try_into().unwrap());
+    if carried != context.sequence {
+        state.failure_mode = true;
+        return Err(TpmRc(rc::FAILURE));
+    }
+    Ok(plain[8..].to_vec())
 }
 
 /// Marshal a loaded object into a context body.
@@ -567,7 +602,7 @@ mod tests {
 
     #[test]
     fn a_context_is_protected_and_tamper_evident() {
-        let state = TpmState::manufacture().unwrap();
+        let mut state = TpmState::manufacture().unwrap();
         let body = b"the context body".to_vec();
         let blob = seal_context(&state, rh::OWNER, 1, saved::TRANSIENT_OBJECT, &body).unwrap();
 
@@ -577,24 +612,24 @@ mod tests {
             hierarchy: rh::OWNER,
             context_blob: blob.clone(),
         };
-        assert_eq!(open_context(&state, &context).unwrap(), body);
+        assert_eq!(open_context(&mut state, &context).unwrap(), body);
 
         // A different sequence number, handle or hierarchy fails.
         let mut bad = Context {
             sequence: 2,
             ..context.clone()
         };
-        assert!(open_context(&state, &bad).is_err());
+        assert!(open_context(&mut state, &bad).is_err());
         bad = Context {
             saved_handle: saved::SEQUENCE_OBJECT,
             ..context.clone()
         };
-        assert!(open_context(&state, &bad).is_err());
+        assert!(open_context(&mut state, &bad).is_err());
         bad = Context {
             hierarchy: rh::PLATFORM,
             ..context.clone()
         };
-        assert!(open_context(&state, &bad).is_err());
+        assert!(open_context(&mut state, &bad).is_err());
     }
 
     #[test]
@@ -608,10 +643,10 @@ mod tests {
             hierarchy: rh::OWNER,
             context_blob: blob,
         };
-        assert!(open_context(&state, &context).is_ok());
+        assert!(open_context(&mut state, &context).is_ok());
         state.on_clear().unwrap();
         assert_eq!(
-            open_context(&state, &context).unwrap_err().0 & 0x03F,
+            open_context(&mut state, &context).unwrap_err().0 & 0x03F,
             rc::INTEGRITY & 0x03F
         );
     }

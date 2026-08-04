@@ -1058,6 +1058,188 @@ fn a_kem_key_names_the_hash_its_curve_is_registered_with() {
 }
 
 #[test]
+fn a_saved_session_survives_a_restart_and_not_a_reset() {
+    // Part 1 clause 27.5: "saved session contexts are not invalidated and may
+    // be reloaded after a TPM Restart or TPM Resume. Saved session contexts are
+    // invalidated on a TPM Reset." A session is protected under the NULL
+    // hierarchy, so this is what says nullProof may not change on a restart.
+    let h = Harness::started("sessionctx");
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0u8; 16]); // nonceCaller
+    p.u16(0); // encryptedSalt
+    p.u8(se::HMAC);
+    p.u16(alg::NULL); // symmetric
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+    let session = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[session], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS, "ContextSave -> {:08x}", r.code);
+    let context = r.body.clone();
+
+    // A TPM Restart: Shutdown(STATE) then Startup(CLEAR).
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &context));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a restart invalidated a saved session -> {:08x}",
+        r.code
+    );
+
+    // A TPM Reset does invalidate it.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &context));
+    assert_ne!(r.code, rc::SUCCESS, "a saved session survived a reset");
+}
+
+#[test]
+fn clear_changes_the_endorsement_proof_but_not_its_seed() {
+    // Part 3 clause 24.6.1: TPM2_Clear will "change the storage primary seed
+    // (SPS) to a new value" and "change shProof and ehProof". The Endorsement
+    // Primary Seed is not in that list, so an endorsement primary key comes
+    // back the same while a context saved under that hierarchy does not.
+    let h = Harness::started("clearproof");
+    let mut t = Writer::new();
+    t.u16(alg::ECC);
+    t.u16(alg::SHA256);
+    t.u32(0x0004_0072); // fixedTPM fixedParent userWithAuth sign
+    t.u16(0);
+    t.u16(alg::NULL);
+    t.u16(alg::ECDSA);
+    t.u16(alg::SHA256);
+    t.u16(swtrust::tpm::constants::curve::NIST_P256);
+    t.u16(alg::NULL);
+    t.u16(0);
+    t.u16(0);
+    let template = t.finish().unwrap();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let params = p.finish().unwrap();
+
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::ENDORSEMENT],
+        Some(&password(b"")),
+        &params,
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let handle = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+    // Only outPublic: the creation ticket beside it is made with the proof,
+    // which does change.
+    let size = u16::from_be_bytes([r.body[8], r.body[9]]) as usize;
+    let public_before = r.body[10..10 + size].to_vec();
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[handle], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let context = r.body.clone();
+
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Clear,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "TPM2_Clear -> {:08x}", r.code);
+
+    // The seed did not change, so the same template gives the same key.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::ENDORSEMENT],
+        Some(&password(b"")),
+        &params,
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let size = u16::from_be_bytes([r.body[8], r.body[9]]) as usize;
+    assert_eq!(
+        r.body[10..10 + size].to_vec(),
+        public_before,
+        "TPM2_Clear changed the endorsement seed"
+    );
+
+    // The proof did, so the context saved under it no longer verifies.
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &context));
+    assert_ne!(
+        r.code,
+        rc::SUCCESS,
+        "an endorsement context survived TPM2_Clear"
+    );
+}
+
+#[test]
+fn test_parms_refuses_a_kem_the_tpm_cannot_run() {
+    // Part 2 Table 229 says of an ECC key's kdf that "in the context of object
+    // creation, TPM2_LoadExternal(), or TPM2_TestParms(), TPM_RC_KDF indicates
+    // the TPM does not support the requested KDF".
+    let h = Harness::started("testparms");
+    let mut p = Writer::new();
+    p.u16(alg::ECC);
+    p.u16(alg::NULL); // symmetric
+    p.u16(alg::ECDH); // scheme
+    p.u16(alg::SHA256);
+    p.u16(swtrust::tpm::constants::curve::NIST_P256);
+    p.u16(alg::HKDF);
+    p.u16(alg::SHA384); // the hash P-256 is not registered with
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::TestParms,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::KDF | 0x040 | (1 << 8),
+        "TestParms took a KEM the TPM cannot run -> {:08x}",
+        r.code
+    );
+
+    let mut p = Writer::new();
+    p.u16(alg::ECC);
+    p.u16(alg::NULL);
+    p.u16(alg::ECDH);
+    p.u16(alg::SHA256);
+    p.u16(swtrust::tpm::constants::curve::NIST_P256);
+    p.u16(alg::HKDF);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::TestParms,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "the registered pair -> {:08x}", r.code);
+}
+
+#[test]
 fn ecc_parameters_describe_p256() {
     let h = Harness::started("eccparms");
     let mut p = Writer::new();
