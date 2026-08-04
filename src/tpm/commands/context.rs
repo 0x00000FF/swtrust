@@ -119,6 +119,10 @@ fn unmarshal_object(body: &[u8]) -> TpmResult<Object> {
     let hierarchy = r.u32()?;
     let tpm_generated = r.u8()? != 0;
     let public = crate::tpm::structures::keys::TpmtPublic::unmarshal(&mut r)?;
+    // A context may have been saved by a build whose rules were looser. The
+    // integrity check says the blob is this TPM's, not that what it holds is
+    // still something this TPM would accept.
+    crate::tpm::core::object::validate_public(&public)?;
     let sensitive = if r.u8()? != 0 {
         Some(crate::tpm::structures::keys::TpmtSensitive::unmarshal(
             &mut r,
@@ -425,6 +429,39 @@ mod tests {
     use super::*;
     use crate::tpm::constants::se;
     use crate::tpm::structures::schemes::SymDef;
+
+    #[test]
+    fn an_object_context_an_older_build_saved_is_refused() {
+        use crate::tpm::structures::attributes::ObjectAttributes;
+        use crate::tpm::structures::base::Tpm2bDigest;
+        use crate::tpm::structures::keys::{PublicId, PublicParms, TpmtPublic};
+        use crate::tpm::structures::schemes::Scheme;
+
+        // Part 3 clause 18.1 forbids a restricted signing key whose scheme is
+        // TPM_ALG_NULL. The integrity check on a context says the blob is this
+        // TPM's, not that a build with the same seeds was right to save it.
+        let public = TpmtPublic {
+            object_type: alg::ECC,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(
+                ObjectAttributes::SIGN_ENCRYPT | ObjectAttributes::RESTRICTED,
+            ),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::Ecc {
+                symmetric: SymDef::null(),
+                scheme: Scheme::null(),
+                curve_id: crate::tpm::constants::curve::NIST_P256,
+                kdf: Scheme::null(),
+            },
+            unique: PublicId::Ecc(Default::default()),
+        };
+        let object = Object::new(public, None, rh::OWNER, &rh::OWNER.to_be_bytes(), true).unwrap();
+        let body = marshal_object(&object).unwrap();
+        assert_eq!(
+            unmarshal_object(&body).unwrap_err(),
+            crate::tpm::error::TpmRc(crate::tpm::constants::rc::SCHEME)
+        );
+    }
 
     #[test]
     fn a_session_context_round_trips() {

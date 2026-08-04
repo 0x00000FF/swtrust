@@ -26,6 +26,10 @@ use super::session::SessionSlots;
 /// was written before the profile existed, which was always the legacy one, so
 /// it is still read rather than being thrown away: a TPM whose state a caller
 /// depends on should not lose it because this build learned a new field.
+///
+/// One build wrote the profile byte while still tagging the record version 1.
+/// It was never released and no file of that shape exists, so version 1 means
+/// the layout that came before the byte and nothing else.
 const STATE_VERSION: u32 = 2;
 const STATE_VERSION_WITHOUT_PROFILE: u32 = 1;
 
@@ -623,7 +627,13 @@ impl TpmState {
         // A file from before the profile existed was written by a TPM that had
         // the legacy algorithms, because that is all there was.
         let written_strict = if version == STATE_VERSION {
-            r.u8()? != 0
+            // Only zero and one are profiles. Taking anything else as strict
+            // would accept a file whose remaining fields cannot be trusted.
+            match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(TpmRc(rc::BAD_CONTEXT)),
+            }
         } else {
             false
         };
@@ -718,6 +728,11 @@ impl TpmState {
             let hierarchy = r.u32()?;
             let tpm_generated = r.u8()? != 0;
             let public = crate::tpm::structures::keys::TpmtPublic::unmarshal(&mut r)?;
+            // A file may have been written by a build whose rules were looser,
+            // so what comes back is checked rather than trusted. An object the
+            // TPM would refuse to load today must not be usable because it was
+            // made persistent yesterday.
+            super::object::validate_public(&public)?;
             let sensitive = if r.u8()? != 0 {
                 Some(crate::tpm::structures::keys::TpmtSensitive::unmarshal(
                     &mut r,
@@ -1286,6 +1301,49 @@ mod tests {
             back.commits.use_counter(alg::SHA256, b"n", counter, 256).unwrap(),
             r
         );
+    }
+
+    /// A restricted signing key whose scheme is TPM_ALG_NULL, which Part 3
+    /// clause 18.1 forbids and no build accepts today.
+    fn key_no_build_should_accept() -> Object {
+        let public = TpmtPublic {
+            object_type: alg::ECC,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(
+                ObjectAttributes::SIGN_ENCRYPT | ObjectAttributes::RESTRICTED,
+            ),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::Ecc {
+                symmetric: SymDef::null(),
+                scheme: Scheme::null(),
+                curve_id: crate::tpm::constants::curve::NIST_P256,
+                kdf: Scheme::null(),
+            },
+            unique: PublicId::Ecc(Default::default()),
+        };
+        Object::new(public, None, rh::OWNER, &rh::OWNER.to_be_bytes(), true).unwrap()
+    }
+
+    #[test]
+    fn a_state_file_naming_an_unknown_profile_is_refused() {
+        let s = TpmState::manufacture().unwrap();
+        let mut saved = s.save().unwrap();
+        // The profile byte follows the version. Only zero and one name one, so
+        // anything else means the rest of the record cannot be placed.
+        assert_eq!(saved[4], 0);
+        saved[4] = 2;
+        assert_eq!(TpmState::load(&saved).unwrap_err(), TpmRc(rc::BAD_CONTEXT));
+    }
+
+    #[test]
+    fn a_persistent_object_an_older_build_accepted_is_refused_on_load() {
+        // The file is the record of another build's rules, not of this one, so
+        // what it holds is checked on the way back in.
+        let mut s = TpmState::manufacture().unwrap();
+        s.persistent
+            .insert(hc::PERSISTENT_FIRST, key_no_build_should_accept());
+        let saved = s.save().unwrap();
+        assert_eq!(TpmState::load(&saved).unwrap_err(), TpmRc(rc::SCHEME));
     }
 
     #[test]

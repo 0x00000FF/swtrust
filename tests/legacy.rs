@@ -222,16 +222,48 @@ fn a_sha1_bank_can_be_allocated_extended_and_read() {
         code_of(&r)
     );
 
-    // Read it back and check the register moved.
+    // Read it back and check the register holds what the extend produced.
     let mut body = 1u32.to_be_bytes().to_vec();
     body.extend_from_slice(&alg::SHA1.to_be_bytes());
     body.push(3);
     body.extend_from_slice(&[0x00, 0x08, 0x00]);
     let r = h.send(cc::PCR_Read, &body);
     assert_eq!(code_of(&r), rc::SUCCESS);
-    // pcrUpdateCounter, the selection echoed back, then the digest list.
-    let digest = &r[r.len() - 20..];
-    assert_ne!(digest, [0u8; 20], "the SHA-1 register did not change");
+
+    // Walk the reply rather than taking the tail of it, so one that selected
+    // nothing cannot pass: pcrUpdateCounter, the selection echoed back, then a
+    // count and that many digests.
+    let mut at = 10 + 4;
+    let selections = u32::from_be_bytes([r[at], r[at + 1], r[at + 2], r[at + 3]]) as usize;
+    assert_eq!(selections, 1, "the SHA-1 bank was not in the reply");
+    at += 4;
+    assert_eq!(
+        u16::from_be_bytes([r[at], r[at + 1]]),
+        alg::SHA1,
+        "a different bank came back"
+    );
+    at += 2;
+    let size_of_select = r[at] as usize;
+    let select = &r[at + 1..at + 1 + size_of_select];
+    assert_eq!(select[1] & 0x08, 0x08, "PCR 11 was not among those read");
+    at += 1 + size_of_select;
+    let count = u32::from_be_bytes([r[at], r[at + 1], r[at + 2], r[at + 3]]);
+    assert_eq!(count, 1, "no digest was returned");
+    at += 4;
+    let size = u16::from_be_bytes([r[at], r[at + 1]]) as usize;
+    assert_eq!(size, 20, "the digest was not SHA-1 sized");
+    let digest = &r[at + 2..at + 2 + size];
+
+    // PCR 11 comes up at zero after a reset, and TPM2_PCR_Extend replaces the
+    // register with H(old || new).
+    let mut preimage = [0u8; 40];
+    preimage[20..].copy_from_slice(&[0xab; 20]);
+    let expected = swtrust::tpm::crypto::hash::digest(alg::SHA1, &preimage).unwrap();
+    assert_eq!(
+        digest,
+        &expected[..],
+        "the SHA-1 register holds another value"
+    );
 }
 
 #[test]
@@ -272,6 +304,46 @@ fn an_object_may_be_named_with_sha1_and_sign_with_it() {
     let handle = u32::from_be_bytes([r[10], r[11], r[12], r[13]]);
     assert_eq!(handle >> 24, 0x80, "a transient handle was expected");
 
+    // The reply carries the created public area and the Name the TPM gave it.
+    // Part 1 clause 16 makes the Name the nameAlg followed by that hash of the
+    // public area, so a key named with SHA-1 has a 22 octet Name.
+    let mut at = 10 + 4 + 4 + 2; // header, handle, parameterSize, outPublic's size
+    let public_size = u16::from_be_bytes([r[at - 2], r[at - 1]]) as usize;
+    let public_area = &r[at..at + public_size];
+    at += public_size;
+    let creation_data = u16::from_be_bytes([r[at], r[at + 1]]) as usize;
+    at += 2 + creation_data;
+    let creation_hash = u16::from_be_bytes([r[at], r[at + 1]]) as usize;
+    at += 2 + creation_hash;
+    at += 2 + 4; // creationTicket: its tag and hierarchy
+    let ticket_digest = u16::from_be_bytes([r[at], r[at + 1]]) as usize;
+    at += 2 + ticket_digest;
+    let name_size = u16::from_be_bytes([r[at], r[at + 1]]) as usize;
+    assert_eq!(name_size, 22, "the Name was not that of a SHA-1 object");
+    let name = &r[at + 2..at + 2 + name_size];
+    assert_eq!(
+        u16::from_be_bytes([name[0], name[1]]),
+        alg::SHA1,
+        "the Name does not say SHA-1"
+    );
+    let expected_name = swtrust::tpm::crypto::hash::digest(alg::SHA1, public_area).unwrap();
+    assert_eq!(
+        &name[2..],
+        &expected_name[..],
+        "the Name is not the SHA-1 of the public area"
+    );
+
+    // A TPMT_PUBLIC of an RSA key ends with the modulus in its unique field.
+    assert_eq!(
+        u16::from_be_bytes([
+            public_area[public_area.len() - 258],
+            public_area[public_area.len() - 257],
+        ]),
+        256,
+        "the modulus is not where the public area should end"
+    );
+    let modulus = &public_area[public_area.len() - 256..];
+
     // Sign a SHA-1 digest with it, which is the path that needed the
     // DigestInfo prefix.
     let mut body = 20u16.to_be_bytes().to_vec();
@@ -293,4 +365,22 @@ fn an_object_may_be_named_with_sha1_and_sign_with_it() {
     assert_eq!(u16::from_be_bytes([r[14], r[15]]), 0x0014);
     assert_eq!(u16::from_be_bytes([r[16], r[17]]), alg::SHA1);
     assert_eq!(u16::from_be_bytes([r[18], r[19]]), 256);
+    let signature = &r[20..20 + 256];
+
+    // Raise the signature by the public exponent and compare the block with
+    // what RFC 8017 section 9.2 says it has to be. The DigestInfo prefix is
+    // written out here rather than taken from the implementation, so a wrong
+    // prefix fails instead of agreeing with itself.
+    let key = swtrust::tpm::crypto::rsa::RsaPublic::new(modulus, 0).unwrap();
+    let block = swtrust::tpm::crypto::rsa::public_op(&key, signature).unwrap();
+    let mut expected = vec![0x00, 0x01];
+    expected.resize(256 - 1 - 15 - 20, 0xff);
+    expected.push(0x00);
+    // The SHA-1 AlgorithmIdentifier of OID 1.3.14.3.2.26 with a NULL parameter.
+    expected.extend_from_slice(&[
+        0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+    ]);
+    expected.extend_from_slice(&[0xcd; 20]);
+    assert_eq!(expected.len(), 256);
+    assert_eq!(block, expected, "the signed block is not RSASSA over SHA-1");
 }

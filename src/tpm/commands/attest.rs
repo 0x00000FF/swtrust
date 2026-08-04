@@ -149,9 +149,9 @@ pub fn certify(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let object_handle = request.handle(0)?;
     let sign_handle = request.handle(1)?;
     let mut r = request.reader();
-    let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
-    r.expect_end()?;
+    let qualifying_data = Tpm2bData::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r).map_err(|e| e.with_parameter(2))?;
+    r.expect_end().map_err(|e| e.with_parameter(2))?;
 
     let object = if crate::tpm::core::object::ObjectSlots::is_transient(object_handle) {
         state.objects.object(object_handle).map_err(|e| e.with_handle(1))?
@@ -182,11 +182,12 @@ pub fn certify_creation(state: &mut TpmState, request: &Request) -> TpmResult<Re
     let sign_handle = request.handle(0)?;
     let object_handle = request.handle(1)?;
     let mut r = request.reader();
-    let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
-    let creation_hash = Tpm2bDigest::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
-    let creation_ticket = Ticket::unmarshal_tagged(&mut r, &[st::CREATION])?;
-    r.expect_end()?;
+    let qualifying_data = Tpm2bData::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let creation_hash = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r).map_err(|e| e.with_parameter(3))?;
+    let creation_ticket =
+        Ticket::unmarshal_tagged(&mut r, &[st::CREATION]).map_err(|e| e.with_parameter(4))?;
+    r.expect_end().map_err(|e| e.with_parameter(4))?;
 
     let object = if crate::tpm::core::object::ObjectSlots::is_transient(object_handle) {
         state
@@ -271,9 +272,9 @@ pub fn quote(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 pub fn get_time(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let sign_handle = request.handle(1)?;
     let mut r = request.reader();
-    let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
-    r.expect_end()?;
+    let qualifying_data = Tpm2bData::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r).map_err(|e| e.with_parameter(2))?;
+    r.expect_end().map_err(|e| e.with_parameter(2))?;
 
     let attested = Attested::Time {
         time: TimeInfo {
@@ -297,11 +298,11 @@ pub fn nv_certify(state: &mut TpmState, request: &Request) -> TpmResult<Response
     let auth_handle = request.handle(1)?;
     let nv_handle = request.handle(2)?;
     let mut r = request.reader();
-    let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
-    let size = r.u16()?;
-    let offset = r.u16()?;
-    r.expect_end()?;
+    let qualifying_data = Tpm2bData::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r).map_err(|e| e.with_parameter(2))?;
+    let size = r.u16().map_err(|e| e.with_parameter(3))?;
+    let offset = r.u16().map_err(|e| e.with_parameter(4))?;
+    r.expect_end().map_err(|e| e.with_parameter(4))?;
 
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(3))?;
     // Part 3 clause 31.16.1 certifies only what the authorization is entitled
@@ -336,9 +337,9 @@ pub fn get_session_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
     let sign_handle = request.handle(1)?;
     let session_handle = request.handle(2)?;
     let mut r = request.reader();
-    let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
-    r.expect_end()?;
+    let qualifying_data = Tpm2bData::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r).map_err(|e| e.with_parameter(2))?;
+    r.expect_end().map_err(|e| e.with_parameter(2))?;
 
     let session = state
         .sessions
@@ -366,9 +367,9 @@ pub fn get_session_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
 pub fn get_command_audit_digest(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let sign_handle = request.handle(1)?;
     let mut r = request.reader();
-    let qualifying_data = Tpm2bData::unmarshal(&mut r)?;
-    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r)?;
-    r.expect_end()?;
+    let qualifying_data = Tpm2bData::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    let in_scheme = Scheme::unmarshal_sig_scheme(&mut r).map_err(|e| e.with_parameter(2))?;
+    r.expect_end().map_err(|e| e.with_parameter(2))?;
 
     let digest_alg = state.audit.alg;
     let audit_digest = state.audit.digest.clone();
@@ -409,10 +410,10 @@ pub fn set_command_code_audit_status(
     use crate::tpm::structures::lists::TpmlCc;
 
     let mut r = request.reader();
-    let audit_alg = r.u16()?;
-    let set_list = TpmlCc::unmarshal(&mut r)?;
-    let clear_list = TpmlCc::unmarshal(&mut r)?;
-    r.expect_end()?;
+    let audit_alg = r.u16().map_err(|e| e.with_parameter(1))?;
+    let set_list = TpmlCc::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    let clear_list = TpmlCc::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+    r.expect_end().map_err(|e| e.with_parameter(3))?;
 
     if audit_alg != alg::NULL && !hash::is_supported(audit_alg) {
         return Err(TpmRc(rc::HASH).with_parameter(1));
