@@ -56,9 +56,16 @@ fn signing_object(state: &TpmState, handle: u32) -> TpmResult<Object> {
 ///
 /// When `sign_handle` is TPM_RH_NULL the structure is returned unsigned, which
 /// Part 3 clause 18.1 allows so a caller can inspect the values.
+///
+/// `sign_handle_number` is which handle of the command signHandle is, counting
+/// from one. Part 2 clause 6.6.2 puts that number in the N field of a response
+/// code, and the attestation commands do not agree on where the signing key
+/// sits: TPM2_Quote and TPM2_CertifyCreation take it first, TPM2_Certify and
+/// TPM2_GetTime take it second.
 fn attest_and_sign(
     state: &mut TpmState,
     sign_handle: u32,
+    sign_handle_number: usize,
     in_scheme: &Scheme,
     extra_data: &Tpm2bData,
     attested: Attested,
@@ -67,7 +74,8 @@ fn attest_and_sign(
     let (object, scheme) = if sign_handle == rh::NULL {
         (None, None)
     } else {
-        let object = signing_object(state, sign_handle).map_err(|e| e.with_handle(1))?;
+        let object =
+            signing_object(state, sign_handle).map_err(|e| e.with_handle(sign_handle_number))?;
         let scheme = signing_scheme(&object, in_scheme)?;
         (Some(object), Some(scheme))
     };
@@ -158,8 +166,7 @@ pub fn certify(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         qualified_name: Tpm2bName::from_slice(&object.qualified_name)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)
-            .map_err(|e| if e.0 & 0xF00 == 0x100 { e.with_handle(2) } else { e })?;
+        attest_and_sign(state, sign_handle, 2, &in_scheme, &qualifying_data, attested, 2)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -218,7 +225,7 @@ pub fn certify_creation(state: &mut TpmState, request: &Request) -> TpmResult<Re
         creation_hash: creation_hash.clone(),
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 3)?;
+        attest_and_sign(state, sign_handle, 1, &in_scheme, &qualifying_data, attested, 3)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -252,7 +259,7 @@ pub fn quote(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         pcr_digest: Tpm2bDigest::new(pcr_digest)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
+        attest_and_sign(state, sign_handle, 1, &in_scheme, &qualifying_data, attested, 2)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -276,7 +283,7 @@ pub fn get_time(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
         firmware_version: crate::tpm::config::FIRMWARE_VERSION_1 as u64,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
+        attest_and_sign(state, sign_handle, 2, &in_scheme, &qualifying_data, attested, 2)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -316,7 +323,7 @@ pub fn nv_certify(state: &mut TpmState, request: &Request) -> TpmResult<Response
         nv_contents: Tpm2bMaxNvBuffer::new(data)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
+        attest_and_sign(state, sign_handle, 1, &in_scheme, &qualifying_data, attested, 2)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -347,7 +354,7 @@ pub fn get_session_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
         session_digest: Tpm2bDigest::from_slice(&session.audit.digest)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
+        attest_and_sign(state, sign_handle, 2, &in_scheme, &qualifying_data, attested, 2)?;
     respond(move |w| {
         info.marshal(w);
         signature.marshal(w);
@@ -380,7 +387,7 @@ pub fn get_command_audit_digest(state: &mut TpmState, request: &Request) -> TpmR
         command_digest: Tpm2bDigest::new(command_digest)?,
     };
     let (info, signature) =
-        attest_and_sign(state, sign_handle, &in_scheme, &qualifying_data, attested, 2)?;
+        attest_and_sign(state, sign_handle, 2, &in_scheme, &qualifying_data, attested, 2)?;
     // Part 1 clause 32 ends the audit log when the command returns a
     // signature, so a report taken with TPM_RH_NULL leaves the log running.
     // The counter is not touched here; it moves when the next log starts.
@@ -527,6 +534,7 @@ mod tests {
         let (info, signature) = attest_and_sign(
             &mut state,
             rh::NULL,
+            1,
             &Scheme::null(),
             &Tpm2bData::from_slice(b"qualifier").unwrap(),
             Attested::Time {
