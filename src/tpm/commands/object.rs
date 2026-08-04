@@ -886,7 +886,7 @@ pub fn load(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     object::validate_loaded_public(&public).map_err(|e| e.with_parameter(2))?;
     // Clause 12.2.1 repeats the creation rule for this command alone, so an
     // object that can do nothing is refused here as well as when it was made.
-    object::validate_not_inert(&public).map_err(|e| e.with_parameter(2))?;
+    object::validate_action_attributes(&public).map_err(|e| e.with_parameter(2))?;
     let object_name = names::object_name(&public)?;
 
     let plain = protect::unwrap_private(

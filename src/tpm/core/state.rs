@@ -28,8 +28,9 @@ use super::session::SessionSlots;
 /// depends on should not lose it because this build learned a new field.
 ///
 /// One build wrote the profile byte while still tagging the record version 1.
-/// It was never released and no file of that shape exists, so version 1 means
-/// the layout that came before the byte and nothing else.
+/// It was never released, so version 1 means the layout that came before the
+/// byte and nothing else. A file of the other shape can only have been written
+/// by a developer running that build, and is not one this reads.
 const STATE_VERSION: u32 = 2;
 const STATE_VERSION_WITHOUT_PROFILE: u32 = 1;
 
@@ -728,11 +729,6 @@ impl TpmState {
             let hierarchy = r.u32()?;
             let tpm_generated = r.u8()? != 0;
             let public = crate::tpm::structures::keys::TpmtPublic::unmarshal(&mut r)?;
-            // A file may have been written by a build whose rules were looser,
-            // so what comes back is checked rather than trusted. An object the
-            // TPM would refuse to load today must not be usable because it was
-            // made persistent yesterday.
-            super::object::validate_public(&public)?;
             let sensitive = if r.u8()? != 0 {
                 Some(crate::tpm::structures::keys::TpmtSensitive::unmarshal(
                     &mut r,
@@ -740,6 +736,10 @@ impl TpmState {
             } else {
                 None
             };
+            // The file is the record of whatever build wrote it, so an
+            // object that comes back has to pass what TPM2_Load would apply to
+            // it today rather than be trusted for having been saved.
+            super::object::validate_restored(&public, sensitive.as_ref())?;
             // A persistent object keeps the qualified name it had when it was
             // made persistent, which is rebuilt from its hierarchy.
             let parent_qn = super::names::handle_name(hierarchy);
@@ -1333,6 +1333,37 @@ mod tests {
         assert_eq!(saved[4], 0);
         saved[4] = 2;
         assert_eq!(TpmState::load(&saved).unwrap_err(), TpmRc(rc::BAD_CONTEXT));
+    }
+
+    /// An RSA key whose modulus is shorter than the keyBits beside it says,
+    /// which Part 2 Table 195 makes a contradiction and TPM2_Load refuses.
+    fn key_whose_modulus_disagrees() -> Object {
+        use crate::tpm::structures::base::Tpm2bPublicKeyRsa;
+        let public = TpmtPublic {
+            object_type: alg::RSA,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(ObjectAttributes::SIGN_ENCRYPT),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::Rsa {
+                symmetric: SymDef::null(),
+                scheme: Scheme::hash(alg::RSASSA, alg::SHA256),
+                key_bits: 2048,
+                exponent: 0,
+            },
+            unique: PublicId::Rsa(Tpm2bPublicKeyRsa::new(vec![0xff; 128]).unwrap()),
+        };
+        Object::new(public, None, rh::OWNER, &rh::OWNER.to_be_bytes(), true).unwrap()
+    }
+
+    #[test]
+    fn a_persistent_key_whose_material_disagrees_is_refused_on_load() {
+        // The restoration path applies what TPM2_Load would apply today, not
+        // just the rules every public area shares.
+        let mut s = TpmState::manufacture().unwrap();
+        s.persistent
+            .insert(hc::PERSISTENT_FIRST, key_whose_modulus_disagrees());
+        let saved = s.save().unwrap();
+        assert_eq!(TpmState::load(&saved).unwrap_err(), TpmRc(rc::KEY_SIZE));
     }
 
     #[test]

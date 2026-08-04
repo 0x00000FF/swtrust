@@ -380,17 +380,18 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
         return Err(TpmRc(rc::ATTRIBUTES));
     }
 
-    // A signing key that is not asymmetric and not a keyed hash cannot sign.
-    if sign && public.object_type == alg::SYMCIPHER && attrs.has(ObjectAttributes::RESTRICTED) {
-        return Err(TpmRc(rc::ATTRIBUTES));
-    }
-
     // Part 3 clause 18.1: "For a restricted signing key, the key's scheme
     // cannot be TPM_ALG_NULL and cannot be overridden." A restricted key signs
     // only what the TPM itself produced, and the scheme is part of what the
     // verifier is told to expect, so leaving it open would let the caller
     // choose it later and the restriction would say nothing.
-    if sign && attrs.has(ObjectAttributes::RESTRICTED) {
+    //
+    // A symmetric block cipher key is not a signing key. Part 2 clause 8.3.3.14
+    // says sign/encrypt on one means permission to encrypt, and that "a
+    // restricted symmetric block cipher key may only be used to encrypt a data
+    // block", so that combination is a key the specification defines rather
+    // than one to refuse, and it has no signing scheme to name.
+    if sign && attrs.has(ObjectAttributes::RESTRICTED) && public.object_type != alg::SYMCIPHER {
         let scheme_is_null = public
             .scheme()
             .map(|s| s.is_null())
@@ -433,24 +434,55 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
 /// has to satisfy when it is loaded.
 pub fn validate_creation_template(public: &TpmtPublic) -> TpmResult<()> {
     validate_public(public)?;
-    validate_not_inert(public)
+    validate_action_attributes(public)
 }
 
-/// Refuse an object that can neither sign nor decrypt.
+/// What an object is allowed to do, for the commands that say so.
 ///
-/// Part 3 states this twice in the same words, in clause 12.1.1 for
+/// Part 3 states the first rule twice in the same words, in clause 12.1.1 for
 /// TPM2_Create and TPM2_CreatePrimary and in clause 12.2.1 for TPM2_Load: "If
 /// the Object is a not a keyedHash object, and the sign and encrypt attributes
 /// are CLEAR, the TPM shall return TPM_RC_ATTRIBUTES." Only a keyed hash object
 /// is allowed to be inert, because that is what a sealed data object is.
 ///
-/// TPM2_LoadExternal does not say it, so it is not applied there.
-pub fn validate_not_inert(public: &TpmtPublic) -> TpmResult<()> {
-    if public.object_type != alg::KEYEDHASH
-        && !public.object_attributes.has(ObjectAttributes::SIGN_ENCRYPT)
-        && !public.object_attributes.has(ObjectAttributes::DECRYPT)
-    {
+/// The second is Part 2 clause 8.3.3.12, which says restricted "shall be CLEAR
+/// in template if neither sign nor decrypt is SET in template" on creation and
+/// "shall be CLEAR if neither sign nor decrypt is SET in the object" on load.
+/// restricted only qualifies what signing or decryption may do, so on an object
+/// that does neither it describes nothing. A sealed data object is exactly a
+/// keyed hash with both clear, so this is the rule that keeps one from claiming
+/// to be restricted.
+///
+/// Neither is stated for TPM2_LoadExternal, and clause 8.3.3.12 gives
+/// TPM2_Import its own answer of "may be SET or CLEAR", so neither command
+/// applies these.
+pub fn validate_action_attributes(public: &TpmtPublic) -> TpmResult<()> {
+    let attrs = public.object_attributes;
+    let sign = attrs.has(ObjectAttributes::SIGN_ENCRYPT);
+    let decrypt = attrs.has(ObjectAttributes::DECRYPT);
+    if public.object_type != alg::KEYEDHASH && !sign && !decrypt {
         return Err(TpmRc(rc::ATTRIBUTES));
+    }
+    if attrs.has(ObjectAttributes::RESTRICTED) && !sign && !decrypt {
+        return Err(TpmRc(rc::ATTRIBUTES));
+    }
+    Ok(())
+}
+
+/// Check an object a state file or a saved context gave back.
+///
+/// The blob was written by whatever build was running then, so an object that
+/// comes back has to pass what TPM2_Load would apply to it today. Part 2 clause
+/// 8.3.3.12 words the load rules as conditions on the object rather than on the
+/// command, so they do not stop being true because the object was put away.
+pub fn validate_restored(
+    public: &TpmtPublic,
+    sensitive: Option<&TpmtSensitive>,
+) -> TpmResult<()> {
+    validate_loaded_public(public)?;
+    validate_action_attributes(public)?;
+    if let Some(sensitive) = sensitive {
+        check_binding(public, sensitive)?;
     }
     Ok(())
 }
@@ -539,6 +571,84 @@ mod tests {
 
     fn object(attrs: u32) -> Object {
         Object::new(public(attrs), None, rh::OWNER, &rh::OWNER.to_be_bytes(), true).unwrap()
+    }
+
+    /// A symmetric block cipher key with the given attributes.
+    fn symcipher(attrs: u32) -> TpmtPublic {
+        TpmtPublic {
+            object_type: alg::SYMCIPHER,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(attrs),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::SymCipher {
+                sym: SymDef::new(alg::AES, 128, alg::CFB),
+            },
+            unique: PublicId::Sym(Default::default()),
+        }
+    }
+
+    #[test]
+    fn a_restricted_symmetric_key_may_encrypt() {
+        // Part 2 clause 8.3.3.14: sign/encrypt on a symmetric block cipher key
+        // means permission to encrypt, and "a restricted symmetric block cipher
+        // key may only be used to encrypt a data block". It is a key the
+        // specification defines rather than one to refuse, and it has no
+        // signing scheme to name.
+        let public = symcipher(
+            ObjectAttributes::SIGN_ENCRYPT
+                | ObjectAttributes::RESTRICTED
+                | ObjectAttributes::USER_WITH_AUTH,
+        );
+        assert!(validate_public(&public).is_ok());
+        assert!(validate_action_attributes(&public).is_ok());
+    }
+
+    #[test]
+    fn restricted_says_nothing_on_an_object_that_neither_signs_nor_decrypts() {
+        // Part 2 clause 8.3.3.12: restricted "shall be CLEAR in template if
+        // neither sign nor decrypt is SET in template" on creation and "shall
+        // be CLEAR if neither sign nor decrypt is SET in the object" on load. A
+        // sealed data object is a keyed hash with both clear, so this is what
+        // keeps one from claiming to be restricted.
+        let sealed = TpmtPublic {
+            object_type: alg::KEYEDHASH,
+            name_alg: alg::SHA256,
+            object_attributes: ObjectAttributes(
+                ObjectAttributes::RESTRICTED | ObjectAttributes::USER_WITH_AUTH,
+            ),
+            auth_policy: Tpm2bDigest::empty(),
+            parameters: PublicParms::KeyedHash {
+                scheme: Scheme::null(),
+            },
+            unique: PublicId::KeyedHash(Default::default()),
+        };
+        assert_eq!(
+            validate_action_attributes(&sealed).unwrap_err(),
+            TpmRc(rc::ATTRIBUTES)
+        );
+        // Without restricted the same object is an ordinary sealed one.
+        let mut plain = sealed.clone();
+        plain.object_attributes = ObjectAttributes(ObjectAttributes::USER_WITH_AUTH);
+        assert!(validate_action_attributes(&plain).is_ok());
+    }
+
+    #[test]
+    fn a_restricted_signing_key_still_needs_a_scheme() {
+        // The rule of Part 3 clause 18.1 is about signing keys, so narrowing it
+        // away from the symmetric case must not have loosened it here.
+        let mut public = public(
+            ObjectAttributes::SIGN_ENCRYPT
+                | ObjectAttributes::RESTRICTED
+                | ObjectAttributes::USER_WITH_AUTH,
+        );
+        assert!(validate_public(&public).is_ok());
+        public.parameters = PublicParms::Ecc {
+            symmetric: SymDef::null(),
+            scheme: Scheme::null(),
+            curve_id: curve::NIST_P256,
+            kdf: Scheme::null(),
+        };
+        assert_eq!(validate_public(&public).unwrap_err(), TpmRc(rc::SCHEME));
     }
 
     fn sequence() -> Slot {

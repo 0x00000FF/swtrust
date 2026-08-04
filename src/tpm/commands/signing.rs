@@ -124,8 +124,14 @@ pub fn sign_digest_command(state: &mut TpmState, request: &Request) -> TpmResult
         }
         verify_hash_ticket(state, &validation, hash_alg, digest.as_slice(), 3)?;
     }
-    let signature = sign_digest(state, &object, &scheme, digest.as_slice())
-        .map_err(|e| with_counter_parameter(e, &object, 1))?;
+    let signature = sign_digest(
+        state,
+        &object,
+        &scheme,
+        digest.as_slice(),
+        crate::tpm::commands::crypto::SignParameters::at(2, 1),
+    )
+    .map_err(|e| with_counter_parameter(e, &object, 1))?;
     respond(move |w| {
         signature.marshal(w);
         Ok(())
@@ -312,7 +318,13 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
     let scheme = scheme_with_counter(&object, counter)?;
     // Part 3 Table 115: an HMAC key signs the message itself, everything else
     // signs the digest of the message.
-    let signature = sign_message(state, &object, &scheme, &data)?;
+    let signature = sign_message(
+        state,
+        &object,
+        &scheme,
+        &data,
+        crate::tpm::commands::crypto::SignParameters::at(2, 1),
+    )?;
     respond(move |w| {
         signature.marshal(w);
         Ok(())

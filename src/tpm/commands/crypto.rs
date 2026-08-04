@@ -175,6 +175,26 @@ pub fn check_signing_key(object: &Object) -> TpmResult<()> {
 /// sign_digest serves several commands that number their parameters
 /// differently, so it answers unqualified and each command says which of its
 /// own parameters carried the counter.
+/// Which parameter of a command the digest and the scheme are.
+///
+/// Part 2 clause 6.6.2 numbers a parameter by its place in the command
+/// schematic, and the commands that sign do not agree on those places:
+/// TPM2_Sign takes the digest first and the scheme second, TPM2_SignDigest
+/// takes a signature context first, and the attestation commands compute the
+/// digest themselves so no parameter carries it. Zero means the TPM cannot
+/// designate one, which clause 6.6.2 answers with the plain code.
+#[derive(Clone, Copy)]
+pub struct SignParameters {
+    pub digest: usize,
+    pub scheme: usize,
+}
+
+impl SignParameters {
+    pub fn at(digest: usize, scheme: usize) -> SignParameters {
+        SignParameters { digest, scheme }
+    }
+}
+
 pub fn with_counter_parameter(e: TpmRc, object: &Object, parameter: usize) -> TpmRc {
     let uses_counter = object
         .public
@@ -197,11 +217,12 @@ pub fn sign_message(
     object: &Object,
     scheme: &Scheme,
     message: &[u8],
+    at: SignParameters,
 ) -> TpmResult<TpmtSignature> {
     if !signs_a_message(object) {
         let hash_alg = scheme.hash_alg().ok_or(TpmRc(rc::SCHEME))?;
         let digest = hash::digest(hash_alg, message)?;
-        return sign_digest(state, object, scheme, &digest);
+        return sign_digest(state, object, scheme, &digest, at);
     }
     let Some(sensitive) = &object.sensitive else {
         return Err(TpmRc(rc::HANDLE).with_handle(1));
@@ -543,13 +564,14 @@ pub fn sign_digest(
     object: &Object,
     scheme: &Scheme,
     digest: &[u8],
+    at: SignParameters,
 ) -> TpmResult<TpmtSignature> {
     let Some(sensitive) = &object.sensitive else {
         return Err(TpmRc(rc::HANDLE).with_handle(1));
     };
     let hash_alg = scheme.hash_alg().ok_or(TpmRc(rc::SCHEME))?;
     if digest.len() != hash::digest_size(hash_alg)? {
-        return Err(TpmRc(rc::SIZE).with_parameter(1));
+        return Err(TpmRc(rc::SIZE).with_parameter(at.digest));
     }
 
     match object.public.object_type {
@@ -580,7 +602,7 @@ pub fn sign_digest(
                     b.extend_from_slice(&em);
                     b
                 }
-                _ => return Err(TpmRc(rc::SCHEME).with_parameter(2)),
+                _ => return Err(TpmRc(rc::SCHEME).with_parameter(at.scheme)),
             };
             let sig = rsa::private_op(&key, &block)?;
             Ok(TpmtSignature {
@@ -633,7 +655,7 @@ pub fn sign_digest(
                         &mut state.rng,
                     )?
                 }
-                _ => return Err(TpmRc(rc::SCHEME).with_parameter(2)),
+                _ => return Err(TpmRc(rc::SCHEME).with_parameter(at.scheme)),
             };
             Ok(TpmtSignature {
                 sig_alg: scheme.scheme,
@@ -772,7 +794,8 @@ pub fn sign(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         }
         verify_hash_ticket(state, &validation, hash_alg, digest.as_slice(), 3)?;
     }
-    let signature = sign_digest(state, &object, &scheme, digest.as_slice())
+    let at = SignParameters::at(1, 2);
+    let signature = sign_digest(state, &object, &scheme, digest.as_slice(), at)
         .map_err(|e| with_counter_parameter(e, &object, 2))?;
     respond(move |w| {
         signature.marshal(w);

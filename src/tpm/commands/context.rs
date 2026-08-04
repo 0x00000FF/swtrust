@@ -119,10 +119,6 @@ fn unmarshal_object(body: &[u8]) -> TpmResult<Object> {
     let hierarchy = r.u32()?;
     let tpm_generated = r.u8()? != 0;
     let public = crate::tpm::structures::keys::TpmtPublic::unmarshal(&mut r)?;
-    // A context may have been saved by a build whose rules were looser. The
-    // integrity check says the blob is this TPM's, not that what it holds is
-    // still something this TPM would accept.
-    crate::tpm::core::object::validate_public(&public)?;
     let sensitive = if r.u8()? != 0 {
         Some(crate::tpm::structures::keys::TpmtSensitive::unmarshal(
             &mut r,
@@ -132,6 +128,10 @@ fn unmarshal_object(body: &[u8]) -> TpmResult<Object> {
     };
     let qn_size = r.u16()? as usize;
     let qualified_name = r.take(qn_size)?.to_vec();
+    // The integrity check says the blob is this TPM's, not that a build with
+    // the same seeds was right to save what is in it, so the object has to
+    // pass what TPM2_Load would apply to it today.
+    crate::tpm::core::object::validate_restored(&public, sensitive.as_ref())?;
     let name = crate::tpm::core::names::object_name(&public)?;
     Ok(Object {
         public,

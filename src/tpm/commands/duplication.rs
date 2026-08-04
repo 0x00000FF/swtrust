@@ -220,6 +220,8 @@ pub fn import(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         .ok_or(TpmRc(rc::TYPE).with_handle(1))?;
 
     let public = object_public.public_area;
+    crate::tpm::core::object::validate_loaded_public(&public)
+        .map_err(|e| e.with_parameter(2))?;
     // An imported object cannot claim to have been made by this TPM.
     if public
         .object_attributes

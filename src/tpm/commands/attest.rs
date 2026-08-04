@@ -135,7 +135,14 @@ fn attest_and_sign(
             // Part 2 clause 6.6.2 names the parameter an error belongs to,
             // and for a commit counter that is the scheme this command was
             // given.
-            sign_digest(state, &object, &scheme, &digest).map_err(|e| {
+            sign_digest(
+                state,
+                &object,
+                &scheme,
+                &digest,
+                super::crypto::SignParameters::at(0, scheme_parameter),
+            )
+            .map_err(|e| {
                 super::crypto::with_counter_parameter(e, &object, scheme_parameter)
             })?
         }
