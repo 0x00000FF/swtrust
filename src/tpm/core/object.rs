@@ -23,6 +23,11 @@ pub struct Object {
     /// Set when the object was created by this TPM rather than imported or
     /// loaded from outside, which TPM2_CertifyCreation needs.
     pub tpm_generated: bool,
+    /// The stateClear property of Part 1 clause 30.4.2: "an Object has the
+    /// stateClear property when stClear is SET in the Object or in any of its
+    /// ancestor keys." It is carried rather than read off the object because
+    /// the ancestors are gone by the time it is asked for.
+    pub state_clear: bool,
 }
 
 impl Object {
@@ -37,6 +42,9 @@ impl Object {
         let name = names::object_name(&public)?;
         let qualified_name =
             names::qualified_name(public.name_alg, parent_qualified_name, &name)?;
+        let state_clear = public
+            .object_attributes
+            .has(ObjectAttributes::ST_CLEAR);
         Ok(Object {
             public,
             sensitive,
@@ -44,6 +52,7 @@ impl Object {
             qualified_name,
             hierarchy,
             tpm_generated,
+            state_clear,
         })
     }
 
@@ -401,6 +410,21 @@ pub fn validate_public(public: &TpmtPublic) -> TpmResult<()> {
         }
     }
 
+    // Part 2 Table 229 says of an ECC key's kdf that it belongs to "an
+    // unrestricted decryption TPM_ALG_ECDH key" and "shall be NULL in all
+    // other cases (TPM_RC_KDF)". Part 1 clause 44.4.1 makes that same field
+    // what says the key is a KEM key, so a key that names one without being
+    // able to use it describes nothing.
+    if let crate::tpm::structures::keys::PublicParms::Ecc { scheme, kdf, .. } = &public.parameters {
+        if !kdf.is_null()
+            && (attrs.has(ObjectAttributes::RESTRICTED)
+                || !decrypt
+                || scheme.scheme != alg::ECDH)
+        {
+            return Err(TpmRc(rc::KDF));
+        }
+    }
+
     // The name algorithm must be a hash unless the object cannot be a parent.
     if public.name_alg == alg::NULL
         && attrs.has(ObjectAttributes::RESTRICTED | ObjectAttributes::DECRYPT)
@@ -489,20 +513,24 @@ pub fn validate_restricted_has_an_action(public: &TpmtPublic) -> TpmResult<()> {
 
 /// Check an object a state file or a saved context gave back.
 ///
-/// The blob was written by whatever build was running then, so an object that
-/// comes back has to pass what TPM2_Load would apply to it today. Part 2 clause
-/// 8.3.3.12 words the load rules as conditions on the object rather than on the
-/// command, so they do not stop being true because the object was put away.
+/// The blob was written by whatever build was running then, so what it holds is
+/// checked rather than trusted. What can be checked is what is true of every
+/// resident object however it arrived: the key material has to agree with the
+/// parameters beside it, and a sensitive area has to belong to its public one.
+///
+/// Not the attribute rules. Part 2 clause 8.3.3.1 gives each of TPM2_Create,
+/// TPM2_Load, TPM2_Import and TPM2_LoadExternal its own column of the attribute
+/// table, and clause 8.3.3.1 exempts a public area loaded on its own from every
+/// entry in the External column, so the same attributes are legal through one
+/// command and not through another. A saved object does not record which
+/// command admitted it, so applying any of those columns here would refuse
+/// something that was resident legitimately, which would lose a caller's state
+/// on a restart.
 pub fn validate_restored(
     public: &TpmtPublic,
     sensitive: Option<&TpmtSensitive>,
 ) -> TpmResult<()> {
     validate_loaded_public(public)?;
-    // Not the inert rule beside it. That one belongs to TPM2_Create and
-    // TPM2_Load rather than to the object: TPM2_LoadExternal reads no attribute
-    // column for a public area on its own, so a public key that neither signs
-    // nor decrypts is resident legitimately and has to survive being saved.
-    validate_restricted_has_an_action(public)?;
     if let Some(sensitive) = sensitive {
         check_binding(public, sensitive)?;
     }

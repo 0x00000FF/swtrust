@@ -7,6 +7,7 @@
 //! block cipher modes and deterministic key generation from a seed.
 
 pub mod bn;
+pub mod dhkem;
 pub mod ecc;
 pub mod hash;
 pub mod hmac;

@@ -446,23 +446,28 @@ fn self_test_and_test_result() {
     assert_eq!(reader.u32().unwrap(), rc::SUCCESS);
 }
 
-/// An ECC primary key on P-256 with the given attributes and kdf.
+/// Ask for an ECC primary key on P-256 with the given attributes, scheme and
+/// kdf, and give back the whole response so a refusal can be read.
 ///
-/// Part 2 Table 195 says of the kdf of an ECC key that "if this field is not
-/// NULL, then this key can be used with TPM2_Encapsulate() and
-/// TPM2_Decapsulate()", so it is what decides whether the key is a KEM key.
-fn ecc_kem_key(h: &Harness, attrs: u32, kdf: Option<u16>) -> u32 {
+/// Part 1 clause 44.4.1 says an ECC key "can be used as a Key Encapsulation
+/// Mechanism (KEM) key" if its kdf is not TPM_ALG_NULL, and Part 2 Table 229
+/// gives that field to "an unrestricted decryption TPM_ALG_ECDH key" and says
+/// it "shall be NULL in all other cases (TPM_RC_KDF)".
+fn ask_for_ecc_key(h: &Harness, attrs: u32, scheme: u16, kdf: Option<u16>) -> Answer {
     let mut t = Writer::new();
     t.u16(alg::ECC);
     t.u16(alg::SHA256); // nameAlg
     t.u32(attrs);
     t.u16(0); // authPolicy
     t.u16(alg::NULL); // symmetric
-    t.u16(alg::NULL); // scheme
+    t.u16(scheme);
+    if scheme != alg::NULL {
+        t.u16(alg::SHA256); // the scheme's hash
+    }
     t.u16(swtrust::tpm::constants::curve::NIST_P256);
     match kdf {
         Some(hash) => {
-            t.u16(alg::KDF1_SP800_56A);
+            t.u16(alg::HKDF);
             t.u16(hash);
         }
         None => t.u16(alg::NULL),
@@ -479,15 +484,41 @@ fn ecc_kem_key(h: &Harness, attrs: u32, kdf: Option<u16>) -> u32 {
     p.bytes(&template);
     p.u16(0); // outsideInfo
     p.u32(0); // creationPCR
-    let r = h.send(&command(
+    h.send(&command(
         st::SESSIONS,
         cc::CreatePrimary,
         &[rh::OWNER],
         Some(&password(b"")),
         &p.finish().unwrap(),
-    ));
+    ))
+}
+
+/// An unrestricted ECDH decryption key, which is what a KEM key is.
+fn ecc_kem_key(h: &Harness, kdf: Option<u16>) -> u32 {
+    let scheme = if kdf.is_some() { alg::ECDH } else { alg::NULL };
+    // fixedTPM fixedParent sensitiveDataOrigin userWithAuth decrypt
+    let r = ask_for_ecc_key(h, 0x0002_0072, scheme, kdf);
     assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
     u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]])
+}
+
+#[test]
+fn only_an_unrestricted_ecdh_decryption_key_may_name_a_kdf() {
+    // Part 2 Table 229: the kdf field belongs to "an unrestricted decryption
+    // TPM_ALG_ECDH key" and "shall be NULL in all other cases (TPM_RC_KDF)".
+    let h = Harness::started("kemkdf");
+    // A restricted key, which is a storage key rather than a KEM key.
+    let r = ask_for_ecc_key(&h, 0x0003_0072, alg::ECDH, Some(alg::SHA256));
+    assert_eq!(r.code, rc::KDF | 0x040 | (2 << 8), "restricted -> {:08x}", r.code);
+    // A signing key, which does not decrypt.
+    let r = ask_for_ecc_key(&h, 0x0004_0072, alg::ECDSA, Some(alg::SHA256));
+    assert_eq!(r.code, rc::KDF | 0x040 | (2 << 8), "signing -> {:08x}", r.code);
+    // A decryption key whose scheme is not ECDH.
+    let r = ask_for_ecc_key(&h, 0x0002_0072, alg::NULL, Some(alg::SHA256));
+    assert_eq!(r.code, rc::KDF | 0x040 | (2 << 8), "not ECDH -> {:08x}", r.code);
+    // The one the table describes.
+    let r = ask_for_ecc_key(&h, 0x0002_0072, alg::ECDH, Some(alg::SHA256));
+    assert_eq!(r.code, rc::SUCCESS, "an ECDH decryption key -> {:08x}", r.code);
 }
 
 #[test]
@@ -495,11 +526,7 @@ fn a_kem_key_encapsulates_and_decapsulates_the_same_secret() {
     let h = Harness::started("kem");
     // An unrestricted decryption key with a kdf, which is what Part 2 Table 195
     // makes usable with these two commands.
-    let handle = ecc_kem_key(
-        &h,
-        0x0002_0072, // fixedTPM fixedParent sensitiveDataOrigin userWithAuth decrypt
-        Some(alg::SHA256),
-    );
+    let handle = ecc_kem_key(&h, Some(alg::SHA256));
 
     let r = h.send(&command(st::NO_SESSIONS, cc::Encapsulate, &[handle], None, &[]));
     assert_eq!(r.code, rc::SUCCESS, "TPM2_Encapsulate -> {:08x}", r.code);
@@ -508,20 +535,15 @@ fn a_kem_key_encapsulates_and_decapsulates_the_same_secret() {
     let secret = reader.take(secret_size).unwrap().to_vec();
     assert_eq!(secret_size, 32, "the shared secret is a SHA-256 worth");
 
-    // Part 2 Table 101 makes the ECC ciphertext the octets of a TPMS_ECC_POINT
-    // and Table 102 gives TPM2B_KEM_CIPHERTEXT the one size around it, so the
-    // buffer holds two sized coordinates and nothing else.
+    // Part 1 clause 44.4.2 item 6 returns pkE_serialized as the ciphertext, and
+    // item 3.1 says "for NIST P-curves, the serialization of a point is
+    // (0x04 || X || Y)", so on P-256 that is 65 octets inside the one size
+    // TPM2B_KEM_CIPHERTEXT carries.
     let ct_size = reader.u16().unwrap() as usize;
     let ciphertext = reader.take(ct_size).unwrap().to_vec();
     assert!(reader.is_empty(), "the response has more after the ciphertext");
-    let mut point = Reader::new(&ciphertext);
-    let x = point.u16().unwrap() as usize;
-    point.take(x).unwrap();
-    let y = point.u16().unwrap() as usize;
-    point.take(y).unwrap();
-    assert!(point.is_empty(), "the point carries a size of its own");
-    assert_eq!(x, 32);
-    assert_eq!(y, 32);
+    assert_eq!(ct_size, 65, "the ciphertext is not an uncompressed point");
+    assert_eq!(ciphertext[0], 0x04, "the point is not uncompressed");
 
     // The same ciphertext must give the same secret back.
     let mut p = Writer::new();
@@ -546,16 +568,16 @@ fn a_key_without_a_kdf_is_not_a_kem_key() {
     // Part 3 clause 14.10.1 and 14.11.1 both say the key "shall be a KEM key
     // (TPM_RC_KEY)", and Part 2 Table 195 makes a non NULL kdf what says so.
     let h = Harness::started("kemnokdf");
-    let handle = ecc_kem_key(&h, 0x0002_0072, None);
+    let handle = ecc_kem_key(&h, None);
     // TPM2_Encapsulate takes no authorization; TPM2_Decapsulate uses the key.
     for code in [cc::Encapsulate, cc::Decapsulate] {
         let mut p = Writer::new();
         let (tag, auth) = if code == cc::Decapsulate {
-            // A well formed but empty point, so the command gets past
-            // unmarshalling and reaches the key.
-            p.u16(4);
-            p.u16(0);
-            p.u16(0);
+            // A serialized point of the right shape, so the command gets
+            // past unmarshalling and reaches the key.
+            p.u16(65);
+            p.u8(0x04);
+            p.bytes(&[0u8; 64]);
             (st::SESSIONS, Some(password(b"")))
         } else {
             (st::NO_SESSIONS, None)
@@ -580,28 +602,18 @@ fn a_key_without_a_kdf_is_not_a_kem_key() {
 fn decapsulate_refuses_a_restricted_key() {
     // Part 3 clause 14.11.1: the key "shall be a KEM key (TPM_RC_KEY) with
     // restricted CLEAR and decrypt SET (TPM_RC_ATTRIBUTES)". Without this a
-    // storage key would answer as a decapsulation oracle. TPM2_Encapsulate says
-    // instead that "the TPM does not verify the objectAttributes of the key",
-    // so the same key is fine there.
+    // storage key would answer as a decapsulation oracle. Such a key cannot
+    // name a kdf, so it is refused for its attributes before the question of
+    // whether it is a KEM key arises.
     let h = Harness::started("kemrestricted");
-    let handle = ecc_kem_key(
-        &h,
-        0x0003_0072, // the same with restricted set
-        Some(alg::SHA256),
-    );
-
-    let r = h.send(&command(st::NO_SESSIONS, cc::Encapsulate, &[handle], None, &[]));
-    assert_eq!(
-        r.code,
-        rc::SUCCESS,
-        "TPM2_Encapsulate looked at the attributes -> {:08x}",
-        r.code
-    );
+    let r = ask_for_ecc_key(&h, 0x0003_0072, alg::NULL, None);
+    assert_eq!(r.code, rc::SUCCESS, "a storage key -> {:08x}", r.code);
+    let handle = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
 
     let mut p = Writer::new();
-    p.u16(4);
-    p.u16(0);
-    p.u16(0);
+    p.u16(65);
+    p.u8(0x04);
+    p.bytes(&[0u8; 64]);
     let r = h.send(&command(
         st::SESSIONS,
         cc::Decapsulate,
@@ -628,7 +640,7 @@ fn a_public_area_on_its_own_may_say_fixed_tpm() {
     // that does live on some TPM is loaded this way to compute its Name or to
     // make a credential for it, and it says fixedTPM and restricted.
     let h = Harness::started("external");
-    let handle = ecc_kem_key(&h, 0x0003_0072, Some(alg::SHA256));
+    let handle = ecc_kem_key(&h, Some(alg::SHA256));
     let r = h.send(&command(
         st::NO_SESSIONS,
         cc::ReadPublic,
@@ -668,7 +680,7 @@ fn a_public_only_object_may_be_made_persistent() {
     // public portion of the object was loaded (for NV space efficiency).
     // Support for persisting public-only objects was added in version 185."
     let h = Harness::started("evictpublic");
-    let handle = ecc_kem_key(&h, 0x0002_0072, Some(alg::SHA256));
+    let handle = ecc_kem_key(&h, Some(alg::SHA256));
     let r = h.send(&command(
         st::NO_SESSIONS,
         cc::ReadPublic,
@@ -733,6 +745,135 @@ fn a_public_only_object_may_be_made_persistent() {
         r.code,
         rc::SUCCESS,
         "the persistent object did not survive -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
+fn a_context_of_a_state_clear_object_does_not_survive_startup_clear() {
+    // Part 1 clause 30.4.2: "objects that have the stateClear property are
+    // invalidated by Startup(CLEAR). To enforce this, the TPM will include
+    // clearCount in the integrity value of the Object."
+    let h = Harness::started("stclearctx");
+    // fixedTPM fixedParent sensitiveDataOrigin userWithAuth sign, with stClear.
+    let r = ask_for_ecc_key(&h, 0x0004_0076, alg::ECDSA, None);
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let handle = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[handle], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS, "ContextSave -> {:08x}", r.code);
+    let context = r.body.clone();
+    // Clause 30.4.2 item 3 gives such an object its own savedHandle value.
+    let saved_handle = u32::from_be_bytes([
+        context[8],
+        context[9],
+        context[10],
+        context[11],
+    ]);
+    assert_eq!(saved_handle, 0x8000_0002, "the context does not say stateClear");
+
+    // The same context loads while the count stands still.
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &context));
+    assert_eq!(r.code, rc::SUCCESS, "ContextLoad -> {:08x}", r.code);
+
+    // A Startup(CLEAR) advances the count, and the context stops verifying.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &context));
+    assert_ne!(
+        r.code,
+        rc::SUCCESS,
+        "a stateClear context survived Startup(CLEAR)"
+    );
+}
+
+#[test]
+fn a_state_clear_object_may_not_be_made_persistent() {
+    // Part 3 clause 28.5.1 rule 1.2 refuses an object when "the stClear is SET
+    // in the object or in an ancestor key".
+    let h = Harness::started("stclearevict");
+    let r = ask_for_ecc_key(&h, 0x0004_0076, alg::ECDSA, None);
+    assert_eq!(r.code, rc::SUCCESS);
+    let handle = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    let mut p = Writer::new();
+    p.u32(0x8100_0020);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::EvictControl,
+        &[rh::OWNER, handle],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::ATTRIBUTES | (2 << 8),
+        "a stClear object was persisted -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
+fn an_owner_object_is_not_persisted_under_platform_authorization() {
+    // Part 3 clause 28.5.1 rule 2: "if auth is TPM_RH_PLATFORM, the proper
+    // hierarchy is the Platform hierarchy. If auth is TPM_RH_OWNER, the proper
+    // hierarchy is either the Storage or the Endorsement hierarchy."
+    let h = Harness::started("evicthierarchy");
+    let handle = ecc_kem_key(&h, None);
+
+    let mut p = Writer::new();
+    p.u32(0x8180_0001);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::EvictControl,
+        &[rh::PLATFORM, handle],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::HIERARCHY | (2 << 8),
+        "the platform persisted an owner object -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
+fn the_platform_may_remove_a_persistent_object_the_owner_made() {
+    // Rule 8: "if auth is TPM_RH_OWNER, objectHandle shall be in the inclusive
+    // range of 81 00 00 00 to 81 7F FF FF. If auth is TPM_RH_PLATFORM,
+    // objectHandle may be any valid persistent object handle."
+    let h = Harness::started("evictremove");
+    let handle = ecc_kem_key(&h, None);
+
+    let mut p = Writer::new();
+    p.u32(0x8100_0030);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::EvictControl,
+        &[rh::OWNER, handle],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "EvictControl -> {:08x}", r.code);
+
+    let mut p = Writer::new();
+    p.u32(0x8100_0030);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::EvictControl,
+        &[rh::PLATFORM, 0x8100_0030],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "the platform could not remove it -> {:08x}",
         r.code
     );
 }

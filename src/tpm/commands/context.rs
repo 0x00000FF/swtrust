@@ -9,7 +9,6 @@ use crate::tpm::core::state::TpmState;
 use crate::tpm::crypto::{hash, hmac as mac, sym};
 use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Reader, Unmarshal, Writer};
-use crate::tpm::structures::attributes::ObjectAttributes;
 use crate::tpm::structures::base::{Tpm2bContextData, Tpm2bDigest};
 use crate::tpm::structures::context::{Context, ContextData};
 
@@ -45,6 +44,21 @@ fn context_keys(state: &TpmState, hierarchy: u32, sequence: u64) -> TpmResult<(V
 }
 
 /// Encrypt and authenticate a marshalled context.
+/// What the integrity value of a context covers beyond the blob itself.
+///
+/// Part 1 clause 30.4.2 says "objects that have the stateClear property are
+/// invalidated by Startup(CLEAR). To enforce this, the TPM will include
+/// clearCount in the integrity value of the Object." The count advances on
+/// every Startup(CLEAR), so a context that carries it stops verifying once one
+/// has happened, which is what invalidates it.
+fn clear_count(state: &TpmState, saved_handle: u32) -> u32 {
+    if saved_handle == saved::TRANSIENT_STCLEAR {
+        state.clock.reset_count
+    } else {
+        0
+    }
+}
+
 fn seal_context(
     state: &TpmState,
     hierarchy: u32,
@@ -65,6 +79,7 @@ fn seal_context(
             &sequence.to_be_bytes(),
             &saved_handle.to_be_bytes(),
             &hierarchy.to_be_bytes(),
+            &clear_count(state, saved_handle).to_be_bytes(),
         ],
     )?;
     let data = ContextData {
@@ -87,6 +102,7 @@ fn open_context(state: &TpmState, context: &Context) -> TpmResult<Vec<u8>> {
             &context.sequence.to_be_bytes(),
             &context.saved_handle.to_be_bytes(),
             &context.hierarchy.to_be_bytes(),
+            &clear_count(state, context.saved_handle).to_be_bytes(),
         ],
     )?;
     if !crate::tpm::core::protect::constant_time_eq(&expected, data.integrity.as_slice()) {
@@ -114,7 +130,7 @@ fn marshal_object(object: &Object) -> TpmResult<Vec<u8>> {
 }
 
 /// Rebuild an object from a context body.
-fn unmarshal_object(body: &[u8]) -> TpmResult<Object> {
+fn unmarshal_object(body: &[u8], state_clear: bool) -> TpmResult<Object> {
     let mut r = Reader::new(body);
     let hierarchy = r.u32()?;
     let tpm_generated = r.u8()? != 0;
@@ -140,6 +156,7 @@ fn unmarshal_object(body: &[u8]) -> TpmResult<Object> {
         qualified_name,
         hierarchy,
         tpm_generated,
+        state_clear,
     })
 }
 
@@ -281,11 +298,7 @@ pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Respon
                 Slot::Object(o) => {
                     // An object that may not be duplicated may still be saved,
                     // because a context never leaves this TPM.
-                    let saved_handle = if o
-                        .public
-                        .object_attributes
-                        .has(ObjectAttributes::ST_CLEAR)
-                    {
+                    let saved_handle = if o.state_clear {
                         saved::TRANSIENT_STCLEAR
                     } else {
                         saved::TRANSIENT_OBJECT
@@ -340,7 +353,12 @@ pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Respon
             respond_with_handle(handle, |_| Ok(()))
         }
         saved::TRANSIENT_OBJECT | saved::TRANSIENT_STCLEAR => {
-            let object = unmarshal_object(&body).map_err(|_| TpmRc(rc::BAD_CONTEXT))?;
+            // Part 1 clause 30.4.2 gives the two savedHandle values their
+            // meaning: one "indicates a Transient Object that does not have the
+            // stateClear property" and the other one that does.
+            let state_clear = context.saved_handle == saved::TRANSIENT_STCLEAR;
+            let object =
+                unmarshal_object(&body, state_clear).map_err(|_| TpmRc(rc::BAD_CONTEXT))?;
             let handle = state.objects.insert(Slot::Object(Box::new(object)))?;
             respond_with_handle(handle, |_| Ok(()))
         }
@@ -361,27 +379,44 @@ pub fn evict_control(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     }
     // The platform owns the upper half of the persistent range.
     let is_platform_range = persistent_handle >= hc::PLATFORM_PERSISTENT;
+    if !matches!(auth, rh::PLATFORM | rh::OWNER) {
+        return Err(TpmRc(rc::AUTH_TYPE).with_handle(1));
+    }
+
+    // Naming a persistent object removes it, and the clause gives a removal its
+    // own rules. Rule 8: "if auth is TPM_RH_OWNER, objectHandle shall be in the
+    // inclusive range of 81 00 00 00 to 81 7F FF FF. If auth is
+    // TPM_RH_PLATFORM, objectHandle may be any valid persistent object handle."
+    // So the platform may remove one the owner made, which the range rule for
+    // making an object persistent would not allow. Rule 9: "if objectHandle is
+    // not the same value as persistentHandle, return TPM_RC_HANDLE."
+    if (hc::PERSISTENT_FIRST..=hc::PERSISTENT_LAST).contains(&object_handle) {
+        if auth == rh::OWNER && object_handle >= hc::PLATFORM_PERSISTENT {
+            return Err(TpmRc(rc::RANGE).with_handle(2));
+        }
+        if object_handle != persistent_handle {
+            return Err(TpmRc(rc::HANDLE).with_handle(2));
+        }
+        state
+            .persistent
+            .remove(&persistent_handle)
+            .ok_or(TpmRc(rc::HANDLE).with_handle(2))?;
+        return respond(|_| Ok(()));
+    }
+
+    // Rule 3 is about where a new persistent object may go, so it applies to
+    // making one and not to removing one.
     match auth {
         rh::PLATFORM => {
             if !is_platform_range {
                 return Err(TpmRc(rc::RANGE).with_parameter(1));
             }
         }
-        rh::OWNER => {
+        _ => {
             if is_platform_range {
                 return Err(TpmRc(rc::RANGE).with_parameter(1));
             }
         }
-        _ => return Err(TpmRc(rc::AUTH_TYPE).with_handle(1)),
-    }
-
-    // Naming the persistent handle itself removes the object.
-    if object_handle == persistent_handle {
-        state
-            .persistent
-            .remove(&persistent_handle)
-            .ok_or(TpmRc(rc::HANDLE).with_handle(2))?;
-        return respond(|_| Ok(()));
     }
 
     let object = state
@@ -400,11 +435,22 @@ pub fn evict_control(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     if object.hierarchy == rh::NULL {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
     }
-    if object
-        .public
-        .object_attributes
-        .has(ObjectAttributes::ST_CLEAR)
-    {
+    // Rule 2: "the TPM shall return TPM_RC_HIERARCHY if the object is not in
+    // the proper hierarchy as determined by auth. If auth is TPM_RH_PLATFORM,
+    // the proper hierarchy is the Platform hierarchy. If auth is
+    // TPM_RH_OWNER, the proper hierarchy is either the Storage or the
+    // Endorsement hierarchy."
+    let proper = match auth {
+        rh::PLATFORM => object.hierarchy == rh::PLATFORM,
+        _ => object.hierarchy == rh::OWNER || object.hierarchy == rh::ENDORSEMENT,
+    };
+    if !proper {
+        return Err(TpmRc(rc::HIERARCHY).with_handle(2));
+    }
+    // Rule 1.2 is "the stClear is SET in the object or in an ancestor key",
+    // which is the stateClear property Part 1 clause 30.4.2 defines and the
+    // object carries from when its parent was still known.
+    if object.state_clear {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
     }
     if state.persistent.contains_key(&persistent_handle) {
@@ -465,7 +511,7 @@ mod tests {
         let object = Object::new(public, None, rh::OWNER, &rh::OWNER.to_be_bytes(), true).unwrap();
         let body = marshal_object(&object).unwrap();
         assert_eq!(
-            unmarshal_object(&body).unwrap_err(),
+            unmarshal_object(&body, false).unwrap_err(),
             crate::tpm::error::TpmRc(crate::tpm::constants::rc::SCHEME)
         );
     }

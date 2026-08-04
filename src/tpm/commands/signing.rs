@@ -5,7 +5,7 @@ use crate::tpm::config;
 use crate::tpm::constants::{alg, rc, rh, st};
 use crate::tpm::core::object::{Object, Sequence, SequenceKind, Slot};
 use crate::tpm::core::state::TpmState;
-use crate::tpm::crypto::{ecc, hash};
+use crate::tpm::crypto::{dhkem, ecc, hash};
 use crate::tpm::error::{TpmRc, TpmResult};
 use crate::tpm::marshal::{Marshal, Unmarshal};
 use crate::tpm::structures::attributes::ObjectAttributes;
@@ -853,41 +853,31 @@ pub fn encapsulate(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         return Err(TpmRc(rc::TYPE));
     };
     // Part 3 clause 14.10.1 asks only that the key be a KEM key, and says "the
-    // TPM does not verify the objectAttributes of the key". Part 2 Table 195
-    // says of an ECC key's kdf that "if this field is not NULL, then this key
-    // can be used with TPM2_Encapsulate() and TPM2_Decapsulate()", so a NULL
-    // one is what makes a key not a KEM key.
-    let hash_alg = kdf.hash_alg().ok_or(TpmRc(rc::KEY).with_handle(1))?;
+    // TPM does not verify the objectAttributes of the key". Part 1 clause
+    // 44.4.1 says which ECC keys those are: one "can be used as a Key
+    // Encapsulation Mechanism (KEM) key" if its kdf is not TPM_ALG_NULL.
+    let hash_alg = dhkem::kem_hash(kdf).map_err(|_| TpmRc(rc::KEY).with_handle(1))?;
 
+    // Part 1 clause 44.4.2 walks the DHKEM Encaps function of RFC 9180.
     let ephemeral = ecc::generate(*curve_id, &mut state.rng)?;
-    let (zx, _) = ecc::ecdh(
+    let (dh, _) = ecc::ecdh(
         &ephemeral.curve,
         &ephemeral.private,
         point.x.as_slice(),
         point.y.as_slice(),
     )?;
-    let secret = crate::tpm::crypto::hmac::kdfe(
-        hash_alg,
-        &zx,
-        "SECRET",
-        &ephemeral.public_x,
-        point.x.as_slice(),
-        (hash::digest_size(hash_alg)? * 8) as u32,
-    )?;
+    let pk_e = dhkem::serialize_point(*curve_id, &ephemeral.public_x, &ephemeral.public_y)?;
+    let pk_r = dhkem::serialize_point(*curve_id, point.x.as_slice(), point.y.as_slice())?;
+    let mut kem_context = pk_e.clone();
+    kem_context.extend_from_slice(&pk_r);
+    let secret = dhkem::extract_and_expand(hash_alg, *curve_id, &dh, &kem_context)?;
 
     respond(move |w| {
         Tpm2bSharedSecret::new(secret)?.marshal(w);
-        // The ciphertext of the ECC form is the ephemeral point. Part 2 Table
-        // 101 makes the ecdh member of TPMU_KEM_CIPHERTEXT the octets of a
-        // TPMS_ECC_POINT, and Table 102 gives TPM2B_KEM_CIPHERTEXT the one
-        // size around it, so the point carries no size of its own.
-        w.sized16_with(|w| {
-            EccPoint {
-                x: Tpm2bEccParameter::new(ephemeral.public_x.clone()).unwrap_or_default(),
-                y: Tpm2bEccParameter::new(ephemeral.public_y.clone()).unwrap_or_default(),
-            }
-            .marshal(w)
-        });
+        // Item 6 returns pkE_serialized as the ciphertext, and Part 2 Table 102
+        // gives TPM2B_KEM_CIPHERTEXT the size around it.
+        w.u16(pk_e.len() as u16);
+        w.bytes(&pk_e);
         Ok(())
     })
 }
@@ -899,9 +889,9 @@ pub fn decapsulate(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
     let size = r.u16().map_err(|e| e.with_parameter(1))? as usize;
-    let mut inner = r.sub(size).map_err(|e| e.with_parameter(1))?;
+    let inner = r.sub(size).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
-    let ciphertext = EccPoint::unmarshal(&mut inner).map_err(|e| e.with_parameter(1))?;
+    let ciphertext = inner.rest().to_vec();
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
     if object.public.object_type != alg::ECC {
@@ -930,25 +920,19 @@ pub fn decapsulate(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let PublicId::Ecc(point) = &object.public.unique else {
         return Err(TpmRc(rc::TYPE));
     };
-    let hash_alg = kdf.hash_alg().ok_or(TpmRc(rc::KEY).with_handle(1))?;
+    let hash_alg = dhkem::kem_hash(kdf).map_err(|_| TpmRc(rc::KEY).with_handle(1))?;
 
+    // Part 1 clause 44.4.3: the ciphertext is pkE_serialized, so it is read
+    // back the way clause 44.4.2 item 3 wrote it.
+    let (ct_x, ct_y) =
+        dhkem::deserialize_point(*curve_id, &ciphertext).map_err(|e| e.with_parameter(1))?;
     let curve = ecc::Curve::new(*curve_id)?;
     let private = crate::tpm::crypto::bn::BigNum::from_bytes(sensitive.sensitive.as_slice())?;
-    let (zx, _) = ecc::ecdh(
-        &curve,
-        &private,
-        ciphertext.x.as_slice(),
-        ciphertext.y.as_slice(),
-    )
-    .map_err(|e| e.with_parameter(1))?;
-    let secret = crate::tpm::crypto::hmac::kdfe(
-        hash_alg,
-        &zx,
-        "SECRET",
-        ciphertext.x.as_slice(),
-        point.x.as_slice(),
-        (hash::digest_size(hash_alg)? * 8) as u32,
-    )?;
+    let (dh, _) = ecc::ecdh(&curve, &private, &ct_x, &ct_y).map_err(|e| e.with_parameter(1))?;
+    let pk_r = dhkem::serialize_point(*curve_id, point.x.as_slice(), point.y.as_slice())?;
+    let mut kem_context = ciphertext.clone();
+    kem_context.extend_from_slice(&pk_r);
+    let secret = dhkem::extract_and_expand(hash_alg, *curve_id, &dh, &kem_context)?;
     respond(move |w| {
         Tpm2bSharedSecret::new(secret)?.marshal(w);
         Ok(())

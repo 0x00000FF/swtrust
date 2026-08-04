@@ -104,12 +104,13 @@ impl Unmarshal for SchemeXor {
 
 /// True when `id` names a key derivation function this TPM implements.
 ///
-/// Part 2 Table 82 also lists TPM_ALG_HKDF, which this TPM does not implement
-/// and therefore does not accept.
+/// Part 2 Table 82 lists TPM_ALG_HKDF beside the others, and the note under an
+/// ECC key's kdf field says "currently, TPM_ALG_HKDF is the only supported KDF
+/// for DHKEM", so a KEM key cannot be described without it.
 pub fn is_kdf(id: u16) -> bool {
     matches!(
         id,
-        alg::MGF1 | alg::KDF1_SP800_56A | alg::KDF2 | alg::KDF1_SP800_108
+        alg::MGF1 | alg::KDF1_SP800_56A | alg::KDF2 | alg::KDF1_SP800_108 | alg::HKDF
     )
 }
 

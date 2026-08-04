@@ -334,6 +334,8 @@ fn creation_ticket(
 
 /// The parent an object is created under or loaded into.
 struct Parent {
+    /// The stateClear property of Part 1 clause 30.4.2, which a child inherits.
+    state_clear: bool,
     name_alg: u16,
     seed: Vec<u8>,
     symmetric: crate::tpm::structures::schemes::SymDef,
@@ -366,6 +368,7 @@ fn parent_of(state: &TpmState, handle: u32) -> TpmResult<Parent> {
         return Err(TpmRc(rc::SYMMETRIC));
     }
     Ok(Parent {
+        state_clear: object.state_clear,
         name_alg: object.name_alg(),
         seed: object.seed_value().to_vec(),
         symmetric,
@@ -901,13 +904,16 @@ pub fn load(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     // is what makes the public area a description of this private key.
     object::check_binding(&public, &sensitive).map_err(|e| e.with_parameter(1))?;
 
-    let object = Object::new(
+    let mut object = Object::new(
         public,
         Some(sensitive),
         parent.hierarchy,
         &parent.qualified_name,
         false,
     )?;
+    // Part 1 clause 30.4.2: the property comes from the object or from any of
+    // its ancestors, and the parent carries what its own ancestors gave it.
+    object.state_clear |= parent.state_clear;
     let name = object.name.clone();
     let handle = state.objects.insert(Slot::Object(Box::new(object)))?;
     respond_with_handle(handle, move |w| {
@@ -983,6 +989,19 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
             || public
                 .object_attributes
                 .has(ObjectAttributes::RESTRICTED)
+        {
+            return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+        }
+        // Clause 8.3.3.8 firmwareLimited and 8.3.3.9 svnLimited say the same
+        // of an external object that brings its sensitive half: an object
+        // whose use is bound to this TPM's firmware or version cannot have
+        // arrived from outside it.
+        if public
+            .object_attributes
+            .has(ObjectAttributes::FIRMWARE_LIMITED)
+            || public
+                .object_attributes
+                .has(ObjectAttributes::SVN_LIMITED)
         {
             return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
         }
