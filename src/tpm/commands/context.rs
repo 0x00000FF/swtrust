@@ -389,15 +389,22 @@ pub fn evict_control(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         .object(object_handle)
         .map_err(|e| e.with_handle(2))?
         .clone();
-    // Only an object that never leaves the TPM may be made persistent.
-    if !object
-        .public
-        .object_attributes
-        .has(ObjectAttributes::FIXED_TPM)
-    {
+    // Part 3 clause 28.5.1 lists what a transient object may not be: it may not
+    // be "in the hierarchy of TPM_RH_NULL or a firmware-limited or SVN-limited
+    // hierarchy", and stClear may not be set in it or in an ancestor. The
+    // clause says nothing of fixedTPM, and the note beside it says "older
+    // versions of the specification did not allow an object to be persisted
+    // when only the public portion of the object was loaded (for NV space
+    // efficiency). Support for persisting public-only objects was added in
+    // version 185."
+    if object.hierarchy == rh::NULL {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
     }
-    if object.is_public_only() {
+    if object
+        .public
+        .object_attributes
+        .has(ObjectAttributes::ST_CLEAR)
+    {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
     }
     if state.persistent.contains_key(&persistent_handle) {

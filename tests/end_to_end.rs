@@ -446,6 +446,297 @@ fn self_test_and_test_result() {
     assert_eq!(reader.u32().unwrap(), rc::SUCCESS);
 }
 
+/// An ECC primary key on P-256 with the given attributes and kdf.
+///
+/// Part 2 Table 195 says of the kdf of an ECC key that "if this field is not
+/// NULL, then this key can be used with TPM2_Encapsulate() and
+/// TPM2_Decapsulate()", so it is what decides whether the key is a KEM key.
+fn ecc_kem_key(h: &Harness, attrs: u32, kdf: Option<u16>) -> u32 {
+    let mut t = Writer::new();
+    t.u16(alg::ECC);
+    t.u16(alg::SHA256); // nameAlg
+    t.u32(attrs);
+    t.u16(0); // authPolicy
+    t.u16(alg::NULL); // symmetric
+    t.u16(alg::NULL); // scheme
+    t.u16(swtrust::tpm::constants::curve::NIST_P256);
+    match kdf {
+        Some(hash) => {
+            t.u16(alg::KDF1_SP800_56A);
+            t.u16(hash);
+        }
+        None => t.u16(alg::NULL),
+    }
+    t.u16(0); // unique x
+    t.u16(0); // unique y
+    let template = t.finish().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(4); // inSensitive
+    p.u16(0); // userAuth
+    p.u16(0); // data
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0); // outsideInfo
+    p.u32(0); // creationPCR
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]])
+}
+
+#[test]
+fn a_kem_key_encapsulates_and_decapsulates_the_same_secret() {
+    let h = Harness::started("kem");
+    // An unrestricted decryption key with a kdf, which is what Part 2 Table 195
+    // makes usable with these two commands.
+    let handle = ecc_kem_key(
+        &h,
+        0x0002_0072, // fixedTPM fixedParent sensitiveDataOrigin userWithAuth decrypt
+        Some(alg::SHA256),
+    );
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::Encapsulate, &[handle], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS, "TPM2_Encapsulate -> {:08x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let secret_size = reader.u16().unwrap() as usize;
+    let secret = reader.take(secret_size).unwrap().to_vec();
+    assert_eq!(secret_size, 32, "the shared secret is a SHA-256 worth");
+
+    // Part 2 Table 101 makes the ECC ciphertext the octets of a TPMS_ECC_POINT
+    // and Table 102 gives TPM2B_KEM_CIPHERTEXT the one size around it, so the
+    // buffer holds two sized coordinates and nothing else.
+    let ct_size = reader.u16().unwrap() as usize;
+    let ciphertext = reader.take(ct_size).unwrap().to_vec();
+    assert!(reader.is_empty(), "the response has more after the ciphertext");
+    let mut point = Reader::new(&ciphertext);
+    let x = point.u16().unwrap() as usize;
+    point.take(x).unwrap();
+    let y = point.u16().unwrap() as usize;
+    point.take(y).unwrap();
+    assert!(point.is_empty(), "the point carries a size of its own");
+    assert_eq!(x, 32);
+    assert_eq!(y, 32);
+
+    // The same ciphertext must give the same secret back.
+    let mut p = Writer::new();
+    p.u16(ct_size as u16);
+    p.bytes(&ciphertext);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Decapsulate,
+        &[handle],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "TPM2_Decapsulate -> {:08x}", r.code);
+    let mut reader = Reader::new(&r.body);
+    let _parameter_size = reader.u32().unwrap();
+    let size = reader.u16().unwrap() as usize;
+    assert_eq!(reader.take(size).unwrap(), &secret[..], "a different secret came back");
+}
+
+#[test]
+fn a_key_without_a_kdf_is_not_a_kem_key() {
+    // Part 3 clause 14.10.1 and 14.11.1 both say the key "shall be a KEM key
+    // (TPM_RC_KEY)", and Part 2 Table 195 makes a non NULL kdf what says so.
+    let h = Harness::started("kemnokdf");
+    let handle = ecc_kem_key(&h, 0x0002_0072, None);
+    // TPM2_Encapsulate takes no authorization; TPM2_Decapsulate uses the key.
+    for code in [cc::Encapsulate, cc::Decapsulate] {
+        let mut p = Writer::new();
+        let (tag, auth) = if code == cc::Decapsulate {
+            // A well formed but empty point, so the command gets past
+            // unmarshalling and reaches the key.
+            p.u16(4);
+            p.u16(0);
+            p.u16(0);
+            (st::SESSIONS, Some(password(b"")))
+        } else {
+            (st::NO_SESSIONS, None)
+        };
+        let r = h.send(&command(
+            tag,
+            code,
+            &[handle],
+            auth.as_deref(),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(
+            r.code,
+            rc::KEY | (1 << 8),
+            "a key with no kdf was taken -> {:08x}",
+            r.code
+        );
+    }
+}
+
+#[test]
+fn decapsulate_refuses_a_restricted_key() {
+    // Part 3 clause 14.11.1: the key "shall be a KEM key (TPM_RC_KEY) with
+    // restricted CLEAR and decrypt SET (TPM_RC_ATTRIBUTES)". Without this a
+    // storage key would answer as a decapsulation oracle. TPM2_Encapsulate says
+    // instead that "the TPM does not verify the objectAttributes of the key",
+    // so the same key is fine there.
+    let h = Harness::started("kemrestricted");
+    let handle = ecc_kem_key(
+        &h,
+        0x0003_0072, // the same with restricted set
+        Some(alg::SHA256),
+    );
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::Encapsulate, &[handle], None, &[]));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "TPM2_Encapsulate looked at the attributes -> {:08x}",
+        r.code
+    );
+
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Decapsulate,
+        &[handle],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::ATTRIBUTES | (1 << 8),
+        "a restricted key decapsulated -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
+fn a_public_area_on_its_own_may_say_fixed_tpm() {
+    // Part 2 clause 8.3.3.1 says the External column of the attribute table
+    // "indicates settings that apply to the inPublic parameter in
+    // TPM2_LoadExternal() if both the public and sensitive portions of the
+    // object are loaded", and that when only the public portion is loaded "the
+    // only attribute checks are the checks in the validation code following
+    // Table 37 and the reserved attributes check". The public half of a key
+    // that does live on some TPM is loaded this way to compute its Name or to
+    // make a credential for it, and it says fixedTPM and restricted.
+    let h = Harness::started("external");
+    let handle = ecc_kem_key(&h, 0x0003_0072, Some(alg::SHA256));
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::ReadPublic,
+        &[handle],
+        None,
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let mut reader = Reader::new(&r.body);
+    let size = reader.u16().unwrap() as usize;
+    let public = reader.take(size).unwrap().to_vec();
+
+    let mut p = Writer::new();
+    p.u16(0); // inPrivate, the Empty Buffer
+    p.u16(public.len() as u16);
+    p.bytes(&public);
+    p.u32(rh::OWNER);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::LoadExternal,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a public area saying fixedTPM was refused -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
+fn a_public_only_object_may_be_made_persistent() {
+    // Part 3 clause 28.5.1 has a note beside its rules: "older versions of the
+    // specification did not allow an object to be persisted when only the
+    // public portion of the object was loaded (for NV space efficiency).
+    // Support for persisting public-only objects was added in version 185."
+    let h = Harness::started("evictpublic");
+    let handle = ecc_kem_key(&h, 0x0002_0072, Some(alg::SHA256));
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::ReadPublic,
+        &[handle],
+        None,
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let mut reader = Reader::new(&r.body);
+    let size = reader.u16().unwrap() as usize;
+    let public = reader.take(size).unwrap().to_vec();
+
+    // Load it as an external public area, which gives an object with no
+    // sensitive half, and then persist that.
+    let mut p = Writer::new();
+    p.u16(0);
+    p.u16(public.len() as u16);
+    p.bytes(&public);
+    p.u32(rh::OWNER);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::LoadExternal,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let external = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    let mut p = Writer::new();
+    p.u32(0x8100_0010);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::EvictControl,
+        &[rh::OWNER, external],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a public-only object was refused -> {:08x}",
+        r.code
+    );
+
+    // It has to come back after a restart, which is where the restore
+    // validation runs.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS, "the state did not load -> {:08x}", r.code);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::ReadPublic,
+        &[0x8100_0010],
+        None,
+        &[],
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "the persistent object did not survive -> {:08x}",
+        r.code
+    );
+}
+
 #[test]
 fn ecc_parameters_describe_p256() {
     let h = Harness::started("eccparms");

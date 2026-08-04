@@ -277,7 +277,7 @@ pub fn clock_set(state: &mut TpmState, request: &Request) -> TpmResult<Response>
 /// and recorded as having no effect.
 pub fn clock_rate_adjust(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let adjust = r.i8()?;
+    let adjust = r.i8().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     if !(-3..=3).contains(&adjust) {
         return Err(TpmRc(rc::VALUE).with_parameter(1));

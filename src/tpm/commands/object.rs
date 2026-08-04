@@ -959,18 +959,33 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         _ => {}
     }
 
-    // An external object may not claim to be TPM resident.
-    if public
-        .object_attributes
-        .has(ObjectAttributes::FIXED_TPM)
-        || public
+    // Part 2 clause 8.3.3.1 says the External column of the attribute table
+    // "indicates settings that apply to the inPublic parameter in
+    // TPM2_LoadExternal() if both the public and sensitive portions of the
+    // object are loaded", and that when only the public portion is loaded
+    // "the only attribute checks are the checks in the validation code
+    // following Table 37 and the reserved attributes check". So the column is
+    // read only when a sensitive area came with the public one. A public area
+    // on its own may say fixedTPM, which is how the public half of a key that
+    // does live on some TPM is loaded to compute its Name or make a credential
+    // for it.
+    if in_private.is_some() {
+        // Clause 8.3.3.2 fixedTPM, 8.3.3.4 fixedParent and 8.3.3.12
+        // restricted all read "shall be CLEAR" here, and Part 3 clause 12.3
+        // repeats the three together: "fixedTPM, fixedParent, and restricted
+        // shall be CLEAR if inPrivate is not the Empty Buffer."
+        if public
             .object_attributes
-            .has(ObjectAttributes::FIXED_PARENT)
-        || public
-            .object_attributes
-            .has(ObjectAttributes::SENSITIVE_DATA_ORIGIN)
-    {
-        return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+            .has(ObjectAttributes::FIXED_TPM)
+            || public
+                .object_attributes
+                .has(ObjectAttributes::FIXED_PARENT)
+            || public
+                .object_attributes
+                .has(ObjectAttributes::RESTRICTED)
+        {
+            return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+        }
     }
     // A sensitive area may only be supplied under the NULL hierarchy. A
     // sensitive area that is present but holds nothing is still present, so it

@@ -323,7 +323,7 @@ pub fn sign_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRes
         &object,
         &scheme,
         &data,
-        crate::tpm::commands::crypto::SignParameters::at(2, 1),
+        crate::tpm::commands::crypto::SignParameters::at(0, 0),
     )?;
     respond(move |w| {
         signature.marshal(w);
@@ -846,20 +846,18 @@ pub fn encapsulate(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         // ML-KEM is the other form and is not implemented.
         return Err(TpmRc(rc::TYPE).with_handle(1));
     }
-    if !object
-        .public
-        .object_attributes
-        .has(ObjectAttributes::DECRYPT)
-    {
-        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
-    }
     let PublicParms::Ecc { curve_id, kdf, .. } = &object.public.parameters else {
         return Err(TpmRc(rc::TYPE));
     };
     let PublicId::Ecc(point) = &object.public.unique else {
         return Err(TpmRc(rc::TYPE));
     };
-    let hash_alg = kdf.hash_alg().unwrap_or(object.public.name_alg);
+    // Part 3 clause 14.10.1 asks only that the key be a KEM key, and says "the
+    // TPM does not verify the objectAttributes of the key". Part 2 Table 195
+    // says of an ECC key's kdf that "if this field is not NULL, then this key
+    // can be used with TPM2_Encapsulate() and TPM2_Decapsulate()", so a NULL
+    // one is what makes a key not a KEM key.
+    let hash_alg = kdf.hash_alg().ok_or(TpmRc(rc::KEY).with_handle(1))?;
 
     let ephemeral = ecc::generate(*curve_id, &mut state.rng)?;
     let (zx, _) = ecc::ecdh(
@@ -879,13 +877,14 @@ pub fn encapsulate(state: &mut TpmState, request: &Request) -> TpmResult<Respons
 
     respond(move |w| {
         Tpm2bSharedSecret::new(secret)?.marshal(w);
-        // The ciphertext of the ECC form is the ephemeral point.
+        // The ciphertext of the ECC form is the ephemeral point. Part 2 Table
+        // 101 makes the ecdh member of TPMU_KEM_CIPHERTEXT the octets of a
+        // TPMS_ECC_POINT, and Table 102 gives TPM2B_KEM_CIPHERTEXT the one
+        // size around it, so the point carries no size of its own.
         w.sized16_with(|w| {
-            Tpm2bEccPoint {
-                point: EccPoint {
-                    x: Tpm2bEccParameter::new(ephemeral.public_x.clone()).unwrap_or_default(),
-                    y: Tpm2bEccParameter::new(ephemeral.public_y.clone()).unwrap_or_default(),
-                },
+            EccPoint {
+                x: Tpm2bEccParameter::new(ephemeral.public_x.clone()).unwrap_or_default(),
+                y: Tpm2bEccParameter::new(ephemeral.public_y.clone()).unwrap_or_default(),
             }
             .marshal(w)
         });
@@ -900,18 +899,25 @@ pub fn decapsulate(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();
     let size = r.u16().map_err(|e| e.with_parameter(1))? as usize;
-    let mut inner = r.sub(size)?;
+    let mut inner = r.sub(size).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
-    let ciphertext = Tpm2bEccPoint::unmarshal(&mut inner)?;
+    let ciphertext = EccPoint::unmarshal(&mut inner).map_err(|e| e.with_parameter(1))?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
     if object.public.object_type != alg::ECC {
         return Err(TpmRc(rc::TYPE).with_handle(1));
     }
-    if !object
+    // Part 3 clause 14.11.1: the key "shall be a KEM key (TPM_RC_KEY) with
+    // restricted CLEAR and decrypt SET (TPM_RC_ATTRIBUTES)". Without the
+    // restricted check a storage key would answer as a decapsulation oracle.
+    if object
         .public
         .object_attributes
-        .has(ObjectAttributes::DECRYPT)
+        .has(ObjectAttributes::RESTRICTED)
+        || !object
+            .public
+            .object_attributes
+            .has(ObjectAttributes::DECRYPT)
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }
@@ -924,22 +930,22 @@ pub fn decapsulate(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let PublicId::Ecc(point) = &object.public.unique else {
         return Err(TpmRc(rc::TYPE));
     };
-    let hash_alg = kdf.hash_alg().unwrap_or(object.public.name_alg);
+    let hash_alg = kdf.hash_alg().ok_or(TpmRc(rc::KEY).with_handle(1))?;
 
     let curve = ecc::Curve::new(*curve_id)?;
     let private = crate::tpm::crypto::bn::BigNum::from_bytes(sensitive.sensitive.as_slice())?;
     let (zx, _) = ecc::ecdh(
         &curve,
         &private,
-        ciphertext.point.x.as_slice(),
-        ciphertext.point.y.as_slice(),
+        ciphertext.x.as_slice(),
+        ciphertext.y.as_slice(),
     )
     .map_err(|e| e.with_parameter(1))?;
     let secret = crate::tpm::crypto::hmac::kdfe(
         hash_alg,
         &zx,
         "SECRET",
-        ciphertext.point.x.as_slice(),
+        ciphertext.x.as_slice(),
         point.x.as_slice(),
         (hash::digest_size(hash_alg)? * 8) as u32,
     )?;

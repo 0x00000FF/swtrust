@@ -458,12 +458,30 @@ pub fn validate_creation_template(public: &TpmtPublic) -> TpmResult<()> {
 /// applies these.
 pub fn validate_action_attributes(public: &TpmtPublic) -> TpmResult<()> {
     let attrs = public.object_attributes;
-    let sign = attrs.has(ObjectAttributes::SIGN_ENCRYPT);
-    let decrypt = attrs.has(ObjectAttributes::DECRYPT);
-    if public.object_type != alg::KEYEDHASH && !sign && !decrypt {
+    if public.object_type != alg::KEYEDHASH
+        && !attrs.has(ObjectAttributes::SIGN_ENCRYPT)
+        && !attrs.has(ObjectAttributes::DECRYPT)
+    {
         return Err(TpmRc(rc::ATTRIBUTES));
     }
-    if attrs.has(ObjectAttributes::RESTRICTED) && !sign && !decrypt {
+    validate_restricted_has_an_action(public)
+}
+
+/// Refuse restricted on an object that neither signs nor decrypts.
+///
+/// This is the clause 8.3.3.12 half of [`validate_action_attributes`], kept
+/// apart because it is the half that holds however the object arrived. Creation
+/// and load both require it; TPM2_LoadExternal requires restricted to be CLEAR
+/// outright when a sensitive area comes with the public one and reads no
+/// attribute column at all when it does not, so an external object satisfies it
+/// either way; and an object TPM2_Import accepts with restricted SET has to be
+/// loaded before it can be used, which applies the rule then.
+pub fn validate_restricted_has_an_action(public: &TpmtPublic) -> TpmResult<()> {
+    let attrs = public.object_attributes;
+    if attrs.has(ObjectAttributes::RESTRICTED)
+        && !attrs.has(ObjectAttributes::SIGN_ENCRYPT)
+        && !attrs.has(ObjectAttributes::DECRYPT)
+    {
         return Err(TpmRc(rc::ATTRIBUTES));
     }
     Ok(())
@@ -480,7 +498,11 @@ pub fn validate_restored(
     sensitive: Option<&TpmtSensitive>,
 ) -> TpmResult<()> {
     validate_loaded_public(public)?;
-    validate_action_attributes(public)?;
+    // Not the inert rule beside it. That one belongs to TPM2_Create and
+    // TPM2_Load rather than to the object: TPM2_LoadExternal reads no attribute
+    // column for a public area on its own, so a public key that neither signs
+    // nor decrypts is resident legitimately and has to survive being saved.
+    validate_restricted_has_an_action(public)?;
     if let Some(sensitive) = sensitive {
         check_binding(public, sensitive)?;
     }
