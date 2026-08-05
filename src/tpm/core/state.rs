@@ -27,6 +27,9 @@ use super::session::SessionSlots;
 /// it is still read rather than being thrown away: a TPM whose state a caller
 /// depends on should not lose it because this build learned a new field.
 ///
+/// Version 8 wrote TPMA_STARTUP_CLEAR, which carries the Read-Only mode Part 1
+/// clause 42.2 keeps across a TPM Resume.
+///
 /// Version 7 wrote the highest value a counter Index has held, which Part 3
 /// clause 31.2 keeps for the lifetime of the TPM.
 ///
@@ -46,7 +49,10 @@ use super::session::SessionSlots;
 /// It was never released, so version 1 means the layout that came before the
 /// byte and nothing else. A file of the other shape can only have been written
 /// by a developer running that build, and is not one this reads.
-const STATE_VERSION: u32 = 7;
+const STATE_VERSION: u32 = 8;
+/// Version 7 did not record TPMA_STARTUP_CLEAR, so Read-Only mode was lost
+/// whenever the state went through a file.
+const STATE_VERSION_WITHOUT_STARTUP_CLEAR: u32 = 7;
 /// Version 6 did not record how far a counter Index had come before it was
 /// undefined.
 const STATE_VERSION_WITHOUT_COUNTER_FLOOR: u32 = 6;
@@ -64,6 +70,7 @@ const FIRST_WITH_PERSISTENT_STATE_CLEAR: u32 = 4;
 const FIRST_WITH_RESET_VALUE: u32 = 5;
 const FIRST_WITH_OBJECT_COUNTER: u32 = 6;
 const FIRST_WITH_COUNTER_FLOOR: u32 = 7;
+const FIRST_WITH_STARTUP_CLEAR: u32 = 8;
 /// Version 3 did not record which session contexts had been saved.
 const STATE_VERSION_WITHOUT_SESSIONS: u32 = 3;
 /// Version 2 recorded the profile but not the clearCount of Part 1 Equation 52.
@@ -828,6 +835,9 @@ impl TpmState {
         w.u16(self.act.policy.hash_alg);
         w.sized16(&self.act.policy.digest);
         w.u8(u8::from(self.ever_started));
+        // Part 1 clause 42.2 keeps Read-Only mode across a TPM Resume, which
+        // goes through this file, so the attributes go with it.
+        w.u32(self.startup_clear.0);
 
         // Part 1 clause 27.5 keeps a saved session context across a TPM Restart
         // and a TPM Resume, and both of those go through a power cycle, so the
@@ -853,6 +863,7 @@ impl TpmState {
         if !matches!(
             version,
             STATE_VERSION
+                | STATE_VERSION_WITHOUT_STARTUP_CLEAR
                 | STATE_VERSION_WITHOUT_COUNTER_FLOOR
                 | STATE_VERSION_WITHOUT_OBJECT_COUNTER
                 | STATE_VERSION_WITHOUT_RESET_VALUE
@@ -1115,6 +1126,11 @@ impl TpmState {
             };
         }
 
+        if version >= FIRST_WITH_STARTUP_CLEAR && !r.is_empty() {
+            state.startup_clear =
+                crate::tpm::structures::attributes::StartupClearAttributes(r.u32()?);
+        }
+
         // Part 1 clause 27.5 keeps a saved session context across a TPM Restart
         // and a TPM Resume. A record from before this was written down names
         // none, so a session saved by that build is not reloadable, which is
@@ -1261,6 +1277,40 @@ mod tests {
         assert_eq!(s.lockout.next_recovery, 10_000, "the deadline was not rebased");
         s.advance_time(10_000);
         assert_eq!(s.lockout.failed_tries, 0);
+    }
+
+    #[test]
+    fn read_only_mode_survives_the_record_and_a_resume() {
+        // Part 1 clause 42.2: "a TPM exits Read-Only mode if the TPM receives a
+        // TPM2_Startup() for TPM Reset or TPM Restart. However Read-Only mode
+        // will remain enabled during TPM Resume." A resume goes through the
+        // state file, so the mode has to be in it.
+        use crate::tpm::structures::attributes::StartupClearAttributes;
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        s.startup_clear = StartupClearAttributes(
+            s.startup_clear.0 | StartupClearAttributes::READ_ONLY,
+        );
+        s.shutdown_type = su::STATE;
+        let saved = s.save().unwrap();
+
+        let mut back = TpmState::load(&saved).unwrap();
+        assert!(
+            back.startup_clear.has(StartupClearAttributes::READ_ONLY),
+            "the record did not carry the mode"
+        );
+        back.on_startup_state().unwrap();
+        assert!(
+            back.startup_clear.has(StartupClearAttributes::READ_ONLY),
+            "a resume left the mode"
+        );
+
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_startup_clear().unwrap();
+        assert!(
+            !back.startup_clear.has(StartupClearAttributes::READ_ONLY),
+            "a restart kept the mode"
+        );
     }
 
     #[test]
@@ -1667,8 +1717,9 @@ mod tests {
     /// timeout, the signal, the policy algorithm and an empty digest.
     const ACT_BLOCK: usize = 4 + 1 + 2 + 2 + 1;
     /// A saved session block with nothing in it: the count and the two
-    /// counters Part 1 clause 27.2.2 keeps apart.
-    const SESSION_BLOCK: usize = 4 + 8 + 8;
+    /// counters Part 1 clause 27.2.2 keeps apart, with TPMA_STARTUP_CLEAR
+    /// ahead of it.
+    const SESSION_BLOCK: usize = 4 + (4 + 8 + 8);
 
     #[test]
     fn a_state_file_without_the_commit_values_still_loads() {
@@ -1794,8 +1845,16 @@ mod tests {
         s.nv.set_counter_floor(0xaabb_ccdd_eeff_0011);
         let current = s.save().unwrap();
 
+        // Version 7 did not write TPMA_STARTUP_CLEAR.
+        let mut v7 = current.clone();
+        v7[..4].copy_from_slice(&7u32.to_be_bytes());
+        let sessions_at = v7.len() - (4 + 8 + 8);
+        v7.drain(sessions_at - 4..sessions_at);
+        let back = TpmState::load(&v7).expect("a version 7 record was refused");
+        assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
+
         // Version 6 did not write the counter high water mark.
-        let mut v6 = current.clone();
+        let mut v6 = v7.clone();
         v6[..4].copy_from_slice(&6u32.to_be_bytes());
         let floor_at = position_of(&v6, &0xaabb_ccdd_eeff_0011u64.to_be_bytes());
         v6.drain(floor_at..floor_at + 8);
@@ -1931,7 +1990,11 @@ mod tests {
             s.sessions.next_object_id();
         }
         s.nv.set_counter_floor(0x1234_5678_9abc_def0);
-        let saved = s.save().unwrap();
+        s.startup_clear = crate::tpm::structures::attributes::StartupClearAttributes(0x0a0b_0c0d);
+        let mut saved = s.save().unwrap();
+        // Version 5 wrote neither TPMA_STARTUP_CLEAR nor the counter mark.
+        let flags_at = position_of(&saved, &0x0a0b_0c0du32.to_be_bytes());
+        saved.drain(flags_at..flags_at + 4);
 
         // A version 5 record carried one context counter, the one this build
         // keeps for objects, and no counter high water mark.

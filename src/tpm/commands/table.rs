@@ -455,3 +455,17 @@ pub fn refused_when_read_only(code: u32) -> bool {
             | cc::NV_ChangeAuth
     )
 }
+
+/// True when Read-Only mode refuses `code` only for some Indices.
+///
+/// Table 207 marks TPM2_NV_Write, TPM2_NV_Extend, TPM2_NV_SetBits,
+/// TPM2_NV_WriteLock and TPM2_NV_ReadLock "permitted only when the NV index is
+/// defined with TPMA_NV_ORDERLY and TPMA_NV_CLEAR_STCLEAR". Such an Index keeps
+/// its data in RAM and loses it on the next TPM Reset, so writing to one
+/// changes nothing the mode is holding still.
+pub fn read_only_needs_a_volatile_index(code: u32) -> bool {
+    matches!(
+        code,
+        cc::NV_Write | cc::NV_Extend | cc::NV_SetBits | cc::NV_WriteLock | cc::NV_ReadLock
+    )
+}

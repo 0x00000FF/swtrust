@@ -1477,6 +1477,27 @@ fn read_only_mode_refuses_what_table_207_names() {
     let r = h.send(&command(st::NO_SESSIONS, cc::GetRandom, &[], None, &[0x00, 0x08]));
     assert_eq!(r.code, rc::SUCCESS, "GetRandom -> {:08x}", r.code);
 
+    // Table 207 permits TPM2_NV_Write "only when the NV index is defined with
+    // TPMA_NV_ORDERLY and TPMA_NV_CLEAR_STCLEAR", whose data goes away on the
+    // next reset in any case. The Index below has neither.
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0u8; 16]);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Write,
+        &[hc::NV_INDEX_FIRST, hc::NV_INDEX_FIRST],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::HANDLE | (1 << 8),
+        "a write to an Index that is not there was not reported as such -> {:08x}",
+        r.code
+    );
+
     // Part 1 clause 42.2: the mode "will remain enabled during TPM Resume".
     let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
     assert_eq!(r.code, rc::SUCCESS);

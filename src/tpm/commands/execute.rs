@@ -67,9 +67,42 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     if state
         .startup_clear
         .has(crate::tpm::structures::attributes::StartupClearAttributes::READ_ONLY)
-        && super::table::refused_when_read_only(request.code)
     {
-        return Err(TpmRc(rc::READ_ONLY));
+        if super::table::refused_when_read_only(request.code) {
+            return Err(TpmRc(rc::READ_ONLY));
+        }
+        if super::table::read_only_needs_a_volatile_index(request.code) {
+            let handle = request.handle(1).or_else(|_| request.handle(0))?;
+            let index = state.nv.get(handle).map_err(|e| e.with_handle(1))?;
+            let volatile = index
+                .public
+                .attributes
+                .has(crate::tpm::structures::attributes::NvAttributes::ORDERLY)
+                && index
+                    .public
+                    .attributes
+                    .has(crate::tpm::structures::attributes::NvAttributes::CLEAR_STCLEAR);
+            if !volatile {
+                return Err(TpmRc(rc::READ_ONLY));
+            }
+        }
+        // Table 207 marks TPM2_PolicySecret not permitted when its
+        // authorization entity is a PIN Index, because the authorization moves
+        // that Index's counter.
+        if request.code == cc::PolicySecret {
+            let handle = request.handle(0)?;
+            if crate::tpm::core::nv::NvStore::is_nv_handle(handle) {
+                if let Ok(index) = state.nv.get(handle) {
+                    if matches!(
+                        index.public.attributes.index_type(),
+                        crate::tpm::structures::attributes::nt::PIN_FAIL
+                            | crate::tpm::structures::attributes::nt::PIN_PASS
+                    ) {
+                        return Err(TpmRc(rc::READ_ONLY));
+                    }
+                }
+            }
+        }
     }
 
     // Every handle that carries an authorization is checked in order.

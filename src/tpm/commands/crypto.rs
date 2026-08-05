@@ -1101,14 +1101,39 @@ pub fn encrypt_decrypt(
         return Err(TpmRc(rc::TYPE));
     };
     // TPM_ALG_NULL means the mode fixed by the key.
+    // Part 3 clause 15.2.1: "if the decrypt parameter of the command is TRUE,
+    // then the decrypt attribute of the key is required to be SET
+    // (TPM_RC_ATTRIBUTES). If the decrypt parameter of the command is FALSE,
+    // then the sign attribute of the key is required to be SET."
+    let allowed = if decrypt {
+        object.public.object_attributes.has(ObjectAttributes::DECRYPT)
+    } else {
+        object
+            .public
+            .object_attributes
+            .has(ObjectAttributes::SIGN_ENCRYPT)
+    };
+    if !allowed {
+        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
+    }
+
     let mode = if mode == alg::NULL { sym.mode } else { mode };
     if sym.mode != alg::NULL && mode != sym.mode {
         return Err(TpmRc(rc::VALUE).with_parameter(mode_parameter));
     }
 
+    // Clause 15.2.1 gives CBC, CFB, OFB and CTR an ivIn "of the same size as
+    // the block size of the cipher" and answers TPM_RC_SIZE otherwise, while
+    // ECB takes none.
+    let block = sym::block_size(sym.algorithm)?;
     let mut iv_buf = iv.as_slice().to_vec();
-    if mode != alg::ECB && iv_buf.is_empty() {
-        iv_buf = vec![0u8; sym::block_size(sym.algorithm)?];
+    let iv_parameter = if data_first { 4 } else { 3 };
+    if mode == alg::ECB {
+        if !iv_buf.is_empty() {
+            return Err(TpmRc(rc::SIZE).with_parameter(iv_parameter));
+        }
+    } else if iv_buf.len() != block {
+        return Err(TpmRc(rc::SIZE).with_parameter(iv_parameter));
     }
     let out = sym::crypt(
         sym.algorithm,
