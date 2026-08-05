@@ -339,11 +339,7 @@ pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Respon
             (rh::NULL, handle, marshal_session(&session)?, id)
         } else {
             let slot = state.objects.get(handle).map_err(|e| e.with_handle(1))?;
-            // Part 1 clause 27.2.2 gives an object context its number from
-            // objectContextID, which "is incremented each time an object
-            // context is saved", and not from the session counter.
-            let sequence_id = state.sessions.next_object_id();
-            match slot {
+            let (hierarchy, saved_handle, body) = match slot {
                 Slot::Object(o) => {
                     // An object that may not be duplicated may still be saved,
                     // because a context never leaves this TPM.
@@ -352,15 +348,17 @@ pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Respon
                     } else {
                         saved::TRANSIENT_OBJECT
                     };
-                    (o.hierarchy, saved_handle, marshal_object(o)?, sequence_id)
+                    (o.hierarchy, saved_handle, marshal_object(o)?)
                 }
-                Slot::Sequence(s) => (
-                    rh::NULL,
-                    saved::SEQUENCE_OBJECT,
-                    marshal_sequence(s)?,
-                    sequence_id,
-                ),
-            }
+                Slot::Sequence(s) => (rh::NULL, saved::SEQUENCE_OBJECT, marshal_sequence(s)?),
+            };
+            // Part 1 clause 27.2.2 gives an object context its number from
+            // objectContextID, which "is incremented each time an object
+            // context is saved", and not from the session counter. It is taken
+            // once the body is in hand, so a command that fails does not spend
+            // one.
+            let sequence_id = state.sessions.next_object_id();
+            (hierarchy, saved_handle, body, sequence_id)
         };
 
     let blob = seal_context(state, hierarchy, sequence, saved_handle, &body)?;
@@ -395,9 +393,13 @@ pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Respon
         // sequence is less than the current value of contextID minus the
         // maximum range for sessions". The lower bound is exclusive, so a
         // sequence exactly that far back is still one the TPM can place.
-        let counter = state.sessions.context_counter();
-        context.sequence < counter
-            && context.sequence + config::CONTEXT_GAP_MAX as u64 >= counter
+        // The counter holds the number the next session will take, so the
+        // value the clause calls current is one less. Its example is explicit:
+        // with a last assigned value of 0x1010 and a range of 0x100, a
+        // sequence above 0x1010 or below 0x0F10 is an error.
+        let current = state.sessions.context_counter().saturating_sub(1);
+        context.sequence <= current
+            && context.sequence + config::CONTEXT_GAP_MAX as u64 >= current
     } else {
         context.sequence < state.sessions.object_counter()
     };
@@ -408,9 +410,13 @@ pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     // context with the lowest number so that its tracking number can be
     // updated." While the window is full that is the only session context the
     // TPM takes.
+    // Table 17 measures the gap from "the lowest numbered active session", so
+    // that is the one the remedy names. When it is a session that is already
+    // loaded, no saved context is the oldest and none is taken: the caller has
+    // to save that session and load it again.
     if is_session
         && state.sessions.at_context_gap()
-        && Some(context.sequence) != state.sessions.oldest_saved()
+        && Some(context.sequence) != state.sessions.oldest_active()
     {
         return Err(TpmRc(rc::CONTEXT_GAP));
     }

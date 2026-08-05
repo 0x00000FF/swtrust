@@ -1009,18 +1009,20 @@ impl TpmState {
             }
             let counter = r.u64()?;
             // Clause 27.2.2 has two counters. A record from before the second
-            // was written down advanced one value for both, so that value is
-            // where the object counter goes: it is past every object context
-            // that build could have saved. The session counter cannot take it
-            // as well, because every object save moved it too and a saved
-            // session could then be further back than the window allows. It
-            // starts just past the newest saved session instead, which is
-            // where it would stand had only sessions moved it.
-            let (counter, object_counter) = if version >= FIRST_WITH_OBJECT_COUNTER {
-                (counter, r.u64()?)
+            // was written down advanced one value for both, and there is no
+            // way to take that apart: the saved list names the sessions that
+            // are still outstanding, not the numbers the ones that are gone
+            // consumed. Winding the session counter back to the newest saved
+            // session would hand a number out twice, and a spent context of
+            // that number would be taken as the current one, which is the
+            // replay clause 27.5 forbids. So the counter stands where it was
+            // for both, and the tracking is dropped: a session context from
+            // that build no longer loads, which is what the specification
+            // already says of one whose tracking the TPM has lost.
+            let (saved, counter, object_counter) = if version >= FIRST_WITH_OBJECT_COUNTER {
+                (saved, counter, r.u64()?)
             } else {
-                let newest = saved.iter().map(|(_, id)| *id).max();
-                (newest.map(|n| n + 1).unwrap_or(counter), counter)
+                (Vec::new(), counter, counter)
             };
             state
                 .sessions
@@ -1645,12 +1647,13 @@ mod tests {
     }
 
     #[test]
-    fn a_version_5_record_gives_its_one_counter_to_the_objects() {
-        // Version 5 moved one counter for both kinds of context, so a session
-        // saved early and a great many object saves afterwards would leave the
-        // session further back than the window allows. Part 1 clause 27.1 keeps
-        // a saved session valid until it is closed or the TPM is reset, so the
-        // session counter is put where only sessions would have taken it.
+    fn a_version_5_record_keeps_its_counter_and_drops_its_tracking() {
+        // Version 5 moved one counter for both kinds of context. Neither half
+        // can be recovered from it: winding the session counter back would
+        // hand a number out twice, and leaving it where it is puts an old
+        // saved session outside the window. The counter is kept, because
+        // reusing a number would let a spent context pass as the current one,
+        // and the tracking goes.
         let mut s = TpmState::manufacture().unwrap();
         let session = crate::tpm::core::session::Session::new(
             hc::HMAC_SESSION_FIRST,
@@ -1689,7 +1692,12 @@ mod tests {
         );
         assert!(
             !back.sessions.at_context_gap(),
-            "the saved session came back outside the window"
+            "a record with no tracking left reports a gap"
+        );
+        assert_eq!(
+            back.sessions.context_counter(),
+            counter,
+            "the session counter moved, which would hand a number out twice"
         );
     }
 

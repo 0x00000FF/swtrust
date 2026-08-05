@@ -647,6 +647,14 @@ impl SessionSlots {
             .min()
     }
 
+    /// The identifier a session is carrying, loaded or saved.
+    pub fn saved_version(&self, handle: u32) -> Option<u64> {
+        self.version
+            .get(&handle)
+            .or_else(|| self.saved.get(&handle))
+            .copied()
+    }
+
     /// The lowest identifier a saved session holds, which is the one the
     /// remedy for a gap says to load.
     pub fn oldest_saved(&self) -> Option<u64> {
@@ -658,13 +666,12 @@ impl SessionSlots {
         match self.oldest_active() {
             // Part 2 Table 30 makes TPM_PT_CONTEXT_GAP_MAX "the maximum
             // allowed difference (unsigned) between the contextID values of
-            // two saved session contexts". A session taken now would carry
-            // the current counter, so the window is full once the difference
-            // has reached the maximum: one more would pass it. The oldest
-            // context is still loadable at exactly that distance, which is
-            // what clause 14.6.1 keeps by making its bound exclusive.
+            // two saved session contexts", and a difference equal to it is
+            // allowed. A session taken now carries the counter as it stands,
+            // so the window is full only once that number would sit further
+            // from the oldest than the maximum.
             Some(oldest) => {
-                self.context_counter.saturating_sub(oldest) >= config::CONTEXT_GAP_MAX as u64
+                self.context_counter.saturating_sub(oldest) > config::CONTEXT_GAP_MAX as u64
             }
             None => false,
         }
@@ -749,6 +756,7 @@ impl SessionSlots {
 
     pub fn remove(&mut self, handle: u32) -> TpmResult<Session> {
         self.saved.remove(&handle);
+        self.version.remove(&handle);
         self.sessions.remove(&handle).ok_or(TpmRc(rc::HANDLE))
     }
 
@@ -764,6 +772,10 @@ impl SessionSlots {
         for candidate in self.flush_candidates(handle) {
             let loaded = self.sessions.remove(&candidate).is_some();
             let saved = self.saved.remove(&candidate).is_some();
+            // Part 3 clause 28.4.1 has TPM2_FlushContext remove all of a
+            // session's context, so what it was numbered goes too and stops
+            // standing in the way of the gap.
+            self.version.remove(&candidate);
             if loaded || saved {
                 return Ok(candidate);
             }
@@ -883,6 +895,15 @@ impl SessionSlots {
     /// Drop every session bound to `handle`, which happens when the entity the
     /// session is bound to goes away.
     pub fn flush_bound_to(&mut self, handle: u32) {
+        let going: Vec<u32> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.bind == handle)
+            .map(|(h, _)| *h)
+            .collect();
+        for h in going {
+            self.version.remove(&h);
+        }
         self.sessions.retain(|_, s| s.bind != handle);
     }
 }
@@ -1367,15 +1388,25 @@ mod tests {
         let h = slots.insert(session(se::HMAC)).unwrap();
         let (blob, id) = slots.save(h).unwrap();
 
-        // Walk the counter until a new session would sit further from the
-        // saved one than the reported maximum allows.
-        while slots.context_counter() - id < config::CONTEXT_GAP_MAX as u64 - 1 {
+        // A session whose number sits exactly the reported maximum from the
+        // oldest is still allowed: Part 2 Table 30 calls that value "the
+        // maximum allowed difference", not the first one refused.
+        while slots.context_counter() - id < config::CONTEXT_GAP_MAX as u64 {
             slots.next_context_id();
         }
+        assert!(!slots.at_context_gap(), "the maximum itself was refused");
         let mut edge = session(se::HMAC);
         edge.handle = hc::HMAC_SESSION_FIRST + 1;
         let at_edge = slots.insert(edge).unwrap();
+        assert_eq!(
+            slots.saved_version(at_edge).unwrap() - id,
+            config::CONTEXT_GAP_MAX as u64,
+            "the edge is not the maximum apart"
+        );
         slots.save(at_edge).unwrap();
+
+        // One more and the next number would be further out than that.
+        slots.next_context_id();
         assert!(slots.at_context_gap(), "the window is not reported full");
 
         let mut past = session(se::HMAC);
@@ -1393,6 +1424,26 @@ mod tests {
         let mut again = session(se::HMAC);
         again.handle = hc::HMAC_SESSION_FIRST + 3;
         assert!(slots.insert(again).is_ok(), "a session still could not be made");
+    }
+
+    #[test]
+    fn a_flushed_session_stops_holding_the_window_open() {
+        // Part 3 clause 28.4.1 has TPM2_FlushContext remove all of a session's
+        // context, so the number it held is not one of the active ones any
+        // more. Leaving it behind would report a gap whose remedy names a
+        // session that is no longer there.
+        let mut slots = SessionSlots::new();
+        let h = slots.insert(session(se::HMAC)).unwrap();
+        let id = slots.saved_version(h).unwrap();
+        while slots.context_counter() - id <= config::CONTEXT_GAP_MAX as u64 {
+            slots.next_context_id();
+        }
+        assert!(slots.at_context_gap(), "the loaded session did not hold it");
+        slots.flush(h).unwrap();
+        assert!(
+            !slots.at_context_gap(),
+            "a flushed session still holds the window open"
+        );
     }
 
     #[test]
