@@ -1895,7 +1895,8 @@ mod tests {
         {
             // Each entry loses the octet count and the three octets after it.
             let mut out = Vec::with_capacity(v8.len());
-            let count_at = position_of(&v8, &(config::DEFAULT_PCR_BANKS.len() as u32).to_be_bytes());
+            let count_at =
+                position_of(&v8, &(config::DEFAULT_PCR_BANKS.len() as u32).to_be_bytes());
             out.extend_from_slice(&v8[..count_at + 4]);
             let mut at = count_at + 4;
             for _ in 0..config::DEFAULT_PCR_BANKS.len() {
