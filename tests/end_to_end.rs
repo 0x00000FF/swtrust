@@ -6291,3 +6291,76 @@ fn disabling_a_hierarchy_flushes_the_objects_of_the_ones_derived_from_it() {
         "an SVN-limited object survived its base hierarchy being disabled"
     );
 }
+
+
+/// Part 2 Table 205 defines ownerAuthSet as "TPM2_HierarchyChangeAuth() with
+/// ownerAuth has been executed since the last TPM2_Clear()", which a change to
+/// the Empty Buffer satisfies as much as any other change.
+#[test]
+fn the_permanent_bits_record_the_command_and_not_the_value() {
+    let h = Harness::started("authset");
+
+    let permanent = || -> u32 {
+        let mut p = Writer::new();
+        p.u32(cap::TPM_PROPERTIES);
+        p.u32(pt::PERMANENT);
+        p.u32(1);
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::GetCapability,
+            &[],
+            None,
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS);
+        // moreData, the capability, the count, then the property and its value.
+        u32::from_be_bytes([r.body[13], r.body[14], r.body[15], r.body[16]])
+    };
+    let change_auth = |handle: u32, value: &[u8]| -> u32 {
+        let mut p = Writer::new();
+        p.u16(value.len() as u16);
+        p.bytes(value);
+        h.send(&command(
+            st::SESSIONS,
+            cc::HierarchyChangeAuth,
+            &[handle],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+
+    const OWNER_AUTH_SET: u32 = 1 << 0;
+    const ENDORSEMENT_AUTH_SET: u32 = 1 << 1;
+    const LOCKOUT_AUTH_SET: u32 = 1 << 2;
+
+    assert_eq!(permanent() & OWNER_AUTH_SET, 0, "a fresh TPM has the bit set");
+
+    // A change to the Empty Buffer is still a change.
+    assert_eq!(change_auth(rh::OWNER, b""), rc::SUCCESS);
+    assert_ne!(
+        permanent() & OWNER_AUTH_SET,
+        0,
+        "a change to the Empty Buffer left the bit clear"
+    );
+    assert_eq!(permanent() & ENDORSEMENT_AUTH_SET, 0);
+
+    assert_eq!(change_auth(rh::ENDORSEMENT, b"secret"), rc::SUCCESS);
+    assert_ne!(permanent() & ENDORSEMENT_AUTH_SET, 0);
+    assert_eq!(permanent() & LOCKOUT_AUTH_SET, 0);
+
+    // TPM2_Clear takes the bits away again.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Clear,
+        &[rh::LOCKOUT],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Clear -> {:08x}", r.code);
+    assert_eq!(
+        permanent() & (OWNER_AUTH_SET | ENDORSEMENT_AUTH_SET | LOCKOUT_AUTH_SET),
+        0,
+        "TPM2_Clear left an authorization bit set"
+    );
+}

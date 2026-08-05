@@ -85,6 +85,15 @@ pub const NV_CLOCK_UPDATE_INTERVAL: u32 = 1 << 17;
 /// nothing that uses Clock has to allow for it wrapping.
 pub const MAX_CLOCK: u64 = 0xFFFF_0000_0000_0000;
 
+/// The one algorithm set this TPM has, TPM_PT_ALGORITHM_SET.
+///
+/// Part 3 clause 26.3.1 calls the value "vendor-dependent". A TPM that offered
+/// a choice would have to check each algorithm as it is unmarshalled, which the
+/// note in that clause spells out; this one implements the algorithms of its
+/// profile and no other set, so this is the only value TPM2_SetAlgorithmSet
+/// takes.
+pub const ALGORITHM_SET: u32 = 0;
+
 /// The security version number this firmware reports, TPM_PT_FIRMWARE_SVN.
 ///
 /// Part 1 clause 41.4 has a bootloader latch the version of the firmware it

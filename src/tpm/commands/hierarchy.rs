@@ -213,6 +213,19 @@ pub fn hierarchy_change_auth(state: &mut TpmState, request: &Request) -> TpmResu
         }
         _ => return Err(TpmRc(rc::VALUE).with_handle(1)),
     }
+    // Part 2 Table 205 records that this command ran rather than what it set:
+    // ownerAuthSet is "TPM2_HierarchyChangeAuth() with ownerAuth has been
+    // executed since the last TPM2_Clear()", which is as true of a change to
+    // the Empty Buffer as of any other.
+    let bit = match auth_handle {
+        rh::OWNER => Some(PermanentAttributes::OWNER_AUTH_SET),
+        rh::ENDORSEMENT => Some(PermanentAttributes::ENDORSEMENT_AUTH_SET),
+        rh::LOCKOUT => Some(PermanentAttributes::LOCKOUT_AUTH_SET),
+        _ => None,
+    };
+    if let Some(bit) = bit {
+        state.permanent = state.permanent.with(bit);
+    }
     respond(|_| Ok(()))
 }
 
@@ -278,10 +291,23 @@ pub fn pp_commands(state: &mut TpmState, request: &Request) -> TpmResult<Respons
 }
 
 /// TPM2_SetAlgorithmSet, Part 3 clause 26.3.
+///
+/// "This command allows the platform to change the set of algorithms that are
+/// used by the TPM. The algorithmSet setting is a vendor-dependent value." This
+/// TPM has one such set, the algorithms its profile implements, and the note in
+/// the clause says what selecting between several would take: "proper support
+/// would require modification of the unmarshaling code so that each time an
+/// algorithm is unmarshaled, it would be verified as being enabled." Rather
+/// than record a selector that changes nothing, the one set this TPM has is the
+/// only value it takes, and any other is refused. A caller reading
+/// TPM_PT_ALGORITHM_SET back therefore learns which algorithms are in use.
 pub fn set_algorithm_set(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
     let algorithm_set = r.u32().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
+    if algorithm_set != crate::tpm::config::ALGORITHM_SET {
+        return Err(TpmRc(rc::VALUE).with_parameter(1));
+    }
     state.algorithm_set = algorithm_set;
     respond(|_| Ok(()))
 }

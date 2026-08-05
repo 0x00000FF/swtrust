@@ -774,7 +774,12 @@ fn tpm_properties(state: &TpmState, property: u32) -> Vec<TaggedProperty> {
         TaggedProperty::new(pt::CONTEXT_GAP_MAX, config::CONTEXT_GAP_MAX),
         TaggedProperty::new(pt::NV_COUNTERS_MAX, config::MIN_COUNTER_INDICES),
         TaggedProperty::new(pt::NV_INDEX_MAX, config::MAX_NV_INDEX_SIZE as u32),
-        TaggedProperty::new(pt::MEMORY, MemoryAttributes(MemoryAttributes::SHARED_NV).0),
+        // Part 2 Table 42: sharedNV SET means "shared memory between the TPM
+        // RAM and NV memory is implemented", which this TPM does not do. An NV
+        // Index takes from the octets of clause 34.7's NV pool and a persistent
+        // object from a count of its own; neither takes from the other, so a
+        // caller told how much of one is left is not told about the other.
+        TaggedProperty::new(pt::MEMORY, MemoryAttributes::default().0),
         TaggedProperty::new(pt::CLOCK_UPDATE, config::NV_CLOCK_UPDATE_INTERVAL),
         TaggedProperty::new(pt::CONTEXT_HASH, config::CONTEXT_INTEGRITY_HASH_ALG as u32),
         TaggedProperty::new(pt::CONTEXT_SYM, config::CONTEXT_ENCRYPT_ALG as u32),
@@ -807,12 +812,26 @@ fn tpm_properties(state: &TpmState, property: u32) -> Vec<TaggedProperty> {
         TaggedProperty::new(pt::PERMANENT, permanent_attributes(state).0),
         TaggedProperty::new(pt::STARTUP_CLEAR, state.startup_clear.0),
         TaggedProperty::new(pt::HR_NV_INDEX, state.nv.len() as u32),
-        TaggedProperty::new(pt::HR_LOADED, state.objects.len() as u32),
-        TaggedProperty::new(pt::HR_LOADED_AVAIL, state.objects.available() as u32),
+        // Part 2 Table 28 counts authorization sessions here, not objects:
+        // TPM_PT_HR_LOADED is "the number of authorization sessions currently
+        // loaded into TPM RAM" and TPM_PT_HR_LOADED_AVAIL "the number of
+        // additional authorization sessions, of any type, that could be
+        // loaded into TPM RAM".
+        TaggedProperty::new(pt::HR_LOADED, state.sessions.loaded() as u32),
+        TaggedProperty::new(
+            pt::HR_LOADED_AVAIL,
+            (config::MAX_LOADED_SESSIONS as usize).saturating_sub(state.sessions.loaded()) as u32,
+        ),
         TaggedProperty::new(pt::HR_ACTIVE, state.sessions.active() as u32),
+        // The same table says a positive value means "at least this many
+        // additional sessions can be created", and creating one needs a
+        // loaded slot as well as a tracking slot.
         TaggedProperty::new(
             pt::HR_ACTIVE_AVAIL,
-            (config::MAX_ACTIVE_SESSIONS as usize).saturating_sub(state.sessions.active()) as u32,
+            (config::MAX_ACTIVE_SESSIONS as usize)
+                .saturating_sub(state.sessions.active())
+                .min((config::MAX_LOADED_SESSIONS as usize).saturating_sub(state.sessions.loaded()))
+                as u32,
         ),
         TaggedProperty::new(pt::HR_TRANSIENT_AVAIL, state.objects.available() as u32),
         TaggedProperty::new(pt::HR_PERSISTENT, state.persistent.len() as u32),
@@ -821,9 +840,17 @@ fn tpm_properties(state: &TpmState, property: u32) -> Vec<TaggedProperty> {
             (config::MIN_EVICT_OBJECTS as usize).saturating_sub(state.persistent.len()) as u32,
         ),
         TaggedProperty::new(pt::NV_COUNTERS, state.nv.counter_count() as u32),
+        // "The number of additional NV Indexes that can be defined with their
+        // TPM_NT of TPM_NV_COUNTER": the count is one bound and the octets
+        // still free are the other.
         TaggedProperty::new(
             pt::NV_COUNTERS_AVAIL,
-            config::MIN_COUNTER_INDICES.saturating_sub(state.nv.counter_count() as u32),
+            config::MIN_COUNTER_INDICES
+                .saturating_sub(state.nv.counter_count() as u32)
+                .min({
+                    let each = crate::tpm::core::nv::NvStore::smallest_counter_footprint();
+                    (state.nv.available() / each) as u32
+                }),
         ),
         TaggedProperty::new(pt::ALGORITHM_SET, state.algorithm_set),
         TaggedProperty::new(pt::LOADED_CURVES, config::IMPLEMENTED_CURVES.len() as u32),
@@ -847,19 +874,12 @@ fn tpm_properties(state: &TpmState, property: u32) -> Vec<TaggedProperty> {
 
 /// TPMA_PERMANENT as it currently stands.
 pub fn permanent_attributes(state: &TpmState) -> PermanentAttributes {
+    // The three authorization bits are kept in the state rather than derived
+    // from the values: Part 2 Table 205 defines each as
+    // TPM2_HierarchyChangeAuth "has been executed since the last
+    // TPM2_Clear()", so a change to the Empty Buffer sets one just as any
+    // other change does, and TPM2_Clear is what takes them away.
     let mut a = state.permanent;
-    a.set(
-        PermanentAttributes::OWNER_AUTH_SET,
-        state.hierarchies.owner.has_auth(),
-    );
-    a.set(
-        PermanentAttributes::ENDORSEMENT_AUTH_SET,
-        state.hierarchies.endorsement.has_auth(),
-    );
-    a.set(
-        PermanentAttributes::LOCKOUT_AUTH_SET,
-        !state.lockout_auth.is_empty(),
-    );
     a.set(PermanentAttributes::IN_LOCKOUT, state.lockout.in_lockout);
     a
 }
@@ -1021,13 +1041,24 @@ mod tests {
     }
 
     #[test]
-    fn permanent_attributes_track_the_authorization_values() {
+    fn permanent_attributes_report_what_the_state_records() {
+        // Part 2 Table 205 defines the three authorization bits as
+        // TPM2_HierarchyChangeAuth "has been executed since the last
+        // TPM2_Clear()", so they are what that command recorded and not what
+        // the authorization values happen to be now. Setting a value without
+        // the command leaves them alone.
         let mut state = TpmState::manufacture().unwrap();
         assert!(!permanent_attributes(&state).has(PermanentAttributes::OWNER_AUTH_SET));
         state.hierarchies.owner.auth = b"x".to_vec();
+        assert!(!permanent_attributes(&state).has(PermanentAttributes::OWNER_AUTH_SET));
+        state.permanent = state.permanent.with(PermanentAttributes::OWNER_AUTH_SET);
         assert!(permanent_attributes(&state).has(PermanentAttributes::OWNER_AUTH_SET));
-        state.lockout_auth = b"y".to_vec();
-        assert!(permanent_attributes(&state).has(PermanentAttributes::LOCKOUT_AUTH_SET));
+
+        // TPM2_Clear takes them away again.
+        state.on_clear().unwrap();
+        assert!(!permanent_attributes(&state).has(PermanentAttributes::OWNER_AUTH_SET));
+
+        // inLockout is the state of the moment rather than a record.
         state.lockout.in_lockout = true;
         assert!(permanent_attributes(&state).has(PermanentAttributes::IN_LOCKOUT));
     }

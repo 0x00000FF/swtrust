@@ -242,6 +242,26 @@ impl NvStore {
         config::NV_MEMORY_SIZE.saturating_sub(self.used())
     }
 
+    /// The smallest NV Index a counter can be defined as, in octets.
+    ///
+    /// Part 2 Table 28 asks TPM_PT_NV_COUNTERS_AVAIL for a value that
+    /// guarantees "at least this many NV Index instances that can be defined
+    /// as a counter can be created", which takes the space one would occupy as
+    /// well as the count. A counter holds eight octets and the smallest public
+    /// area names an Index with an empty policy.
+    pub fn smallest_counter_footprint() -> usize {
+        use crate::tpm::structures::nv::NvPublic;
+
+        let public = NvPublic {
+            nv_index: crate::tpm::constants::hc::NV_INDEX_FIRST,
+            name_alg: crate::tpm::constants::alg::SHA256,
+            attributes: crate::tpm::structures::attributes::NvAttributes(0),
+            auth_policy: crate::tpm::structures::base::Tpm2bDigest::empty(),
+            data_size: 8,
+        };
+        public.to_bytes().len() + 8
+    }
+
     /// Number of counter Indices defined.
     pub fn counter_count(&self) -> usize {
         self.indices

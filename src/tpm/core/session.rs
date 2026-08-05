@@ -616,6 +616,11 @@ impl SessionSlots {
         self.sessions.len() + self.saved.len()
     }
 
+    /// Sessions in TPM memory, which TPM_PT_HR_LOADED counts.
+    pub fn loaded(&self) -> usize {
+        self.sessions.len()
+    }
+
     /// The current context counter.
     pub fn context_counter(&self) -> u64 {
         self.context_counter
