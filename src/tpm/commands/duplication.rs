@@ -342,6 +342,13 @@ pub fn rewrap(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let in_secret = Tpm2bEncryptedSecret::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
+    // Part 2 clause 10.4.3 gives a TPM2B_NAME three shapes and no other, and
+    // clause 13.2.1 uses this one as "the Name of the Object being rewrapped",
+    // which the inner wrap is bound to.
+    if !crate::tpm::core::names::is_well_formed(name.as_slice()) {
+        return Err(TpmRc(rc::SIZE).with_parameter(2));
+    }
+
     // Remove the old parent's outer wrap.
     let body = if old_parent == rh::NULL {
         in_duplicate.as_slice().to_vec()

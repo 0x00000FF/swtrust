@@ -1261,6 +1261,10 @@ pub fn policy_duplication_select(
     let mut r = request.reader();
     let object_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     let new_parent_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
+    // Part 3 clause 23.15.1 hashes both Names together, and the new parent may
+    // be a permanent handle, whose Name is the handle itself.
+    check_entity_name_at(object_name.as_slice(), 1)?;
+    check_entity_name_at(new_parent_name.as_slice(), 2)?;
     let include_object = match r.u8().map_err(|e| e.with_parameter(3))? {
         0 => false,
         1 => true,
@@ -1543,6 +1547,11 @@ fn check_entity_name(name: &[u8]) -> TpmResult<()> {
     check_key_name(name)
 }
 
+/// The same check for a Name that arrives as one parameter among several.
+fn check_entity_name_at(name: &[u8], parameter: usize) -> TpmResult<()> {
+    check_entity_name(name).map_err(|e| e.with_parameter(parameter))
+}
+
 /// Whether a Name is the Name of a key, which is always a digest.
 ///
 /// Part 3 clause 23.16.1 asks it of keySign: "if the first two octets of
@@ -1571,6 +1580,11 @@ pub fn policy_ac_send_select(state: &mut TpmState, request: &Request) -> TpmResu
     let object_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     let auth_handle_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
     let ac_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
+    // Part 3 clause 32.4.1 hashes all three together. The authorizing handle
+    // and the attached component are named by handle, the object by digest.
+    check_entity_name_at(object_name.as_slice(), 1)?;
+    check_entity_name_at(auth_handle_name.as_slice(), 2)?;
+    check_entity_name_at(ac_name.as_slice(), 3)?;
     let include_object = match r.u8().map_err(|e| e.with_parameter(4))? {
         0 => false,
         1 => true,
