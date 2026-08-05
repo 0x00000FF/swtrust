@@ -718,10 +718,19 @@ impl SessionSlots {
     }
 
     /// Bring a saved session back into memory.
-    pub fn restore(&mut self, session: Session) -> TpmResult<()> {
+    pub fn restore(&mut self, session: Session, version: u64) -> TpmResult<()> {
         let handle = session.handle;
-        if !self.saved.contains_key(&handle) {
-            return Err(TpmRc(rc::HANDLE));
+        // Part 1 clause 27.5: "a saved session context may only be loaded
+        // once", and the counter value "serves as a version number for the
+        // session context ... the TPM maintains a database of concurrent
+        // sessions so that it can validate that a reloaded session context is
+        // the most recent version". An older blob of the same session carries
+        // an older version, and taking it would be the replay the clause says
+        // these limitations exist to prevent.
+        match self.saved.get(&handle) {
+            Some(current) if *current == version => {}
+            Some(_) => return Err(TpmRc(rc::VALUE)),
+            None => return Err(TpmRc(rc::HANDLE)),
         }
         if self.sessions.len() >= config::MAX_LOADED_SESSIONS as usize {
             return Err(TpmRc(rc::SESSION_MEMORY));
@@ -1206,16 +1215,35 @@ mod tests {
         assert!(slots.contains(h));
         // The handle is not handed out again while the context is outstanding.
         assert_ne!(slots.allocate_handle(se::HMAC).unwrap(), h);
-        slots.restore(saved).unwrap();
+        slots.restore(saved.clone(), id).unwrap();
         assert_eq!(slots.len(), 1);
         assert_eq!(slots.active(), 1);
+    }
+
+    #[test]
+    fn an_older_version_of_the_same_session_is_refused() {
+        // Part 1 clause 27.5: "a saved session context may only be loaded
+        // once", and the counter value assigned at each save "serves as a
+        // version number for the session context", so a blob from an earlier
+        // save is not the most recent version and does not load.
+        let mut slots = SessionSlots::new();
+        let h = slots.insert(session(se::HMAC)).unwrap();
+        let (first, first_id) = slots.save(h).unwrap();
+        slots.restore(first.clone(), first_id).unwrap();
+        let (_second, second_id) = slots.save(h).unwrap();
+        assert_ne!(first_id, second_id, "a reload takes a new version");
+        assert_eq!(
+            slots.restore(first, first_id).unwrap_err(),
+            TpmRc(rc::VALUE),
+            "the older blob was taken"
+        );
     }
 
     #[test]
     fn restoring_an_unknown_handle_is_refused() {
         let mut slots = SessionSlots::new();
         assert_eq!(
-            slots.restore(session(se::HMAC)).unwrap_err(),
+            slots.restore(session(se::HMAC), 1).unwrap_err(),
             TpmRc(rc::HANDLE)
         );
     }

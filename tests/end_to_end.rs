@@ -1240,6 +1240,158 @@ fn test_parms_refuses_a_kem_the_tpm_cannot_run() {
 }
 
 #[test]
+fn a_startup_flushes_every_transient_context() {
+    // Part 3 clause 9.3.3: on any TPM2_Startup "all transient contexts
+    // (objects, sessions, and sequences) shall be flushed from TPM memory".
+    // The command can be reached without the platform cycling the power, so
+    // the flush belongs to the command and not to the power.
+    let h = Harness::started("startupflush");
+    let handle = ecc_kem_key(&h, None);
+    let r = h.send(&command(st::NO_SESSIONS, cc::ReadPublic, &[handle], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS);
+    // No power cycle: the next command is the startup itself.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS, "Startup(STATE) -> {:08x}", r.code);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ReadPublic, &[handle], None, &[]));
+    assert_ne!(
+        r.code,
+        rc::SUCCESS,
+        "a loaded object survived TPM2_Startup"
+    );
+}
+
+#[test]
+fn a_context_of_a_disabled_hierarchy_does_not_load() {
+    // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
+    // context is associated with a hierarchy that is disabled."
+    let h = Harness::started("ctxhierarchy");
+    let handle = ecc_kem_key(&h, None);
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[handle], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let context = r.body.clone();
+
+    // Turn the storage hierarchy off with TPM2_HierarchyControl.
+    let mut p = Writer::new();
+    p.u32(rh::OWNER);
+    p.u8(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyControl,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "HierarchyControl -> {:08x}", r.code);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &context));
+    assert_eq!(
+        r.code,
+        rc::HIERARCHY | 0x040 | (1 << 8),
+        "a context of a disabled hierarchy loaded -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
+fn an_older_saved_session_context_does_not_load_again() {
+    // Part 1 clause 27.5: "a saved session context may only be loaded once",
+    // and the counter assigned at each save "serves as a version number for the
+    // session context", so the TPM can tell an older blob of the same session
+    // from the current one.
+    let h = Harness::started("sessionreplay");
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0u8; 16]);
+    p.u16(0);
+    p.u8(se::HMAC);
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let session = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[session], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let first = r.body.clone();
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &first));
+    assert_eq!(r.code, rc::SUCCESS, "the first load -> {:08x}", r.code);
+
+    // Saving again gives the session a new version, and the older blob is no
+    // longer the one the TPM is tracking.
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[session], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &first));
+    assert_ne!(r.code, rc::SUCCESS, "an older session context loaded again");
+}
+
+#[test]
+fn clear_turns_the_hierarchies_back_on_and_moves_the_pcr_counter() {
+    // Part 3 clause 24.6.1 lists "SET shEnable and ehEnable" and ends with
+    // "increment pcrUpdateCounter", the second so that a policy session built
+    // on TPM2_PolicyPCR stops being usable.
+    let h = Harness::started("clearflags");
+    let before = pcr_update_counter(&h);
+
+    let mut p = Writer::new();
+    p.u32(rh::OWNER);
+    p.u8(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyControl,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    // With the hierarchy off, a primary key of it cannot be made.
+    let r = ask_for_ecc_key(&h, 0x0004_0072, alg::ECDSA, None);
+    assert_ne!(r.code, rc::SUCCESS, "a disabled hierarchy made a key");
+
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Clear,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "TPM2_Clear -> {:08x}", r.code);
+
+    let r = ask_for_ecc_key(&h, 0x0004_0072, alg::ECDSA, None);
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "TPM2_Clear did not set shEnable -> {:08x}",
+        r.code
+    );
+    assert_ne!(
+        pcr_update_counter(&h),
+        before,
+        "TPM2_Clear did not move pcrUpdateCounter"
+    );
+}
+
+/// The pcrUpdateCounter, read through TPM2_PCR_Read.
+fn pcr_update_counter(h: &Harness) -> u32 {
+    let mut p = Writer::new();
+    p.u32(0); // an empty selection is enough to be told the counter
+    let r = h.send(&command(st::NO_SESSIONS, cc::PCR_Read, &[], None, &p.finish().unwrap()));
+    assert_eq!(r.code, rc::SUCCESS, "PCR_Read -> {:08x}", r.code);
+    u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]])
+}
+
+#[test]
 fn ecc_parameters_describe_p256() {
     let h = Harness::started("eccparms");
     let mut p = Writer::new();

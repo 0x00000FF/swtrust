@@ -157,6 +157,20 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         Vec::new()
     };
 
+    // Part 3 clause 24.6.1: "if this command is authorized using lockoutAuth,
+    // the HMAC in the response shall use the new lockoutAuth value (that is,
+    // the Empty Buffer) when computing the response HMAC." Every other command
+    // answers with the value it was authorized by, which is the one taken
+    // before it ran.
+    let mut contexts = contexts;
+    if request.code == crate::tpm::constants::cc::Clear
+        && request.handle(0) == Ok(crate::tpm::constants::rh::LOCKOUT)
+    {
+        if let Some(first) = contexts.first_mut() {
+            first.auth.clear();
+        }
+    }
+
     let mut parameters = response.parameters.clone();
     dispatch::encrypt_parameters(state, &request, &mut parameters, &auth_values)?;
 

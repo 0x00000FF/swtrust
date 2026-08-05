@@ -171,6 +171,11 @@ impl Hierarchies {
         self.owner.clear_authorization();
         self.endorsement.regenerate_proof(rng)?;
         self.endorsement.clear_authorization();
+        // Part 3 clause 24.6.1 lists "SET shEnable and ehEnable" among what the
+        // clear operation does, so a hierarchy that TPM2_HierarchyControl had
+        // turned off comes back on.
+        self.owner.enabled = true;
+        self.endorsement.enabled = true;
         Ok(())
     }
 

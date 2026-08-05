@@ -188,6 +188,15 @@ impl PcrBanks {
         self.update_counter = 0;
     }
 
+    /// Advance the counter without changing a register.
+    ///
+    /// Part 3 clause 24.6.1 has TPM2_Clear increment it so that a policy
+    /// session built on TPM2_PolicyPCR stops being usable, which is a change
+    /// to the counter and not to what the registers hold.
+    pub fn bump_update_counter(&mut self) {
+        self.update_counter = self.update_counter.wrapping_add(1);
+    }
+
     /// Put the counter back to a value that came from the state file.
     pub fn set_update_counter(&mut self, value: u32) {
         self.update_counter = value;

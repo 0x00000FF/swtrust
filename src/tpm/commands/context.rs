@@ -61,7 +61,7 @@ fn context_encryption(
 /// handle value is 80 00 00 02", which is the value a saved object carries when
 /// it has the stateClear property.
 fn context_counters(state: &TpmState, saved_handle: u32) -> Vec<u8> {
-    let mut out = state.clock.total_reset_count.to_be_bytes().to_vec();
+    let mut out = state.clock.reset_value.clone();
     if saved_handle == saved::TRANSIENT_STCLEAR {
         out.extend_from_slice(&state.clock.clear_count.to_be_bytes());
     }
@@ -79,9 +79,14 @@ fn seal_context(
     // Clause 27.3.1: "when the context is created by TPM2_ContextSave(), the
     // value of sequence is stored in the TPM2B_CONTEXT_SENSITIVE context before
     // it is encrypted", so that loading can compare the two.
+    // Part 2 Table 258 makes the sensitive area a TPM2B_CONTEXT_SENSITIVE, and
+    // Part 1 clause 27.3.1 says "the size field and the buffer field of context
+    // are encrypted", so the size goes under the cipher with the rest.
     let mut plain = sequence.to_be_bytes().to_vec();
     plain.extend_from_slice(body);
-    let encrypted = sym::cfb_encrypt(&sym_key, &iv, &plain)?;
+    let mut sized = (plain.len() as u16).to_be_bytes().to_vec();
+    sized.extend_from_slice(&plain);
+    let encrypted = sym::cfb_encrypt(&sym_key, &iv, &sized)?;
     // Equation 52 is contextHMAC := HMAC(hProof, data), so the proof itself is
     // the key. The hierarchy is not among the data because Equation 52 takes
     // hProof "as selected by the hierarchy parameter of the TPMS_CONTEXT", so
@@ -130,10 +135,15 @@ fn open_context(state: &mut TpmState, context: &Context) -> TpmResult<Vec<u8>> {
         context.sequence,
         context.saved_handle,
     )?;
-    let plain = sym::cfb_decrypt(&sym_key, &iv, data.encrypted.as_slice())?;
-    if plain.len() < 8 {
+    let sized = sym::cfb_decrypt(&sym_key, &iv, data.encrypted.as_slice())?;
+    if sized.len() < 2 {
         return Err(TpmRc(rc::BAD_CONTEXT).with_parameter(1));
     }
+    let inner = u16::from_be_bytes([sized[0], sized[1]]) as usize;
+    if inner + 2 != sized.len() || inner < 8 {
+        return Err(TpmRc(rc::BAD_CONTEXT).with_parameter(1));
+    }
+    let plain = &sized[2..];
     // Clause 27.3.1: "when the context is loaded, the value of sequence is
     // compared to the value in the loaded TPM2B_CONTEXT_SENSITIVE context after
     // it is decrypted. If the values are not the same, then the TPM will enter
@@ -372,6 +382,13 @@ pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     if context.sequence > state.sessions.context_counter() {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
+    // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
+    // context is associated with a hierarchy that is disabled." The note
+    // beside it says contexts for authorization sessions and sequence objects
+    // belong to the NULL hierarchy, which is never disabled.
+    if !state.hierarchies.is_enabled(context.hierarchy) {
+        return Err(TpmRc(rc::HIERARCHY).with_parameter(1));
+    }
     let body = open_context(state, &context)?;
 
     match context.saved_handle {
@@ -380,7 +397,10 @@ pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Respon
             if session.handle != h {
                 return Err(TpmRc(rc::BAD_CONTEXT).with_parameter(1));
             }
-            state.sessions.restore(session)?;
+            state
+                .sessions
+                .restore(session, context.sequence)
+                .map_err(|e| e.with_parameter(1))?;
             respond_with_handle(h, |_| Ok(()))
         }
         saved::SEQUENCE_OBJECT => {
