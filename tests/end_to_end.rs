@@ -290,16 +290,33 @@ fn read_clock_reports_the_reset_count() {
     assert_eq!(reader.u8().unwrap(), 1, "safe");
 }
 
+/// Part 3 clause 5.2 item 1 answers a tag that is neither TPM_ST_SESSIONS nor
+/// TPM_ST_NO_SESSIONS with TPM_RC_BAD_TAG, and Part 2 Table 19 pairs it with
+/// TPM_ST_RSP_COMMAND, "used when there is an error in the tag... because an
+/// error in the command tag may prevent determination of the family."
 #[test]
-fn a_bad_tag_is_reported_as_tpm_rc_tag() {
+fn a_bad_tag_is_reported_the_way_a_tpm_1_2_reported_it() {
     let h = Harness::started("badtag");
+    // TPM_TAG_RQU_COMMAND is what a caller that expects a TPM 1.2 sends, which
+    // is how firmware tells the two families apart.
     let mut w = Writer::new();
     w.u16(0x00c1);
     w.u32(10);
     w.u32(cc::GetRandom);
     let r = h.send(&w.finish().unwrap());
-    assert_eq!(r.code, rc::TAG);
-    assert_eq!(r.tag, st::NO_SESSIONS);
+    assert_eq!(r.code, rc::BAD_TAG);
+    assert_eq!(r.code, 0x1e, "the value TPM 1.2 returned for TPM_BADTAG");
+    assert_eq!(r.tag, st::RSP_COMMAND);
+
+    // A command tag this family does define is still refused, and that failure
+    // is an ordinary one.
+    let mut w = Writer::new();
+    w.u16(st::NULL);
+    w.u32(10);
+    w.u32(cc::GetRandom);
+    let r = h.send(&w.finish().unwrap());
+    assert_eq!(r.code, rc::BAD_TAG);
+    assert_eq!(r.tag, st::RSP_COMMAND);
 }
 
 #[test]
