@@ -1290,6 +1290,12 @@ pub fn policy_ac_send_select(state: &mut TpmState, request: &Request) -> TpmResu
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
+    // Part 3 clause 32.4.1: "if either policySession->cpHash or
+    // policySession->nameHash has been previously set, the TPM shall return
+    // TPM_RC_CPHASH", because the two share the same place.
+    if s.policy.cp_hash.is_some() || s.policy.name_hash.is_some() {
+        return Err(TpmRc(rc::CPHASH));
+    }
     let mut data = Vec::new();
     if include_object {
         data.extend_from_slice(object_name.as_slice());
@@ -1298,6 +1304,16 @@ pub fn policy_ac_send_select(state: &mut TpmState, request: &Request) -> TpmResu
     data.extend_from_slice(ac_name.as_slice());
     data.push(u8::from(include_object));
     s.extend_policy(cc::Policy_AC_SendSelect, &data)?;
+    // The same clause sets nameHash to the digest of all three Names, "so that
+    // the check performed in TPM2_AC_Send() may be the same regardless of
+    // which Names are included in policySession->policyDigest". That is what
+    // makes the policy valid for one triple and no other.
+    let auth_hash = s.auth_hash;
+    let mut names = Vec::new();
+    names.extend_from_slice(object_name.as_slice());
+    names.extend_from_slice(auth_handle_name.as_slice());
+    names.extend_from_slice(ac_name.as_slice());
+    s.policy.name_hash = Some(hash::digest(auth_hash, &names)?);
     s.policy.command_code = Some(cc::AC_Send);
     respond(|_| Ok(()))
 }

@@ -702,6 +702,7 @@ pub fn check_authorization(
             &nonce_encrypt,
             input.attributes,
         )?;
+        check_pin_available(state, entity).map_err(|e| e.with_session(position))?;
         let accepted = session::auth_hmac_accepted(&key, &expected, &input.hmac);
         record_pin_attempt(state, entity, accepted)?;
         if !accepted {
@@ -1090,11 +1091,17 @@ fn check_policy(
     }
 
     // TPM2_PolicyAuthValue and TPM2_PolicyPassword both require the caller to
-    // prove the authorization value as well as the policy.
+    // prove the authorization value as well as the policy, which Part 1 clause
+    // 16.8.1 counts as a use of that value and clause 34.2.6 therefore puts
+    // through the PIN counters. A policy that proves only the authPolicy does
+    // not, and the note under clause 34.2.6 says the Reference Code was wrong
+    // to move the counter for one that did.
     if s.policy.password_needed {
         let is_lockout = request.handle(index).ok() == Some(rh::LOCKOUT);
-        return compare_auth(state, &input.hmac, &entity.auth, protected, is_lockout)
-            .map_err(|e| e.with_session(position));
+        check_pin_available(state, entity).map_err(|e| e.with_session(position))?;
+        let outcome = compare_auth(state, &input.hmac, &entity.auth, protected, is_lockout);
+        record_pin_attempt(state, entity, outcome.is_ok())?;
+        return outcome.map_err(|e| e.with_session(position));
     }
     // Part 1 clause 16.6.9 gives the key for a policy session:
     // TPM2_PolicyAuthValue folds the entity value in, and without it the key is

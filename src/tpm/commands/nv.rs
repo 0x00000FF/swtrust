@@ -111,6 +111,17 @@ fn validate_new_public(state: &TpmState, public: &NvPublic, auth_handle: u32) ->
         return Err(TpmRc(rc::NV_DEFINED));
     }
     let a = public.attributes;
+    // Part 3 clause 31.3.1: "if publicInfo->dataSize is larger than
+    // MAX_NV_BUFFER_SIZE and TPMA_NV_WRITEALL is SET, then the TPM shall return
+    // TPM_RC_SIZE." No write could ever reach the whole of such an Index.
+    if a.has(NvAttributes::WRITEALL) && public.data_size as usize > config::MAX_NV_BUFFER_SIZE {
+        return Err(TpmRc(rc::SIZE).with_parameter(2));
+    }
+    // The same clause refuses a counter that says its data goes away, because
+    // a counter that starts again is not one.
+    if a.index_type() == nt::COUNTER && a.has(NvAttributes::CLEAR_STCLEAR) {
+        return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+    }
     // Exactly one write authorization and one read authorization must be set.
     let writes = [
         NvAttributes::PPWRITE,
@@ -766,6 +777,42 @@ mod define_tests {
         assert!(
             define(&mut state, rh::OWNER, Vec::new(), good).is_ok(),
             "the shape the clause describes was refused"
+        );
+    }
+
+    #[test]
+    fn a_write_all_index_fits_a_write_and_a_counter_keeps_its_data() {
+        // Part 3 clause 31.3.1: "if publicInfo->dataSize is larger than
+        // MAX_NV_BUFFER_SIZE and TPMA_NV_WRITEALL is SET, then the TPM shall
+        // return TPM_RC_SIZE", and a counter may not say TPMA_NV_CLEAR_STCLEAR.
+        let mut state = TpmState::manufacture().unwrap();
+        let big = public(
+            nt::ORDINARY,
+            NvAttributes::AUTHREAD | NvAttributes::AUTHWRITE | NvAttributes::WRITEALL,
+            (config::MAX_NV_BUFFER_SIZE + 1) as u16,
+        );
+        assert_eq!(
+            define(&mut state, rh::OWNER, Vec::new(), big)
+                .unwrap_err()
+                .value()
+                & 0x03f,
+            rc::SIZE & 0x03f,
+            "an Index no write could fill was defined"
+        );
+
+        let mut state = TpmState::manufacture().unwrap();
+        let counter = public(
+            nt::COUNTER,
+            NvAttributes::AUTHREAD | NvAttributes::AUTHWRITE | NvAttributes::CLEAR_STCLEAR,
+            8,
+        );
+        assert_eq!(
+            define(&mut state, rh::OWNER, Vec::new(), counter)
+                .unwrap_err()
+                .value()
+                & 0x03f,
+            rc::ATTRIBUTES & 0x03f,
+            "a counter that starts again was defined"
         );
     }
 
