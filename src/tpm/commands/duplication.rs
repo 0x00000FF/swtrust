@@ -241,13 +241,22 @@ pub fn import(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let public = object_public.public_area;
     crate::tpm::core::object::validate_loaded_public(&public)
         .map_err(|e| e.with_parameter(2))?;
-    // An imported object cannot claim to have been made by this TPM.
+    // An imported object cannot claim to have been made by this TPM, and Part 2
+    // clauses 8.3.3.8 and 8.3.3.9 say of firmwareLimited and svnLimited that
+    // each "shall be CLEAR" on Import: an object that came from elsewhere was
+    // not limited to this firmware or this version of it.
     if public
         .object_attributes
         .has(ObjectAttributes::FIXED_TPM)
         || public
             .object_attributes
             .has(ObjectAttributes::FIXED_PARENT)
+        || public
+            .object_attributes
+            .has(ObjectAttributes::FIRMWARE_LIMITED)
+        || public
+            .object_attributes
+            .has(ObjectAttributes::SVN_LIMITED)
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
     }

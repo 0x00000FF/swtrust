@@ -422,6 +422,14 @@ impl Device for Tpm {
                     },
                     _ => self.logger.line("cannot read the state again"),
                 }
+                // A reload that did not happen leaves what the failed command
+                // did in memory, so the TPM stays in failure mode rather than
+                // coming up with it. Part 1 clause 36.2 keeps the affected NV
+                // out of reach; failure mode keeps everything out of reach.
+                if state.nv_write_failed {
+                    state.failure_mode = true;
+                    state.test_failure = Some("nv write".to_string());
+                }
             }
             state.started = false;
             // _TPM_Init is where a stored PCR allocation takes effect, before
@@ -437,7 +445,9 @@ impl Device for Tpm {
             // Reset.
             state.sessions.flush_loaded();
             state.physical_presence = false;
-            state.failure_mode = false;
+            if !state.nv_write_failed {
+                state.failure_mode = false;
+            }
             state.clock.time = 0;
 
             // The pre-operational self tests of FIPS 140-3 clause 10.3, which

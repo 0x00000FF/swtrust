@@ -6186,4 +6186,47 @@ fn a_limited_attribute_needs_a_hierarchy_that_has_it() {
         rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
         "an SVN-limited primary claimed firmwareLimited"
     );
+
+    // Part 2 Table 55 gives TPMI_DH_PARENT the limited handles too, and Part 3
+    // clause 12.9.1 asks TPM2_CreateLoaded for the same validation.
+    let loaded = |hierarchy: u32, extra: u32| -> u32 {
+        let mut t = Writer::new();
+        t.u16(0x0008); // TPM_ALG_KEYEDHASH
+        t.u16(alg::SHA256);
+        t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | extra);
+        t.u16(0); // authPolicy
+        t.u16(alg::NULL); // scheme
+        t.u16(0); // unique
+        let template = t.finish().unwrap();
+
+        let mut p = Writer::new();
+        p.u16(4);
+        p.u16(0);
+        p.u16(0);
+        p.u16(template.len() as u16);
+        p.bytes(&template);
+        h.send(&command(
+            st::SESSIONS,
+            cc::CreateLoaded,
+            &[hierarchy],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+    assert_eq!(
+        loaded(rh::FW_OWNER, 0),
+        rc::SUCCESS,
+        "TPM2_CreateLoaded refused a firmware-limited hierarchy"
+    );
+    assert_eq!(
+        loaded(rh::FW_OWNER, FIRMWARE_LIMITED),
+        rc::SUCCESS,
+        "TPM2_CreateLoaded refused the attribute of its own hierarchy"
+    );
+    assert_eq!(
+        loaded(rh::OWNER, FIRMWARE_LIMITED),
+        rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
+        "TPM2_CreateLoaded let an owner object claim firmwareLimited"
+    );
 }

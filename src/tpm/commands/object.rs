@@ -553,6 +553,10 @@ fn derive_object(
     let template = TpmtPublic::unmarshal_with(&mut r, true).map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
     object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
+    // A Derivation Parent is an ordinary object, so a derived object may claim
+    // neither of the two limited attributes.
+    object::validate_limited_attributes(&template, false, false)
+        .map_err(|e| e.with_parameter(2))?;
 
     // Clause 12.9.1 names the one input check that is specific to derivation:
     // "when parentHandle references a Derivation Parent, then
@@ -843,6 +847,14 @@ pub fn create_loaded(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         if !state.hierarchies.is_enabled(parent_handle) {
             return Err(TpmRc(rc::HIERARCHY).with_handle(1));
         }
+        // Part 3 clause 12.9.1 asks of this command the same validation as
+        // TPM2_Create and TPM2_CreatePrimary.
+        object::validate_limited_attributes(
+            &template,
+            is_firmware_limited(parent_handle),
+            is_svn_limited(parent_handle),
+        )
+        .map_err(|e| e.with_parameter(2))?;
         let seed = state.hierarchies.seed_of(parent_handle)?;
         let context = primary_context(&template, &in_sensitive)?;
         let name_alg = if template.name_alg == alg::NULL {
@@ -876,6 +888,8 @@ pub fn create_loaded(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     }
 
     let parent = parent_of(state, parent_handle).map_err(|e| e.with_handle(1))?;
+    object::validate_limited_attributes(&template, parent.firmware_limited, parent.svn_limited)
+        .map_err(|e| e.with_parameter(2))?;
     let (sensitive, unique) = create_sensitive(&mut state.rng, &template, &in_sensitive)?;
     let mut public = template;
     public.unique = unique;
@@ -1065,6 +1079,11 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         && !crate::tpm::core::hierarchy::Hierarchies::is_limited(hierarchy)
     {
         return Err(TpmRc(rc::HIERARCHY).with_parameter(3));
+    }
+    // A hierarchy whose secret this firmware cannot reach is not one an object
+    // may be associated with either, Part 2 Table 18 giving that its own code.
+    if !crate::tpm::core::hierarchy::Hierarchies::limited_secret_available(hierarchy) {
+        return Err(TpmRc(rc::SVN_LIMITED).with_parameter(3));
     }
     // Part 2 Table 45: an object of a hierarchy whose enable is CLEAR "may not
     // be used", so one is not loaded into it either.

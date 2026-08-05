@@ -294,8 +294,15 @@ pub fn allows(handle_spec: Handle, handle: u32) -> bool {
             Kind::Persistent => (hc::PERSISTENT_FIRST..=hc::PERSISTENT_LAST).contains(&handle),
             _ => object(handle),
         },
-        // A parent is an object or any hierarchy, including the null one.
-        Kind::Parent => object(handle) || hierarchy(handle) || handle == rh::NULL,
+        // A parent is an object or any hierarchy, including the null one and
+        // the firmware-limited and SVN-limited ones Part 2 Table 55 lists in
+        // TPMI_DH_PARENT.
+        Kind::Parent => {
+            object(handle)
+                || hierarchy(handle)
+                || handle == rh::NULL
+                || crate::tpm::core::hierarchy::Hierarchies::is_limited(handle)
+        }
         // An entity is anything that can hold an authorization value.
         // Part 2 Table 52 lists TPM_RH_NULL as conditional, so it is allowed
         // only where the command writes the trailing plus, which the check
