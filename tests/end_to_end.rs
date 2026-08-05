@@ -1265,6 +1265,96 @@ fn a_startup_flushes_every_transient_context() {
 }
 
 #[test]
+fn a_restart_leaves_the_pcr_update_counter_alone() {
+    // Part 3 clause 9.3.2 has a TPM Reset clear pcrUpdateCounter to zero, and
+    // the note in clause 9.3.3 says of a TPM Restart that "the PCR Update
+    // Counter (pcrUpdateCounter) is not modified".
+    let h = Harness::started("restartpcr");
+    let mut body = 1u32.to_be_bytes().to_vec();
+    body.extend_from_slice(&alg::SHA256.to_be_bytes());
+    body.extend_from_slice(&[0u8; 32]);
+    let mut p = Writer::new();
+    p.bytes(&body);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::PCR_Extend,
+        &[hc::PCR_FIRST + 8],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "PCR_Extend -> {:08x}", r.code);
+    let before = pcr_update_counter(&h);
+    assert_ne!(before, 0, "the extend did not move the counter");
+
+    // A TPM Restart: Shutdown(STATE) then Startup(CLEAR).
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    assert_eq!(
+        pcr_update_counter(&h),
+        before,
+        "a restart moved the PCR update counter"
+    );
+
+    // A TPM Reset clears it.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    assert_eq!(pcr_update_counter(&h), 0, "a reset did not clear the counter");
+}
+
+#[test]
+fn a_saved_session_outlives_clear() {
+    // Part 1 clause 27.1: "saved session contexts remain valid until the
+    // session is closed, or TPM Reset." TPM2_Clear is neither of those, and a
+    // session is protected under the NULL hierarchy rather than under the seed
+    // the command replaces.
+    let h = Harness::started("clearsession");
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0u8; 16]);
+    p.u16(0);
+    p.u8(se::HMAC);
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let session = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[session], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let context = r.body.clone();
+
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Clear,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "TPM2_Clear -> {:08x}", r.code);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextLoad, &[], None, &context));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "TPM2_Clear invalidated a saved session -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
 fn a_context_of_a_disabled_hierarchy_does_not_load() {
     // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
     // context is associated with a hierarchy that is disabled."

@@ -578,16 +578,26 @@ pub fn parameter_encryption_key(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSlots {
     sessions: BTreeMap<u32, Session>,
-    /// Handles that have been assigned but whose context is not loaded.
+    /// Handles that have been assigned but whose context is not loaded, with
+    /// the identifier each was carrying when it was put away.
     saved: BTreeMap<u32, u64>,
-    /// The next context identifier, which orders saved sessions.
+    /// The identifier a loaded session is carrying.
+    version: BTreeMap<u32, u64>,
+    /// The contextCounter of Part 1 clause 27.2.2, which "is used to provide
+    /// sequence numbers for sessions and increments when a session context is
+    /// created or loaded". An object context does not take its number here.
     context_counter: u64,
+    /// The objectContextID of the same clause, which "provides sequence
+    /// numbers for Transient Objects" and "is incremented each time an object
+    /// context is saved".
+    object_counter: u64,
 }
 
 impl SessionSlots {
     pub fn new() -> SessionSlots {
         SessionSlots {
             context_counter: 1,
+            object_counter: 1,
             ..SessionSlots::default()
         }
     }
@@ -611,7 +621,41 @@ impl SessionSlots {
         self.context_counter
     }
 
-    /// Take the next context identifier.
+    /// The counter an object or sequence context is stamped with.
+    pub fn object_counter(&self) -> u64 {
+        self.object_counter
+    }
+
+    /// Take the next object context identifier, clause 27.2.2.
+    pub fn next_object_id(&mut self) -> u64 {
+        let id = self.object_counter;
+        self.object_counter = self.object_counter.wrapping_add(1);
+        id
+    }
+
+    /// The oldest identifier a saved session still holds.
+    pub fn oldest_saved(&self) -> Option<u64> {
+        self.saved.values().copied().min()
+    }
+
+    /// Refuse a new identifier when an old saved context could no longer be
+    /// told from a new one.
+    ///
+    /// Part 3 clause 11.1.1: "if the TPM implements a gap scheme for assigning
+    /// contextID values, then the TPM shall return TPM_RC_CONTEXT_GAP if
+    /// creating the session would prevent recycling of old saved contexts."
+    /// This TPM reports a gap in TPM_PT_CONTEXT_GAP_MAX, so it answers for one.
+    fn check_gap(&self) -> TpmResult<()> {
+        if let Some(oldest) = self.oldest_saved() {
+            if self.context_counter.saturating_sub(oldest) >= config::CONTEXT_GAP_MAX as u64 {
+                return Err(TpmRc(rc::CONTEXT_GAP));
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the next session identifier, which clause 27.2.2 does when a
+    /// session context is created or loaded.
     pub fn next_context_id(&mut self) -> u64 {
         let id = self.context_counter;
         self.context_counter = self.context_counter.wrapping_add(1);
@@ -657,7 +701,10 @@ impl SessionSlots {
         if self.active() >= config::MAX_ACTIVE_SESSIONS as usize {
             return Err(TpmRc(rc::SESSION_HANDLES));
         }
+        self.check_gap()?;
         let handle = session.handle;
+        let id = self.next_context_id();
+        self.version.insert(handle, id);
         self.sessions.insert(handle, session);
         Ok(handle)
     }
@@ -712,7 +759,9 @@ impl SessionSlots {
     /// Move a session out of memory, keeping its handle reserved.
     pub fn save(&mut self, handle: u32) -> TpmResult<(Session, u64)> {
         let session = self.sessions.remove(&handle).ok_or(TpmRc(rc::HANDLE))?;
-        let id = self.next_context_id();
+        // The identifier was taken when the session was created or last
+        // loaded, which is when clause 27.2.2 says the counter advances.
+        let id = self.version.remove(&handle).unwrap_or(self.context_counter);
         self.saved.insert(handle, id);
         Ok((session, id))
     }
@@ -732,6 +781,10 @@ impl SessionSlots {
             Some(_) => return Err(TpmRc(rc::VALUE)),
             None => return Err(TpmRc(rc::HANDLE)),
         }
+        // Loading advances the counter, so the session comes back with a new
+        // identifier and the blob that brought it here is spent.
+        let id = self.next_context_id();
+        self.version.insert(handle, id);
         if self.sessions.len() >= config::MAX_LOADED_SESSIONS as usize {
             return Err(TpmRc(rc::SESSION_MEMORY));
         }
@@ -762,7 +815,9 @@ impl SessionSlots {
     pub fn clear(&mut self) {
         self.sessions.clear();
         self.saved.clear();
+        self.version.clear();
         self.context_counter = 1;
+        self.object_counter = 1;
     }
 
     /// The handles of the saved sessions and the identifier each was given.
@@ -771,9 +826,15 @@ impl SessionSlots {
     }
 
     /// Put back what [`saved_contexts`] gave, after a TPM Restart or Resume.
-    pub fn restore_saved_contexts(&mut self, saved: Vec<(u32, u64)>, counter: u64) {
+    pub fn restore_saved_contexts(
+        &mut self,
+        saved: Vec<(u32, u64)>,
+        counter: u64,
+        object_counter: u64,
+    ) {
         self.saved = saved.into_iter().collect();
         self.context_counter = counter;
+        self.object_counter = object_counter;
     }
 
     /// Drop the sessions in TPM memory and keep the record of the saved ones.
@@ -786,6 +847,7 @@ impl SessionSlots {
     /// outlives a restart with it.
     pub fn flush_loaded(&mut self) {
         self.sessions.clear();
+        self.version.clear();
     }
 
     /// Drop every session bound to `handle`, which happens when the entity the
@@ -1218,6 +1280,73 @@ mod tests {
         slots.restore(saved.clone(), id).unwrap();
         assert_eq!(slots.len(), 1);
         assert_eq!(slots.active(), 1);
+    }
+
+    #[test]
+    fn a_session_takes_its_number_when_it_is_created_and_when_it_is_loaded() {
+        // Part 1 clause 27.2.2: contextCounter "increments when a session
+        // context is created or loaded". Saving is neither, so a context
+        // carries the number its session already had.
+        let mut slots = SessionSlots::new();
+        let before = slots.context_counter();
+        let h = slots.insert(session(se::HMAC)).unwrap();
+        assert_eq!(
+            slots.context_counter(),
+            before + 1,
+            "creating a session did not take a number"
+        );
+        let at_create = slots.context_counter();
+        let (blob, id) = slots.save(h).unwrap();
+        assert_eq!(
+            slots.context_counter(),
+            at_create,
+            "saving took a number of its own"
+        );
+        assert_eq!(id, before, "the context does not carry the session's number");
+        slots.restore(blob, id).unwrap();
+        assert_eq!(
+            slots.context_counter(),
+            at_create + 1,
+            "loading did not take a number"
+        );
+    }
+
+    #[test]
+    fn an_object_context_does_not_move_the_session_counter() {
+        // The same clause keeps objectContextID apart, incremented "each time
+        // an object context is saved".
+        let mut slots = SessionSlots::new();
+        let sessions_before = slots.context_counter();
+        let objects_before = slots.object_counter();
+        assert_eq!(slots.next_object_id(), objects_before);
+        assert_eq!(slots.object_counter(), objects_before + 1);
+        assert_eq!(
+            slots.context_counter(),
+            sessions_before,
+            "an object context took a session number"
+        );
+    }
+
+    #[test]
+    fn a_session_that_would_strand_an_old_context_is_refused() {
+        // Part 3 clause 11.1.1: "if the TPM implements a gap scheme for
+        // assigning contextID values, then the TPM shall return
+        // TPM_RC_CONTEXT_GAP if creating the session would prevent recycling
+        // of old saved contexts."
+        let mut slots = SessionSlots::new();
+        let h = slots.insert(session(se::HMAC)).unwrap();
+        let (_blob, _id) = slots.save(h).unwrap();
+        // Walk the counter up to the far edge of the window the TPM reports.
+        for _ in 0..config::CONTEXT_GAP_MAX as u64 - 1 {
+            slots.next_context_id();
+        }
+        let mut s = session(se::HMAC);
+        s.handle = hc::HMAC_SESSION_FIRST + 1;
+        assert_eq!(
+            slots.insert(s).unwrap_err(),
+            TpmRc(rc::CONTEXT_GAP),
+            "a session was created past the gap"
+        );
     }
 
     #[test]

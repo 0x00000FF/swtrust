@@ -339,7 +339,10 @@ pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Respon
             (rh::NULL, handle, marshal_session(&session)?, id)
         } else {
             let slot = state.objects.get(handle).map_err(|e| e.with_handle(1))?;
-            let sequence_id = state.sessions.next_context_id();
+            // Part 1 clause 27.2.2 gives an object context its number from
+            // objectContextID, which "is incremented each time an object
+            // context is saved", and not from the session counter.
+            let sequence_id = state.sessions.next_object_id();
             match slot {
                 Slot::Object(o) => {
                     // An object that may not be duplicated may still be saved,
@@ -379,7 +382,19 @@ pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let context = Context::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
-    if context.sequence > state.sessions.context_counter() {
+    // Part 1 clause 27.2.2 fixes the viable range: "for an object, the viable
+    // range is any number that is less than the current value of the object
+    // sequence counter. For a session, the sequence number must also be less
+    // than the session sequence number, but it must also be greater that the
+    // sequence number minus the allowable range for session sequence number."
+    let viable = if crate::tpm::core::session::is_session_handle(context.saved_handle) {
+        let counter = state.sessions.context_counter();
+        context.sequence < counter
+            && context.sequence + config::CONTEXT_GAP_MAX as u64 > counter
+    } else {
+        context.sequence < state.sessions.object_counter()
+    };
+    if !viable {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
     // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the

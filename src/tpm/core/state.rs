@@ -27,6 +27,9 @@ use super::session::SessionSlots;
 /// it is still read rather than being thrown away: a TPM whose state a caller
 /// depends on should not lose it because this build learned a new field.
 ///
+/// Version 6 wrote the object context counter beside the session one, which
+/// Part 1 clause 27.2.2 keeps apart.
+///
 /// Version 5 replaced the counter that stood for resetValue in Part 1
 /// Equation 52 with the random form the equation offers beside it.
 ///
@@ -40,7 +43,9 @@ use super::session::SessionSlots;
 /// It was never released, so version 1 means the layout that came before the
 /// byte and nothing else. A file of the other shape can only have been written
 /// by a developer running that build, and is not one this reads.
-const STATE_VERSION: u32 = 5;
+const STATE_VERSION: u32 = 6;
+/// Version 5 kept one context counter where Part 1 clause 27.2.2 has two.
+const STATE_VERSION_WITHOUT_OBJECT_COUNTER: u32 = 5;
 /// Version 4 counted TPM Resets rather than drawing a value for each one.
 const STATE_VERSION_WITHOUT_RESET_VALUE: u32 = 4;
 /// The version each field arrived in. A gate written against STATE_VERSION
@@ -51,6 +56,7 @@ const FIRST_WITH_CLEAR_COUNT: u32 = 3;
 const FIRST_WITH_SESSIONS: u32 = 4;
 const FIRST_WITH_PERSISTENT_STATE_CLEAR: u32 = 4;
 const FIRST_WITH_RESET_VALUE: u32 = 5;
+const FIRST_WITH_OBJECT_COUNTER: u32 = 6;
 /// Version 3 did not record which session contexts had been saved.
 const STATE_VERSION_WITHOUT_SESSIONS: u32 = 3;
 /// Version 2 recorded the profile but not the clearCount of Part 1 Equation 52.
@@ -397,7 +403,9 @@ impl TpmState {
             self.ever_started || self.clock.reset_count > 0 || self.clock.restart_count > 0;
         self.hierarchies.on_reset(&mut self.rng, !restart)?;
         self.pcr.allocate(&self.pcr_allocation.clone())?;
-        self.pcr.reset_update_counter();
+        if !restart {
+            self.pcr.reset_update_counter();
+        }
         self.objects.clear();
         // Only a TPM Reset invalidates a saved session context; a TPM Restart
         // flushes what is in memory and leaves the saved ones reloadable.
@@ -561,11 +569,6 @@ impl TpmState {
     /// Apply TPM2_Clear, Part 3 clause 24.6.
     pub fn on_clear(&mut self) -> TpmResult<()> {
         self.hierarchies.on_clear(&mut self.rng)?;
-        // Part 2 clause 14.2 says a saved session context is not usable after
-        // the Storage Primary Seed changes, and the sessions of this TPM are
-        // protected under the NULL hierarchy, so the record of which ones had
-        // saved contexts goes with the seed rather than outliving it.
-        self.sessions.clear();
         self.lockout = LockoutState::default();
         self.permanent = PermanentAttributes(
             self.permanent.0 & PermanentAttributes::TPM_GENERATED_EPS,
@@ -728,6 +731,7 @@ impl TpmState {
             w.u64(*id);
         }
         w.u64(self.sessions.context_counter());
+        w.u64(self.sessions.object_counter());
 
         w.finish()
     }
@@ -741,6 +745,7 @@ impl TpmState {
         if !matches!(
             version,
             STATE_VERSION
+                | STATE_VERSION_WITHOUT_OBJECT_COUNTER
                 | STATE_VERSION_WITHOUT_RESET_VALUE
                 | STATE_VERSION_WITHOUT_SESSIONS
                 | STATE_VERSION_WITHOUT_CLEAR_COUNT
@@ -796,6 +801,17 @@ impl TpmState {
             version >= FIRST_WITH_CLEAR_COUNT,
             version >= FIRST_WITH_RESET_VALUE,
         )?;
+        // Part 1 Equation 52 wants a value of the vendor digest size. A record
+        // from before it was drawn carries none, and no startup would fill one
+        // that is not a reset, so one is drawn here. The contexts that build
+        // named the counter it used instead, and they stop verifying, which is
+        // what changing the value does.
+        if state.clock.reset_value.is_empty() {
+            use crate::tpm::crypto::rand::Rng;
+            let size =
+                crate::tpm::crypto::hash::digest_size(config::CONTEXT_INTEGRITY_HASH_ALG)?;
+            state.clock.reset_value = state.rng.bytes(size)?;
+        }
         state.algorithm_set = r.u32()?;
         state.lockout_auth = read_sized(&mut r)?;
         state.lockout_policy = TpmtHa::unmarshal(&mut r)?;
@@ -985,7 +1001,17 @@ impl TpmState {
                 saved.push((handle, id));
             }
             let counter = r.u64()?;
-            state.sessions.restore_saved_contexts(saved, counter);
+            // Clause 27.2.2 has two counters, and a record from before the
+            // second was written down starts it where the first stands, which
+            // is past every object context that build could have saved.
+            let object_counter = if version >= FIRST_WITH_OBJECT_COUNTER {
+                r.u64()?
+            } else {
+                counter
+            };
+            state
+                .sessions
+                .restore_saved_contexts(saved, counter, object_counter);
         }
 
         if !r.is_empty() {
@@ -1390,8 +1416,9 @@ mod tests {
     /// Octets the timer block occupies when the policy is empty: the
     /// timeout, the signal, the policy algorithm and an empty digest.
     const ACT_BLOCK: usize = 4 + 1 + 2 + 2 + 1;
-    /// A saved session block with nothing in it: the count and the counter.
-    const SESSION_BLOCK: usize = 4 + 8;
+    /// A saved session block with nothing in it: the count and the two
+    /// counters Part 1 clause 27.2.2 keeps apart.
+    const SESSION_BLOCK: usize = 4 + 8 + 8;
 
     #[test]
     fn a_state_file_without_the_commit_values_still_loads() {
@@ -1516,17 +1543,25 @@ mod tests {
         s.clock.clear_count = 0x99aa_bbcc;
         let current = s.save().unwrap();
 
+        // Version 5 kept one context counter where there are now two.
+        let mut v5 = current.clone();
+        v5[..4].copy_from_slice(&5u32.to_be_bytes());
+        v5.truncate(v5.len() - 8);
+        let back = TpmState::load(&v5).expect("a version 5 record was refused");
+        assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
+
         // Version 4 counted resets rather than drawing a value for each one.
-        let mut v4 = current.clone();
+        let mut v4 = v5.clone();
         v4[..4].copy_from_slice(&4u32.to_be_bytes());
-        let value_at = position_of_clear_count(&current) + 4;
-        let value_len = 2 + u16::from_be_bytes([current[value_at], current[value_at + 1]]) as usize;
+        let value_at = position_of_clear_count(&v5) + 4;
+        let value_len = 2 + u16::from_be_bytes([v5[value_at], v5[value_at + 1]]) as usize;
         v4.drain(value_at..value_at + value_len);
         let back = TpmState::load(&v4).expect("a version 4 record was refused");
         assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
-        assert!(
-            back.clock.reset_value.is_empty(),
-            "a record with no reset value starts without one"
+        assert_eq!(
+            back.clock.reset_value.len(),
+            32,
+            "a record with no reset value has one drawn for it"
         );
 
         // Version 3 wrote neither the saved session block nor the stateClear
