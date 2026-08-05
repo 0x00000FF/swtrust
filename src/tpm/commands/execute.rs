@@ -61,6 +61,17 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         }
     }
 
+    // Part 1 clause 42.2 item 2: "a device supporting Read-Only mode must
+    // reject any affected command before performing authorization checks", and
+    // clause 42.3 says such a command "will have no effect on the TPM state".
+    if state
+        .startup_clear
+        .has(crate::tpm::structures::attributes::StartupClearAttributes::READ_ONLY)
+        && super::table::refused_when_read_only(request.code)
+    {
+        return Err(TpmRc(rc::READ_ONLY));
+    }
+
     // Every handle that carries an authorization is checked in order.
     // Part 3 clause 5.3 resolves the handle area before the command runs, so a
     // handle that names nothing is reported from here. Part 2 clause 6.6.2 puts

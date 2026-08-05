@@ -412,3 +412,46 @@ mod tests {
         );
     }
 }
+
+/// True when Read-Only mode refuses `code`.
+///
+/// Part 3 clause 24.9.1 says the TPM in Read-Only mode "will return
+/// TPM_RC_READ_ONLY on any attempt to create new objects, to define new NV
+/// space, and to modify existing NV space", and Table 207 lists every command
+/// that is not permitted. That list is reproduced here, because a command
+/// missing from it would run and change state the mode exists to hold still.
+pub fn refused_when_read_only(code: u32) -> bool {
+    matches!(
+        code,
+        cc::Create
+            | cc::CreateLoaded
+            | cc::CreatePrimary
+            | cc::ObjectChangeAuth
+            | cc::SetCommandCodeAuditStatus
+            | cc::PCR_Allocate
+            | cc::PCR_SetAuthPolicy
+            | cc::PCR_SetAuthValue
+            | cc::HierarchyControl
+            | cc::SetPrimaryPolicy
+            | cc::ChangePPS
+            | cc::ChangeEPS
+            | cc::Clear
+            | cc::ClearControl
+            | cc::HierarchyChangeAuth
+            | cc::DictionaryAttackParameters
+            | cc::PP_Commands
+            | cc::SetAlgorithmSet
+            | cc::FieldUpgradeStart
+            | cc::FieldUpgradeData
+            | cc::EvictControl
+            | cc::ClockSet
+            | cc::ClockRateAdjust
+            | cc::SetCapability
+            | cc::NV_DefineSpace
+            | cc::NV_UndefineSpace
+            | cc::NV_UndefineSpaceSpecial
+            | cc::NV_Increment
+            | cc::NV_GlobalWriteLock
+            | cc::NV_ChangeAuth
+    )
+}

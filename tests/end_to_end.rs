@@ -1433,6 +1433,72 @@ fn a_session_bound_to_an_object_outlives_it() {
 }
 
 #[test]
+fn read_only_mode_refuses_what_table_207_names() {
+    // Part 3 clause 24.9.1: in Read-Only mode the TPM "will return
+    // TPM_RC_READ_ONLY on any attempt to create new objects, to define new NV
+    // space, and to modify existing NV space", and Part 1 clause 42.2 has the
+    // refusal come "before performing authorization checks".
+    let h = Harness::started("readonly");
+    let mut p = Writer::new();
+    p.u8(1);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::ReadOnlyControl,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "ReadOnlyControl -> {:08x}", r.code);
+
+    // Creating an object is not permitted.
+    let r = ask_for_ecc_key(&h, 0x0004_0072, alg::ECDSA, None);
+    assert_eq!(r.code, rc::READ_ONLY, "CreatePrimary -> {:08x}", r.code);
+
+    // Nor is defining NV space. The authorization here is deliberately wrong,
+    // because the refusal comes before it is looked at.
+    let mut p = Writer::new();
+    p.u16(0); // auth
+    p.u16(14); // publicInfo
+    p.u32(0x01c0_0001);
+    p.u16(alg::SHA256);
+    p.u32(0x2000_0002);
+    p.u16(0);
+    p.u16(8);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_DefineSpace,
+        &[rh::OWNER],
+        Some(&password(b"wrong")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::READ_ONLY, "NV_DefineSpace -> {:08x}", r.code);
+
+    // Reading is permitted.
+    let r = h.send(&command(st::NO_SESSIONS, cc::GetRandom, &[], None, &[0x00, 0x08]));
+    assert_eq!(r.code, rc::SUCCESS, "GetRandom -> {:08x}", r.code);
+
+    // Part 1 clause 42.2: the mode "will remain enabled during TPM Resume".
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = ask_for_ecc_key(&h, 0x0004_0072, alg::ECDSA, None);
+    assert_eq!(r.code, rc::READ_ONLY, "a resume left Read-Only mode");
+
+    // A TPM Restart takes it away.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    let r = ask_for_ecc_key(&h, 0x0004_0072, alg::ECDSA, None);
+    assert_eq!(r.code, rc::SUCCESS, "a restart kept Read-Only mode");
+}
+
+#[test]
 fn a_context_of_a_disabled_hierarchy_does_not_load() {
     // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
     // context is associated with a hierarchy that is disabled."

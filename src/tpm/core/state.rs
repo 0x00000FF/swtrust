@@ -125,13 +125,45 @@ impl LockoutState {
     /// Time and not Clock", so they go with the timer that a power cycle
     /// restarts.
     pub fn on_time(&mut self, time: u64) {
-        if self.failed_tries > 0 && !self.protection_off() && time >= self.next_recovery {
-            self.failed_tries -= 1;
-            self.next_recovery = time.saturating_add(self.recovery_time as u64 * 1000);
+        // A caller that sends nothing for several intervals has had that many
+        // go by; the clause takes one off after each, not one however many
+        // passed.
+        let interval = self.recovery_time as u64 * 1000;
+        if !self.protection_off() && interval > 0 {
+            while self.failed_tries > 0 && time >= self.next_recovery {
+                self.failed_tries -= 1;
+                self.next_recovery = self.next_recovery.saturating_add(interval);
+            }
+            if self.failed_tries == 0 {
+                self.next_recovery = 0;
+            }
         }
         if self.in_lockout && self.lockout_until != 0 && time >= self.lockout_until {
             self.in_lockout = false;
             self.lockout_until = 0;
+        }
+    }
+
+    /// Start the timers again against a Time that has just gone back to zero.
+    ///
+    /// Part 3 clause 25.3.1 measures both against Time, which every startup
+    /// restarts, so a deadline recorded in the last epoch means nothing in
+    /// this one. Clause 16.8.5 says of a lockoutRecovery of zero that "the TPM
+    /// will not exit this state until the next TPM2_Startup()", which is where
+    /// the special lockout ends instead.
+    pub fn on_startup(&mut self) {
+        self.next_recovery = if self.failed_tries > 0 {
+            self.recovery_time as u64 * 1000
+        } else {
+            0
+        };
+        if self.in_lockout {
+            if self.lockout_recovery == 0 {
+                self.in_lockout = false;
+                self.lockout_until = 0;
+            } else {
+                self.lockout_until = self.lockout_recovery as u64 * 1000;
+            }
         }
     }
 }
@@ -529,7 +561,8 @@ impl TpmState {
         // to zero with no side effects (no event triggered)", and the policy
         // goes back to an Empty Policy.
         self.act.on_reset();
-        self.begin_operation(!disorderly);
+        self.lockout.on_startup();
+        self.begin_operation(!disorderly, false);
         Ok(())
     }
 
@@ -591,7 +624,8 @@ impl TpmState {
         // Table 46 copies each signaled into its preserveSignaled so a caller
         // can tell that a reset may have been caused by a timer expiring.
         self.act.on_resume();
-        self.begin_operation(true);
+        self.lockout.on_startup();
+        self.begin_operation(true, true);
         Ok(())
     }
 
@@ -601,13 +635,19 @@ impl TpmState {
     /// which is what TPMA_STARTUP_CLEAR.orderly reports. The recorded shutdown
     /// type goes back to `su::NONE` so a power loss from here is seen as the
     /// disorderly shutdown that it is.
-    fn begin_operation(&mut self, orderly: bool) {
+    fn begin_operation(&mut self, orderly: bool, keep_read_only: bool) {
         let mut attributes = StartupClearAttributes::PH_ENABLE
             | StartupClearAttributes::SH_ENABLE
             | StartupClearAttributes::EH_ENABLE
             | StartupClearAttributes::PH_ENABLE_NV;
         if orderly {
             attributes |= StartupClearAttributes::ORDERLY;
+        }
+        // Part 1 clause 42.2: "a TPM exits Read-Only mode if the TPM receives a
+        // TPM2_Startup() for TPM Reset or TPM Restart. However Read-Only mode
+        // will remain enabled during TPM Resume."
+        if keep_read_only && self.startup_clear.has(StartupClearAttributes::READ_ONLY) {
+            attributes |= StartupClearAttributes::READ_ONLY;
         }
         self.startup_clear = StartupClearAttributes(attributes);
         self.started = true;
@@ -1186,6 +1226,52 @@ mod tests {
         assert_eq!(s.lockout.failed_tries, 0);
         s.advance_time(10_000);
         assert_eq!(s.lockout.failed_tries, 0, "it went below zero");
+    }
+
+    #[test]
+    fn every_interval_that_passes_takes_one_off() {
+        // Part 1 clause 16.8.2 makes recoveryTime "the rate at which
+        // failedTries is decremented", so three intervals without a failure
+        // take three off rather than one.
+        let mut s = TpmState::manufacture().unwrap();
+        s.lockout.recovery_time = 10;
+        s.lockout.failed_tries = 5;
+        s.lockout.next_recovery = 10_000;
+        s.advance_time(30_000);
+        assert_eq!(s.lockout.failed_tries, 2, "only one interval was counted");
+    }
+
+    #[test]
+    fn a_startup_starts_the_lockout_timers_against_the_new_time() {
+        // Part 3 clause 25.3.1 measures both timers against Time, which a
+        // startup restarts, so a deadline from the last epoch means nothing.
+        let mut s = TpmState::manufacture().unwrap();
+        s.lockout.recovery_time = 10;
+        s.lockout.failed_tries = 1;
+        s.lockout.next_recovery = 900_000; // far into the epoch that just ended
+        s.on_startup_clear().unwrap();
+        assert_eq!(s.lockout.next_recovery, 10_000, "the deadline was not rebased");
+        s.advance_time(10_000);
+        assert_eq!(s.lockout.failed_tries, 0);
+    }
+
+    #[test]
+    fn a_startup_ends_a_special_lockout_that_has_no_interval() {
+        // Part 1 clause 16.8.5: with lockoutRecovery zero "the TPM will not
+        // exit this state until the next TPM2_Startup()".
+        let mut s = TpmState::manufacture().unwrap();
+        s.lockout.lockout_recovery = 0;
+        s.lockout.in_lockout = true;
+        s.on_startup_clear().unwrap();
+        assert!(!s.lockout.in_lockout, "a startup did not end it");
+
+        // With an interval it starts again against the new Time instead.
+        let mut s = TpmState::manufacture().unwrap();
+        s.lockout.lockout_recovery = 5;
+        s.lockout.in_lockout = true;
+        s.on_startup_clear().unwrap();
+        assert!(s.lockout.in_lockout, "a startup ended it too soon");
+        assert_eq!(s.lockout.lockout_until, 5_000);
     }
 
     #[test]

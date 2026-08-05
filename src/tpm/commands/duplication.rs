@@ -53,17 +53,15 @@ fn inner_wrap(
     symmetric: &SymDef,
     key: &[u8],
     name: &[u8],
-    sensitive: &[u8],
+    body: &[u8],
 ) -> TpmResult<Vec<u8>> {
-    let mut body = crate::tpm::marshal::Writer::new();
-    body.sized16(sensitive);
-    let body = body.finish()?;
-
+    // Part 1 Equation 37 takes the digest over `sensitive || name`, where
+    // sensitive "is a TPM2B_SENSITIVE", which is what arrives here.
     let mut inner = Vec::with_capacity(2 + hash::digest_size(name_alg)? + body.len());
     let digest = hash::digest_parts(name_alg, &[&body, name])?;
     inner.extend_from_slice(&(digest.len() as u16).to_be_bytes());
     inner.extend_from_slice(&digest);
-    inner.extend_from_slice(&body);
+    inner.extend_from_slice(body);
 
     let iv = vec![0u8; sym::block_size(symmetric.algorithm)?];
     sym::cfb_encrypt(key, &iv, &inner)
@@ -87,9 +85,16 @@ fn inner_unwrap(
     if !protect::constant_time_eq(&digest, &expected) {
         return Err(TpmRc(rc::INTEGRITY));
     }
-    let mut r = crate::tpm::marshal::Reader::new(&body);
+    Ok(body)
+}
+
+/// Take the TPMT_SENSITIVE out of the TPM2B_SENSITIVE phase one works on.
+fn sensitive_from_body(body: &[u8]) -> TpmResult<Vec<u8>> {
+    let mut r = crate::tpm::marshal::Reader::new(body);
     let size = r.u16().map_err(|_| TpmRc(rc::SENSITIVE))? as usize;
-    Ok(r.take(size).map_err(|_| TpmRc(rc::SENSITIVE))?.to_vec())
+    let inner = r.take(size).map_err(|_| TpmRc(rc::SENSITIVE))?.to_vec();
+    r.expect_end().map_err(|_| TpmRc(rc::SENSITIVE))?;
+    Ok(inner)
 }
 
 /// TPM2_Duplicate, Part 3 clause 13.1.
@@ -126,7 +131,13 @@ pub fn duplicate(state: &mut TpmState, request: &Request) -> TpmResult<Response>
         return Err(TpmRc(rc::HIERARCHY).with_handle(2));
     }
 
-    let mut body = sensitive.to_bytes();
+    // Part 1 clause 20.3.2.2 makes phase one work on a TPM2B_SENSITIVE, and
+    // Equation 39 leaves encSensitive as that same value when no inner wrapper
+    // is asked for, so the size goes on here rather than in one of the paths
+    // that follow.
+    let mut writer = crate::tpm::marshal::Writer::new();
+    writer.sized16(&sensitive.to_bytes());
+    let mut body = writer.finish()?;
     // Inner wrap first, if one was asked for.
     let mut encryption_key_out = Vec::new();
     if !symmetric_alg.is_null() {
@@ -178,23 +189,15 @@ pub fn duplicate(state: &mut TpmState, request: &Request) -> TpmResult<Response>
         // carries its own length; without one clause 20.3.2.2 makes
         // encSensitive the TPM2B_SENSITIVE itself, and that is the size the
         // ordinary wrap puts on.
-        let wrapped = if symmetric_alg.is_null() {
-            protect::wrap_private(
-                new_parent.public.name_alg,
-                &seed,
-                &parent_symmetric,
-                &object.name,
-                &body,
-            )?
-        } else {
-            protect::wrap_private_body(
-                new_parent.public.name_alg,
-                &seed,
-                &parent_symmetric,
-                &object.name,
-                &body,
-            )?
-        };
+        // The outer phase encrypts what phase one produced, whichever of the
+        // two shapes clause 20.3.2.2 left it in.
+        let wrapped = protect::wrap_private_body(
+            new_parent.public.name_alg,
+            &seed,
+            &parent_symmetric,
+            &object.name,
+            &body,
+        )?;
         (wrapped, secret)
     };
 
@@ -272,23 +275,13 @@ pub fn import(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     } else {
         let seed = seed_from_parent(&parent, in_symmetric_seed.as_slice(), b"DUPLICATE\0")
             .map_err(|e| e.with_parameter(4))?;
-        if symmetric_alg.is_null() {
-            protect::unwrap_private(
-                parent.public.name_alg,
-                &seed,
-                &parent_symmetric,
-                &object_name,
-                duplicate_blob.as_slice(),
-            )?
-        } else {
-            protect::unwrap_private_body(
-                parent.public.name_alg,
-                &seed,
-                &parent_symmetric,
-                &object_name,
-                duplicate_blob.as_slice(),
-            )?
-        }
+        protect::unwrap_private_body(
+            parent.public.name_alg,
+            &seed,
+            &parent_symmetric,
+            &object_name,
+            duplicate_blob.as_slice(),
+        )?
     };
 
     // Then the inner wrap, if there was one.
@@ -314,7 +307,11 @@ pub fn import(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         )?;
     }
 
-    let sensitive = TpmtSensitive::from_bytes(&body).map_err(|_| TpmRc(rc::SENSITIVE))?;
+    // What phase one produced is a TPM2B_SENSITIVE, so the TPMT_SENSITIVE
+    // comes out of it here.
+    let sensitive_bytes = sensitive_from_body(&body)?;
+    let sensitive =
+        TpmtSensitive::from_bytes(&sensitive_bytes).map_err(|_| TpmRc(rc::SENSITIVE))?;
     // Part 3 clause 12.8.1 imports only a private area that goes with the
     // public one, so the blob this command produces cannot later load as
     // something the public area does not describe.
@@ -515,6 +512,25 @@ mod wrapper_tests {
     use crate::tpm::constants::alg;
     use crate::tpm::core::protect;
     use crate::tpm::structures::schemes::SymDef;
+
+    #[test]
+    fn phase_one_always_produces_a_sized_sensitive() {
+        // Part 1 Equation 39: with no inner wrapper "encSensitive := sensitive",
+        // and clause 20.3.2.2 makes that sensitive a TPM2B_SENSITIVE. A
+        // duplication with neither wrapper hands back exactly that, so a
+        // conforming TPM can read it.
+        use crate::tpm::marshal::{Reader, Writer};
+        let raw = vec![0x11u8; 40];
+        let mut w = Writer::new();
+        w.sized16(&raw);
+        let body = w.finish().unwrap();
+
+        let mut r = Reader::new(&body);
+        assert_eq!(r.u16().unwrap() as usize, raw.len());
+        assert_eq!(r.take(raw.len()).unwrap(), &raw[..]);
+        assert!(r.is_empty(), "the body carries more than the sensitive area");
+        assert_eq!(super::sensitive_from_body(&body).unwrap(), raw);
+    }
 
     #[test]
     fn an_inner_wrapped_body_keeps_its_own_length_through_the_outer_phase() {
