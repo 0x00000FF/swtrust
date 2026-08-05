@@ -369,6 +369,10 @@ pub fn get_capability(state: &TpmState, request: &Request) -> TpmResult<Response
 /// answers TPM_RC_VALUE when the capability is not one of those Table 184
 /// lists. None here is the clause's "the requested TPM property does not
 /// exist", which the caller answers for.
+///
+/// Errors are numbered for that command, where Table 185 makes capability the
+/// fourth parameter and property the fifth, rather than for TPM2_GetCapability,
+/// where the collection below numbers them one and two.
 pub fn capability_property(
     state: &TpmState,
     capability: u32,
@@ -399,7 +403,8 @@ pub fn capability_property(
     // property. Each of those starts at the property named and returns what
     // follows it, so the first item is the one asked for only when it carries
     // the same value back.
-    let (_, data) = build_capability(state, capability, property, 1)?;
+    let (_, data) =
+        build_capability(state, capability, property, 1).map_err(|e| e.at_parameter(5))?;
     let found = match &data {
         Capabilities::Algorithms(l) => l.items.first().map(|i| u32::from(i.alg)),
         Capabilities::Handles(l) => l.items.first().copied(),

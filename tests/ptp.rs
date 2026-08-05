@@ -657,3 +657,67 @@ fn a_command_between_the_start_and_the_end_abandons_the_sequence() {
         "the abandoned data was carried into the sequence that followed"
     );
 }
+
+
+/// Part 3 clause 22.10.1: a _TPM_Hash_Data indication carries "one or more
+/// octets of data that are to be included in the H-CRTM Event Sequence sequence
+/// context... The context holds data for each hash algorithm for each PCR bank
+/// implemented on the TPM." The sequence has no length limit of its own.
+#[test]
+fn a_sequence_longer_than_the_input_buffer_is_measured_whole() {
+    let h = Harness::new("hcrtm-long");
+    let long = vec![0x5au8; config::MAX_BUFFER_SIZE * 3 + 7];
+
+    // Delivered in pieces, the way the interface delivers it.
+    h.tpm.hash_start();
+    for piece in long.chunks(1024) {
+        h.tpm.hash_data(piece);
+    }
+    h.tpm.hash_end();
+    let measured = h
+        .tpm
+        .with_state(|s| s.pcr.read(alg::SHA256, 17).unwrap().to_vec());
+
+    // Part 3 clause 22.11.1 gives the value:
+    // PCR[17][hashAlg] := H(initial_value || H(hash_data))
+    let inner = swtrust::tpm::crypto::hash::digest(alg::SHA256, &long).unwrap();
+    let mut parts = vec![0u8; 32];
+    parts.extend_from_slice(&inner);
+    let expected = swtrust::tpm::crypto::hash::digest(alg::SHA256, &parts).unwrap();
+    assert_eq!(
+        measured, expected,
+        "the sequence was not measured whole; a prefix of it was"
+    );
+}
+
+/// The same clause: "A _TPM_Hash_End indication that occurs after
+/// TPM2_Startup() will increment pcrUpdateCounter unless a platform-specific
+/// specification excludes modifications of PCR[DRTM] from causing an
+/// increment." Once for the indication, however many banks it reaches.
+#[test]
+fn one_hash_end_moves_the_pcr_update_counter_once() {
+    let h = Harness::new("hcrtm-counter");
+    let banks = h.tpm.with_state(|s| s.pcr.algorithms().len());
+    assert!(banks > 1, "the check needs a TPM with more than one bank");
+
+    let before = h.tpm.with_state(|s| s.pcr.update_counter());
+    h.tpm.hash_start();
+    h.tpm.hash_data(b"a measurement");
+    h.tpm.hash_end();
+    assert_eq!(
+        h.tpm.with_state(|s| s.pcr.update_counter()),
+        before + 1,
+        "the indication counted once for each bank it reached"
+    );
+
+    // A sequence a command abandoned changes no PCR, so it counts for nothing.
+    h.tpm.hash_start();
+    h.tpm.hash_data(b"a measurement");
+    h.send(cc::GetRandom, &8u16.to_be_bytes());
+    h.tpm.hash_end();
+    assert_eq!(
+        h.tpm.with_state(|s| s.pcr.update_counter()),
+        before + 1,
+        "an abandoned sequence moved the counter"
+    );
+}

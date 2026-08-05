@@ -276,7 +276,7 @@ impl Device for Tpm {
             // context is flushed, and no change to any PCR occurs." Dropping
             // the buffer here is what makes the _TPM_Hash_End that may still
             // arrive measure nothing.
-            state.hcrtm_buffer = None;
+            state.hcrtm_sequence = None;
             // The time that passed since the last command is credited before
             // the command runs, so a command that reports the clock or reads
             // the countdown timer sees the value it should.
@@ -382,14 +382,26 @@ impl Device for Tpm {
         // "There is only one _TPM_Hash_Start per H-CRTM Event Sequence", and
         // clause 31.1 abandons a sequence on any other indication, so a second
         // one starts over rather than adding to what came before.
-        state.hcrtm_buffer = Some(Vec::new());
+        //
+        // Part 3 clause 22.9.1 has the context hold "hash state for each bank
+        // of PCR", and requires that creating it "will always succeed", so a
+        // bank whose algorithm has no hasher is left out rather than refused.
+        let sequence = state
+            .pcr
+            .algorithms()
+            .into_iter()
+            .filter_map(|a| crate::tpm::crypto::hash::Hasher::new(a).ok())
+            .collect();
+        state.hcrtm_sequence = Some(sequence);
     }
 
     fn hash_data(&self, data: &[u8]) {
         let mut state = self.locked();
-        if let Some(buf) = state.hcrtm_buffer.as_mut() {
-            if buf.len().saturating_add(data.len()) <= crate::tpm::config::MAX_BUFFER_SIZE {
-                buf.extend_from_slice(data);
+        // Clause 22.10.1: "If no H-CRTM Event Sequence context exists, this
+        // indication is discarded, and no other action is performed."
+        if let Some(sequence) = state.hcrtm_sequence.as_mut() {
+            for h in sequence.iter_mut() {
+                h.update(data);
             }
         }
     }
@@ -404,10 +416,26 @@ impl Device for Tpm {
         use crate::tpm::crypto::hash;
 
         let mut state = self.locked();
-        let Some(buf) = state.hcrtm_buffer.take() else {
+        // Clause 22.11.1: the indication "is discarded, and no other action
+        // performed if the TPM does not contain an H-CRTM Event Sequence
+        // context."
+        let Some(sequence) = state.hcrtm_sequence.take() else {
             return;
         };
-        let algorithms = state.pcr.algorithms();
+        // Each bank's hash is completed here, which is the "complete the
+        // digest" the clause asks for.
+        let digests: Vec<(u16, Vec<u8>)> = sequence
+            .into_iter()
+            .map(|h| (h.hash_alg(), h.finish()))
+            .collect();
+        // A _TPM_Hash_End "will increment pcrUpdateCounter unless a
+        // platform-specific specification excludes modifications of PCR[DRTM]
+        // from causing an increment", once for the indication however many
+        // banks it reaches. Before TPM2_Startup the registers are being given
+        // their initial state, which Part 3 clause 9.3.2 leaves the counter out
+        // of, so the value the indication found is put back either way and the
+        // one increment is added below.
+        let counter_before = state.pcr.update_counter();
 
         if state.started {
             // "If the H-CRTM Event Sequence occurs after TPM2_Startup(), the
@@ -430,20 +458,22 @@ impl Device for Tpm {
             // its end changes no PCR, so counting it would record a restart
             // that did not happen.
             state.clock.restart_count = state.clock.restart_count.wrapping_add(1);
-            for a in algorithms {
-                let Ok(digest) = hash::digest(a, &buf) else {
-                    continue;
-                };
+            for (a, digest) in digests {
                 let _ = state.pcr.extend(config::DRTM_PCR, 4, &[(a, digest)]);
             }
+            state
+                .pcr
+                .set_update_counter(counter_before.wrapping_add(u32::from(
+                    !crate::tpm::core::pcr::no_increment(config::DRTM_PCR),
+                )));
         } else {
             // "A platform-specific specification may allow an H-CRTM Event
             // Sequence before TPM2_Startup(). If so, _TPM_Hash_End will
             // complete the digest, initialize PCR[0] with a digest-size value
             // of 4, and then extend the H-CRTM Event Sequence data into
             // PCR[0]."
-            for a in algorithms {
-                let (Ok(digest), Ok(size)) = (hash::digest(a, &buf), hash::digest_size(a)) else {
+            for (a, digest) in digests {
+                let Ok(size) = hash::digest_size(a) else {
                     continue;
                 };
                 // Every hash this TPM has produces a digest, so the last octet
@@ -459,6 +489,7 @@ impl Device for Tpm {
                 let _ = state.pcr.extend(config::HCRTM_PCR, 4, &[(a, digest)]);
                 state.hcrtm_before_startup = true;
             }
+            state.pcr.set_update_counter(counter_before);
         }
     }
 

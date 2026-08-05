@@ -969,26 +969,30 @@ pub fn policy_counter_timer(state: &mut TpmState, request: &Request) -> TpmResul
     let operation = r.u16().map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
-    // The comparison is against the marshalled TPMS_TIME_INFO.
-    let time_info = crate::tpm::structures::attest::TimeInfo {
-        time: state.clock.time,
-        clock_info: super::management::clock_info(state),
-    };
-    let bytes = time_info.to_bytes();
-    let start = offset as usize;
-    let end = start
-        .checked_add(operand_b.len())
-        .ok_or(TpmRc(rc::VALUE).with_parameter(2))?;
-    if end > bytes.len() {
-        return Err(TpmRc(rc::RANGE).with_parameter(2));
-    }
-    let operand_a = &bytes[start..end];
+    // Part 3 clause 23.1: a trial session updates the digest and "the indicated
+    // validations are not performed", which here are the range of the offset
+    // and the comparison itself.
+    if !policy_session(state, handle)?.is_trial() {
+        // The comparison is against the marshalled TPMS_TIME_INFO.
+        let time_info = crate::tpm::structures::attest::TimeInfo {
+            time: state.clock.time,
+            clock_info: super::management::clock_info(state),
+        };
+        let bytes = time_info.to_bytes();
+        let start = offset as usize;
+        let end = start
+            .checked_add(operand_b.len())
+            .ok_or(TpmRc(rc::VALUE).with_parameter(2))?;
+        if end > bytes.len() {
+            return Err(TpmRc(rc::RANGE).with_parameter(2));
+        }
+        let operand_a = &bytes[start..end];
 
-    let satisfied = compare(operand_a, operand_b.as_slice(), operation)
-        .ok_or(TpmRc(rc::VALUE).with_parameter(3))?;
-    let is_trial = policy_session(state, handle)?.is_trial();
-    if !satisfied && !is_trial {
-        return Err(TpmRc(rc::POLICY));
+        let satisfied = compare(operand_a, operand_b.as_slice(), operation)
+            .ok_or(TpmRc(rc::VALUE).with_parameter(3))?;
+        if !satisfied {
+            return Err(TpmRc(rc::POLICY));
+        }
     }
     let _ = eo::EQ;
 
@@ -1157,8 +1161,9 @@ pub fn policy_duplication_select(
     let s = policy_session(state, handle)?;
     // Clause 23.15.1: "If either policySession->cpHash or
     // policySession->nameHash has been previously set, the TPM shall return
-    // TPM_RC_CPHASH", and the note below it puts the two in the same memory.
-    if s.policy.cp_hash.is_some() || s.policy.name_hash.is_some() {
+    // TPM_RC_CPHASH", and the note below it puts the two in the same memory,
+    // which is the memory the other exclusive assertions use as well.
+    if shared_cp_hash_taken(s) {
         return Err(TpmRc(rc::CPHASH));
     }
     let mut data = Vec::new();
@@ -1183,18 +1188,23 @@ pub fn policy_nv(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let operation = r.u16().map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
+    // The Name of the Index goes into the digest, so it is read whether or not
+    // the assertion is evaluated. Part 3 clause 23.1 leaves a trial session the
+    // digest and none of the validations, which here are the state of the
+    // Index, the range of the read and the comparison.
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
-    if index.read_locked {
-        return Err(TpmRc(rc::NV_LOCKED));
-    }
-    let data = index.read(offset, operand_b.len() as u16)?;
     let nv_name = index.name()?;
-
-    let satisfied = compare(&data, operand_b.as_slice(), operation)
-        .ok_or(TpmRc(rc::VALUE).with_parameter(3))?;
-    let is_trial = policy_session(state, handle)?.is_trial();
-    if !satisfied && !is_trial {
-        return Err(TpmRc(rc::POLICY));
+    if !policy_session(state, handle)?.is_trial() {
+        let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
+        if index.read_locked {
+            return Err(TpmRc(rc::NV_LOCKED));
+        }
+        let data = index.read(offset, operand_b.len() as u16)?;
+        let satisfied = compare(&data, operand_b.as_slice(), operation)
+            .ok_or(TpmRc(rc::VALUE).with_parameter(3))?;
+        if !satisfied {
+            return Err(TpmRc(rc::POLICY));
+        }
     }
 
     let auth_hash = policy_session(state, handle)?.auth_hash;
@@ -1251,41 +1261,50 @@ pub fn policy_capability(state: &mut TpmState, request: &Request) -> TpmResult<R
     let property = r.u32().map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
-    // Part 3 clause 23.23.1: "The TPM will use the parameters of this command
-    // to fetch the indicated property that is used by the TPM in the requested
-    // logical operation." The capability that names no property structure is
-    // answered inside the fetch, with TPM_RC_VALUE.
-    let fetched =
-        crate::tpm::commands::management::capability_property(state, capability, property)?;
-    let satisfied = match &fetched {
-        Some(structure) => {
-            // "The TPM will perform the indicated logical operation (operation)
-            // using the property structure as operandA", starting at offset.
-            let end = (offset as usize).saturating_add(operand_b.len());
-            let Some(operand_a) = structure.get(offset as usize..end) else {
-                return Err(TpmRc(rc::VALUE).with_parameter(2));
-            };
-            compare(operand_a, operand_b.as_slice(), operation)
-                .ok_or(TpmRc(rc::VALUE).with_parameter(3))?
-        }
-        // "If the requested TPM property does not exist, the TPM will return
-        // TPM_RC_POLICY unless the operation is TPM_EO_NEQ." A property that is
-        // not there differs from every value it could be asked about.
-        None => {
-            // An operation that is not one of the TPM_EO is still refused,
-            // whether or not the property it would have been applied to is
-            // there. Two operands of the same length settle that on their own.
-            if compare(&[], &[], operation).is_none() {
-                return Err(TpmRc(rc::VALUE).with_parameter(3));
+    // Part 3 clause 23.1: "If the policySession parameter indicates a trial
+    // policy session, then the policySession->policyDigest will be updated and
+    // the indicated validations are not performed." A trial session is
+    // computing the digest a policy would reach on the TPM it will be used on,
+    // which may have properties this one does not.
+    if !policy_session(state, handle)?.is_trial() {
+        // Clause 23.23.1: "The TPM will use the parameters of this command to
+        // fetch the indicated property that is used by the TPM in the requested
+        // logical operation." The capability that names no property structure
+        // is answered inside the fetch, with TPM_RC_VALUE.
+        let fetched =
+            crate::tpm::commands::management::capability_property(state, capability, property)?;
+        let satisfied = match &fetched {
+            Some(structure) => {
+                // "The TPM will perform the indicated logical operation
+                // (operation) using the property structure as operandA",
+                // starting at offset.
+                let end = (offset as usize).saturating_add(operand_b.len());
+                let Some(operand_a) = structure.get(offset as usize..end) else {
+                    return Err(TpmRc(rc::VALUE).with_parameter(2));
+                };
+                compare(operand_a, operand_b.as_slice(), operation)
+                    .ok_or(TpmRc(rc::VALUE).with_parameter(3))?
             }
-            operation == crate::tpm::constants::eo::NEQ
+            // "If the requested TPM property does not exist, the TPM will
+            // return TPM_RC_POLICY unless the operation is TPM_EO_NEQ." A
+            // property that is not there differs from every value it could be
+            // asked about.
+            None => {
+                // An operation that is not one of the TPM_EO is still refused,
+                // whether or not the property it would have been applied to is
+                // there. Two operands of the same length settle that on their
+                // own.
+                if compare(&[], &[], operation).is_none() {
+                    return Err(TpmRc(rc::VALUE).with_parameter(3));
+                }
+                operation == crate::tpm::constants::eo::NEQ
+            }
+        };
+        // "If the operands do not have the desired relationship, then the TPM
+        // returns TPM_RC_POLICY."
+        if !satisfied {
+            return Err(TpmRc(rc::POLICY));
         }
-    };
-    // "If the operands do not have the desired relationship, then the TPM
-    // returns TPM_RC_POLICY." A trial session computes the digest a real one
-    // would reach without holding the assertion to the TPM it is running on.
-    if !satisfied && !policy_session(state, handle)?.is_trial() {
-        return Err(TpmRc(rc::POLICY));
     }
 
     let auth_hash = policy_session(state, handle)?.auth_hash;

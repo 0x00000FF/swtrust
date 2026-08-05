@@ -441,8 +441,14 @@ pub struct TpmState {
     /// The PC Client Platform TPM Profile 1.07 clause 5.1.2 asks a TPM that
     /// implements TPM2_ACT_SetTimeout for one instance, so there is one.
     pub act: crate::tpm::core::act::Act,
-    /// Data collected between _TPM_Hash_Start and _TPM_Hash_End.
-    pub hcrtm_buffer: Option<Vec<u8>>,
+    /// The H-CRTM Event Sequence context, one hash per PCR bank.
+    ///
+    /// Part 3 clause 22.10.1: the _TPM_Hash_Data indication carries "one or
+    /// more octets of data that are to be included in the H-CRTM Event
+    /// Sequence sequence context... The context holds data for each hash
+    /// algorithm for each PCR bank implemented on the TPM." A sequence has no
+    /// length limit, so the octets are hashed as they arrive rather than kept.
+    pub hcrtm_sequence: Option<Vec<crate::tpm::crypto::hash::Hasher>>,
     /// Set when an H-CRTM sequence measured into PCR 0 before TPM2_Startup.
     ///
     /// Part 1 clause 31.3 leaves that register alone at the startup which
@@ -455,6 +461,15 @@ pub struct TpmState {
     /// TPM2_Startup()", answering TPM_RC_LOCALITY otherwise, so the method the
     /// last one used goes with the saved state.
     pub hcrtm_at_last_startup: bool,
+    /// Whether the record this state was loaded from could say what the last
+    /// TPM2_Startup was.
+    ///
+    /// A file written before version 10 carries neither the H-CRTM startup
+    /// method nor the locality, so the checks Part 3 clause 9.3.3 and Part 1
+    /// clause 31.3 make cannot be performed against it. Clause 9.3.3 has the
+    /// answer for that: "If the startupType is TPM_SU_STATE and the TPM
+    /// requires TPM_SU_CLEAR, then the TPM shall return TPM_RC_VALUE."
+    pub startup_method_unknown: bool,
     /// The locality the last TPM2_Startup came from.
     ///
     /// Part 1 clause 31.3 sets PCR 0 from it when no H-CRTM sequence ran, and
@@ -526,10 +541,11 @@ impl TpmState {
             test_digest: Vec::new(),
             test_failure: None,
             rng,
-            hcrtm_buffer: None,
+            hcrtm_sequence: None,
             hcrtm_before_startup: false,
             hcrtm_at_last_startup: false,
             startup_locality: 0,
+            startup_method_unknown: false,
             command_audit_suppressed: false,
         })
     }
@@ -562,6 +578,9 @@ impl TpmState {
         self.pcr.reset_all_but(keep, locality);
         self.hcrtm_at_last_startup = self.hcrtm_before_startup;
         self.startup_locality = locality;
+        // This startup is one the state can speak for, whatever the record it
+        // was loaded from could say.
+        self.startup_method_unknown = false;
         self.hcrtm_before_startup = false;
         // The allocation is put in place at _TPM_Init, which Part 3 clause
         // 22.5.1 names as the moment a stored request takes effect, and which
@@ -684,7 +703,7 @@ impl TpmState {
         self.hcrtm_before_startup = false;
         // _TPM_Init is an indication too, and Part 1 clause 31.1 abandons a
         // sequence that any of them interrupts.
-        self.hcrtm_buffer = None;
+        self.hcrtm_sequence = None;
         self.pcr_allocation_pending = false;
         Ok(())
     }
@@ -697,6 +716,14 @@ impl TpmState {
         // Clause 9.3.3 of the same part requires of a resume that "the H-CRTM
         // startup method is the same for this TPM2_Startup() as for the
         // previous TPM2_Startup()", and answers TPM_RC_LOCALITY when it is not.
+        // A record older than version 10 cannot say what the startup before
+        // it was, and clause 9.3.3 answers TPM_RC_VALUE when the TPM requires
+        // TPM_SU_CLEAR. Assuming the ordinary case instead would let a state
+        // saved after an H-CRTM startup resume without one, which is what the
+        // check below exists to prevent.
+        if self.startup_method_unknown {
+            return Err(TpmRc(rc::VALUE).with_parameter(1));
+        }
         if self.hcrtm_before_startup != self.hcrtm_at_last_startup {
             return Err(TpmRc(rc::LOCALITY));
         }
@@ -1263,6 +1290,8 @@ impl TpmState {
             if version >= FIRST_WITH_HCRTM_METHOD {
                 state.hcrtm_at_last_startup = r.u8()? != 0;
                 state.startup_locality = r.u8()?;
+            } else {
+                state.startup_method_unknown = true;
             }
         }
 
@@ -2362,6 +2391,53 @@ mod tests {
         back.hcrtm_before_startup = true;
         back.on_startup_state(0)
             .expect("a resume after an H-CRTM sequence was held to the locality");
+    }
+
+    #[test]
+    fn a_record_that_cannot_say_what_the_last_startup_was_needs_a_clear_one() {
+        // A file written before version 10 carries neither the H-CRTM startup
+        // method nor the locality, so neither check Part 3 clause 9.3.3 and
+        // Part 1 clause 31.3 make can be performed. Clause 9.3.3: "If the
+        // startupType is TPM_SU_STATE and the TPM requires TPM_SU_CLEAR, then
+        // the TPM shall return TPM_RC_VALUE." Assuming the ordinary case would
+        // let a state saved after an H-CRTM startup resume without one.
+        let mut s = TpmState::manufacture().unwrap();
+        s.hcrtm_before_startup = true;
+        s.on_startup_clear(3).unwrap();
+        s.shutdown_type = crate::tpm::constants::su::STATE;
+        let mut saved = s.save().unwrap();
+        // Version 9 is the same record without those two octets.
+        saved[..4].copy_from_slice(&9u32.to_be_bytes());
+        let sessions_at = saved.len() - (4 + 8 + 8);
+        saved.drain(sessions_at - 2..sessions_at);
+
+        let mut back = TpmState::load(&saved).expect("a version 9 record was refused");
+        back.on_init().unwrap();
+        assert_eq!(
+            back.on_startup_state(0).unwrap_err(),
+            TpmRc(rc::VALUE).with_parameter(1),
+            "a record that cannot say was resumed anyway"
+        );
+        // Even from the locality the startup actually used, because the record
+        // does not carry that either.
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        back.hcrtm_before_startup = true;
+        assert_eq!(
+            back.on_startup_state(3).unwrap_err(),
+            TpmRc(rc::VALUE).with_parameter(1)
+        );
+
+        // A TPM_SU_CLEAR startup is accepted, and what it recorded is what the
+        // resume after it is held to.
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        back.on_startup_clear(0).unwrap();
+        let saved = back.save().unwrap();
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        back.on_startup_state(0)
+            .expect("a resume after a clear startup was refused");
     }
 
     #[test]

@@ -4825,6 +4825,17 @@ fn a_capability_assertion_is_held_to_the_property_the_tpm_reports() {
         r.code
     );
 
+    // A property that the capability itself refuses is reported against the
+    // parameter that carried it, which Table 185 makes the fifth here and
+    // TPM2_GetCapability makes the second.
+    let r = assert_capability(s, &[0, 0, 0, 0], 0, eo::EQ, cap::ACT, rh::OWNER);
+    assert_eq!(
+        r.code,
+        rc::VALUE | 0x080 | 0x040 | (5 << 8),
+        "the property was reported against another parameter -> {:08x}",
+        r.code
+    );
+
     // An offset that reaches past the property structure has no operandA.
     let r = assert_capability(s, &[0, 0, 0, 0], 6, eo::EQ, cap::TPM_PROPERTIES, pt::MANUFACTURER);
     assert_eq!(
@@ -4834,14 +4845,31 @@ fn a_capability_assertion_is_held_to_the_property_the_tpm_reports() {
         r.code
     );
 
-    // "This command may be used with a trial policy", which computes the digest
-    // without holding the assertion to this TPM.
+    // "This command may be used with a trial policy", and clause 23.1 has such
+    // a session update "the policySession->policyDigest" while "the indicated
+    // validations are not performed", returning TPM_RC_SUCCESS unless the
+    // parameters failed to unmarshal. The policy being computed is for the TPM
+    // it will be used on, which may hold properties this one does not.
     let t = session(true);
     let r = assert_capability(t, b"XXXX", 4, eo::EQ, cap::TPM_PROPERTIES, pt::MANUFACTURER);
     assert_eq!(
         r.code,
         rc::SUCCESS,
         "a trial policy was held to the assertion -> {:08x}",
+        r.code
+    );
+    let r = assert_capability(t, &[0, 0, 0, 0], 0, eo::EQ, cap::PCRS, 0);
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a trial policy was held to the capability it named -> {:08x}",
+        r.code
+    );
+    let r = assert_capability(t, &[0, 0, 0, 0], 999, eo::EQ, cap::TPM_PROPERTIES, absent);
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a trial policy was held to the offset it gave -> {:08x}",
         r.code
     );
 
@@ -4980,5 +5008,138 @@ fn the_assertions_that_share_the_cp_hash_exclude_one_another() {
         digest(cc::PolicyCpHash, bound, &a),
         rc::CPHASH,
         "a bound policy session took a cpHash as well"
+    );
+}
+
+
+/// Part 2 clause 9.29 gives TPMI_RH_AC the range {AC_FIRST:AC_LAST} and
+/// "TPM_RC_VALUE — error returned if the handle is out of range".
+#[test]
+fn an_attached_component_handle_is_held_to_its_range() {
+    let h = Harness::started("achandle");
+
+    let get_capability = |ac: u32| -> u32 {
+        let mut p = Writer::new();
+        p.u32(0); // capability
+        p.u32(1); // count
+        h.send(&command(
+            st::NO_SESSIONS,
+            cc::AC_GetCapability,
+            &[ac],
+            None,
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+
+    // No attached component is present, so the list comes back empty, but the
+    // handle still has to be one that could name one.
+    assert_eq!(
+        get_capability(hc::AC_FIRST),
+        rc::SUCCESS,
+        "a handle in range was refused"
+    );
+    assert_eq!(get_capability(hc::AC_LAST), rc::SUCCESS);
+    assert_eq!(
+        get_capability(hc::AC_LAST + 1),
+        rc::VALUE | 0x080 | (1 << 8),
+        "a handle above the range was accepted"
+    );
+    assert_eq!(
+        get_capability(rh::OWNER),
+        rc::VALUE | 0x080 | (1 << 8),
+        "a permanent handle was taken for an attached component"
+    );
+}
+
+
+/// Part 3 clause 23.1: "If the policySession parameter indicates a trial policy
+/// session, then the policySession->policyDigest will be updated and the
+/// indicated validations are not performed", and the note below it: "Unless
+/// there is an unmarshaling error in the parameters of the command, these
+/// commands will return TPM_RC_SUCCESS when policySession references a trial
+/// session."
+#[test]
+fn a_trial_session_reaches_the_digest_without_the_validations() {
+    use swtrust::tpm::constants::eo;
+
+    let h = Harness::started("trialskip");
+
+    let session = |trial: bool| -> u32 {
+        let mut p = Writer::new();
+        p.u16(16);
+        p.bytes(&[0u8; 16]);
+        p.u16(0);
+        p.u8(if trial { se::TRIAL } else { se::POLICY });
+        p.u16(alg::NULL);
+        p.u16(alg::SHA256);
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::StartAuthSession,
+            &[rh::NULL, rh::NULL],
+            None,
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+        u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]])
+    };
+    let digest = |handle: u32| -> Vec<u8> {
+        let r = h.send(&command(st::NO_SESSIONS, cc::PolicyGetDigest, &[handle], None, &[]));
+        assert_eq!(r.code, rc::SUCCESS);
+        r.body[2..].to_vec()
+    };
+    let counter_timer = |handle: u32, operand: &[u8], offset: u16, operation: u16| -> u32 {
+        let mut p = Writer::new();
+        p.u16(operand.len() as u16);
+        p.bytes(operand);
+        p.u16(offset);
+        p.u16(operation);
+        h.send(&command(
+            st::NO_SESSIONS,
+            cc::PolicyCounterTimer,
+            &[handle],
+            None,
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+
+    // An offset past the end of TPMS_TIME_INFO, which a real session is held
+    // to and a trial one is not.
+    let s = session(false);
+    assert_eq!(
+        counter_timer(s, &[0u8; 8], 60, eo::EQ),
+        rc::RANGE | 0x080 | 0x040 | (2 << 8),
+        "a real session took an offset past the structure"
+    );
+    let t = session(true);
+    assert_eq!(
+        counter_timer(t, &[0u8; 8], 60, eo::EQ),
+        rc::SUCCESS,
+        "a trial session was held to the offset"
+    );
+
+    // An assertion that is simply false is refused for a real session and not
+    // for a trial one. Time is never that large.
+    let s2 = session(false);
+    assert_eq!(
+        counter_timer(s2, &[0xffu8; 8], 0, eo::UNSIGNED_GT),
+        rc::POLICY,
+        "a real session took an assertion that does not hold"
+    );
+    let t2 = session(true);
+    assert_eq!(counter_timer(t2, &[0xffu8; 8], 0, eo::UNSIGNED_GT), rc::SUCCESS);
+
+    // The digest a trial reaches is the one a real session reaches, because it
+    // covers the operand and not what the operand was compared against. Time is
+    // always at or above zero, so the real session is satisfied.
+    let t3 = session(true);
+    let s3 = session(false);
+    assert_eq!(counter_timer(t3, &[0u8; 8], 0, eo::UNSIGNED_GE), rc::SUCCESS);
+    assert_eq!(counter_timer(s3, &[0u8; 8], 0, eo::UNSIGNED_GE), rc::SUCCESS);
+    assert_eq!(
+        digest(t3),
+        digest(s3),
+        "a trial policy and a real one reached different digests"
     );
 }

@@ -66,6 +66,20 @@ impl TpmRc {
         TpmRc(rc::RC_FMT1 | base | kind | ((index as u32) << 8))
     }
 
+    /// Move a format-one code to a different parameter number.
+    ///
+    /// Part 2 clause 6.6.2 lets a format-one code name the parameter that
+    /// carried the value, and the same check reached from two commands names
+    /// two different positions. The qualifier already on the code is replaced
+    /// rather than added to, which the plain [`TpmRc::with_parameter`] would
+    /// not do because it only decorates an unqualified code.
+    pub fn at_parameter(self, index: usize) -> TpmRc {
+        if !self.is_format_one() {
+            return self;
+        }
+        TpmRc(rc::RC_FMT1 | (self.0 & 0x03F)).with_parameter(index)
+    }
+
     /// True when the code is a format-one code without a qualifier applied.
     fn is_base_format_one(self) -> bool {
         // Format-one codes occupy 0x080 through 0x0BF before qualification.

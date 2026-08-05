@@ -1,6 +1,6 @@
 //! Duplication, Part 3 clause 13, and the remaining management commands.
 
-use crate::tpm::constants::{rc, rh};
+use crate::tpm::constants::{hc, rc, rh};
 use crate::tpm::core::names;
 use crate::tpm::core::object::{Object, Slot};
 use crate::tpm::core::protect;
@@ -426,6 +426,13 @@ pub fn act_set_timeout(state: &mut TpmState, request: &Request) -> TpmResult<Res
 ///
 /// No attached component is present, so the list is always empty.
 pub fn ac_get_capability(_state: &TpmState, request: &Request) -> TpmResult<Response> {
+    // Part 2 clause 9.29 gives TPMI_RH_AC the range {AC_FIRST:AC_LAST} and
+    // TPM_RC_VALUE for a handle outside it, whether or not the component it
+    // would name is there.
+    let ac = request.handle(0)?;
+    if !(hc::AC_FIRST..=hc::AC_LAST).contains(&ac) {
+        return Err(TpmRc(rc::VALUE).with_handle(1));
+    }
     let mut r = request.reader();
     let _capability = r.u32().map_err(|e| e.with_parameter(1))?;
     let _count = r.u32().map_err(|e| e.with_parameter(2))?;
@@ -439,8 +446,12 @@ pub fn ac_get_capability(_state: &TpmState, request: &Request) -> TpmResult<Resp
 
 /// TPM2_AC_Send, Part 3 clause 32.3.
 pub fn ac_send(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
+    // The same range, for the third handle this command names. There is no
+    // attached component to send to, so a handle inside it is refused too.
     let ac = request.handle(2)?;
-    let _ = ac;
+    if !(hc::AC_FIRST..=hc::AC_LAST).contains(&ac) {
+        return Err(TpmRc(rc::VALUE).with_handle(3));
+    }
     Err(TpmRc(rc::VALUE).with_handle(3))
 }
 
