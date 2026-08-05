@@ -170,10 +170,14 @@ pub fn incremental_self_test(state: &mut TpmState, request: &Request) -> TpmResu
     if !state.self_test_done {
         run_self_tests(state)?;
     }
-    // Anything asked for that no known answer test covers is still untested,
-    // and saying so is more honest than reporting an empty list.
-    let remaining: Vec<u16> = to_test
-        .items
+    // Part 3 clause 10.3.1: "The TPM will return in toDoList a list of
+    // algorithms that are yet to be tested. This list is not the list of
+    // algorithms that are scheduled to be tested but the algorithms/functions
+    // that have not been tested", and "making toTest an empty list allows the
+    // determination of the algorithms that remain untested without triggering
+    // any testing." So the answer covers everything this TPM implements, not
+    // only what the caller named.
+    let remaining: Vec<u16> = config::implemented_algorithms()
         .iter()
         .copied()
         .filter(|a| !fips::tested_algorithms().contains(a))

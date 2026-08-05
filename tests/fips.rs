@@ -120,8 +120,11 @@ fn incremental_self_test_reports_what_it_does_not_cover() {
     let h = harness("incremental");
     startup(&h);
 
-    // An algorithm a known answer test covers is reported as done, so the
-    // returned list is empty.
+    // Part 3 clause 10.3.1: "The TPM will return in toDoList a list of
+    // algorithms that are yet to be tested. This list is not the list of
+    // algorithms that are scheduled to be tested but the algorithms/functions
+    // that have not been tested." So naming algorithms the known answer tests
+    // cover does not empty the list: what no test covers is still on it.
     let mut p = Writer::new();
     p.u32(2);
     p.u16(alg::SHA256);
@@ -137,14 +140,29 @@ fn incremental_self_test_reports_what_it_does_not_cover() {
         ),
     );
     assert_eq!(r.code, rc::SUCCESS, "-> {:08x}", r.code);
-    let mut reader = Reader::new(&r.body);
-    assert_eq!(reader.u32().unwrap(), 0, "nothing should be left to test");
+    let covered = {
+        let mut reader = Reader::new(&r.body);
+        let n = reader.u32().unwrap() as usize;
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.push(reader.u16().unwrap());
+        }
+        out
+    };
+    assert!(
+        !covered.contains(&alg::SHA256) && !covered.contains(&alg::RSA),
+        "an algorithm a known answer test covers is still reported as untested"
+    );
+    assert!(
+        covered.contains(&alg::XOR),
+        "an algorithm no known answer test covers is not reported"
+    );
 
-    // An implemented algorithm that no known answer test covers is reported
-    // as still to do rather than silently claimed.
+    // "Making toTest an empty list allows the determination of the algorithms
+    // that remain untested without triggering any testing", and the answer is
+    // the same list.
     let mut p = Writer::new();
-    p.u32(1);
-    p.u16(alg::XOR);
+    p.u32(0);
     let r = send(
         &h,
         &command(
@@ -156,9 +174,19 @@ fn incremental_self_test_reports_what_it_does_not_cover() {
         ),
     );
     assert_eq!(r.code, rc::SUCCESS);
-    let mut reader = Reader::new(&r.body);
-    assert_eq!(reader.u32().unwrap(), 1);
-    assert_eq!(reader.u16().unwrap(), alg::XOR);
+    let empty_query = {
+        let mut reader = Reader::new(&r.body);
+        let n = reader.u32().unwrap() as usize;
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.push(reader.u16().unwrap());
+        }
+        out
+    };
+    assert_eq!(
+        empty_query, covered,
+        "an empty toTest gave a different list of what remains untested"
+    );
 
     // An algorithm this TPM does not implement is refused.
     let mut p = Writer::new();

@@ -953,10 +953,18 @@ pub fn rsa_encrypt(state: &mut TpmState, request: &Request) -> TpmResult<Respons
             rsa::pkcs1v15_encrypt_pad(public.size(), message.as_slice(), &mut state.rng)?
         }
         alg::NULL => {
-            if message.len() != public.size() {
+            // Part 3 clause 14.2.1: with no padding "the TPM will treat message
+            // as an unsigned integer and perform a modular exponentiation",
+            // Table 43 bounding it at the size of the modulus and the note
+            // beside it adding that "the numeric value of the message must be
+            // less than the numeric value of the public modulus (n)". A shorter
+            // encoding is the same integer, so it is taken and left-padded.
+            if message.len() > public.size() {
                 return Err(TpmRc(rc::SIZE).with_parameter(1));
             }
-            message.as_slice().to_vec()
+            let mut padded = vec![0u8; public.size() - message.len()];
+            padded.extend_from_slice(message.as_slice());
+            padded
         }
         _ => return Err(TpmRc(rc::SCHEME).with_parameter(2)),
     };
