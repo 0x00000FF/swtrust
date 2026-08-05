@@ -120,21 +120,38 @@ pub fn set_primary_policy(state: &mut TpmState, request: &Request) -> TpmResult<
 /// TPM2_ChangePPS, Part 3 clause 24.5.
 pub fn change_pps(state: &mut TpmState, _request: &Request) -> TpmResult<Response> {
     state.hierarchies.platform.regenerate(&mut state.rng)?;
-    state.hierarchies.platform.clear_authorization();
+    // Part 3 clause 24.4.1 "sets platformPolicy to the default initialization
+    // value (the Empty Buffer)" and says beside it that "Platform
+    // Authorization is not changed", so only the policy goes.
+    state.hierarchies.platform.policy = TpmtHa::null();
     state.objects.flush_hierarchy(rh::PLATFORM);
-    // Everything the platform owns goes away with its seed.
+    // "All resident transient and persistent objects in the Platform hierarchy
+    // are flushed."
     state
         .persistent
         .retain(|h, _| *h < crate::tpm::constants::hc::PLATFORM_PERSISTENT);
-    state.pcr_allocation = crate::tpm::config::DEFAULT_PCR_BANKS.to_vec();
+    // "The policy hash algorithm for PCR is reset to TPM_ALG_NULL." The
+    // allocation is not touched: Part 1 clause 17.5 keeps it until
+    // TPM2_PCR_Allocate changes it, and the same clause says this command
+    // "does not clear any NV Index values" either.
+    state.pcr_policy = TpmtHa::null();
     respond(|_| Ok(()))
 }
 
 /// TPM2_ChangeEPS, Part 3 clause 24.6.
 pub fn change_eps(state: &mut TpmState, _request: &Request) -> TpmResult<Response> {
     state.hierarchies.endorsement.regenerate(&mut state.rng)?;
+    // Part 3 clause 24.5.1 "sets the Endorsement hierarchy controls to their
+    // default initialization values: ehEnable is SET, endorsementAuth and
+    // endorsementPolicy are both set to the Empty Buffer".
     state.hierarchies.endorsement.clear_authorization();
+    state.hierarchies.endorsement.enabled = true;
+    // "It will flush any resident objects (transient or persistent) in the
+    // Endorsement hierarchy."
     state.objects.flush_hierarchy(rh::ENDORSEMENT);
+    state
+        .persistent
+        .retain(|_, o| o.hierarchy != rh::ENDORSEMENT);
     // The seed is no longer the one the manufacturer put in.
     state.permanent = state
         .permanent

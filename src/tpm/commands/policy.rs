@@ -56,6 +56,14 @@ pub fn start_auth_session(state: &mut TpmState, request: &Request) -> TpmResult<
         (Vec::new(), false)
     } else {
         let entity = super::dispatch::entity(state, bind).map_err(|e| e.with_handle(2))?;
+        // Part 1 clause 34.2.9: "if a PIN Pass or PIN Fail Index is referenced
+        // as a bind entity, the TPM must return TPM_RC_HANDLE. Otherwise, the
+        // sequence in which the TPM processes authorizations would enable a
+        // hammering attack on the Index." The session key would carry the
+        // value without the counters ever seeing the attempt.
+        if entity.pin.is_some() {
+            return Err(TpmRc(rc::HANDLE).with_handle(2));
+        }
         (entity.auth, entity.uses_lockout)
     };
     // The bound entity is identified by its Name and its authorization value

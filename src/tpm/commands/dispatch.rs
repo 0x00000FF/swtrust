@@ -315,6 +315,11 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
     }
     if (hc::PERSISTENT_FIRST..=hc::PERSISTENT_LAST).contains(&handle) {
         let object = state.persistent.get(&handle).ok_or(TpmRc(rc::HANDLE))?;
+        // Part 3 clause 24.3.1: clearing an enable "will disable use of any
+        // persistent entity associated with the disabled hierarchy".
+        if !state.hierarchies.is_enabled(object.hierarchy) {
+            return Err(TpmRc(rc::HIERARCHY));
+        }
         return Ok(Entity {
             name,
             auth: object.auth_value().to_vec(),
@@ -336,6 +341,21 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
     }
     if crate::tpm::core::nv::NvStore::is_nv_handle(handle) {
         let index = state.nv.get(handle)?;
+        // The same clause: clearing shEnable "will disable access to any NV
+        // index that has TPMA_NV_PLATFORMCREATE CLEAR", and clearing
+        // phEnableNV does the same for one that has it SET.
+        let platform_created = index
+            .public
+            .attributes
+            .has(NvAttributes::PLATFORMCREATE);
+        let reachable = if platform_created {
+            state.hierarchies.platform_nv_enabled
+        } else {
+            state.hierarchies.owner.enabled
+        };
+        if !reachable {
+            return Err(TpmRc(rc::HANDLE));
+        }
         let policy = if index.public.auth_policy.is_empty() {
             None
         } else {
@@ -1121,7 +1141,18 @@ fn check_policy(
         &nonce_encrypt,
         input.attributes,
     )?;
-    if !session::auth_hmac_accepted(&key, &expected, &input.hmac) {
+    // TPM2_PolicyAuthValue folds the entity value into this key, which Part 1
+    // clause 16.8.1 counts as a use of that value, so a PIN Index answers for
+    // it here as well.
+    let uses_auth_value = s.policy.auth_value_needed;
+    if uses_auth_value {
+        check_pin_available(state, entity).map_err(|e| e.with_session(position))?;
+    }
+    let accepted = session::auth_hmac_accepted(&key, &expected, &input.hmac);
+    if uses_auth_value {
+        record_pin_attempt(state, entity, accepted)?;
+    }
+    if !accepted {
         record_failure(state, protected)?;
         return Err(TpmRc(rc::AUTH_FAIL).with_session(position));
     }
@@ -1978,6 +2009,39 @@ mod tests {
                 .pin_count,
             0,
             "a success did not clear the count"
+        );
+    }
+
+    #[test]
+    fn a_pin_index_may_not_be_a_bind_entity() {
+        // Part 1 clause 34.2.9: "if a PIN Pass or PIN Fail Index is referenced
+        // as a bind entity, the TPM must return TPM_RC_HANDLE. Otherwise, the
+        // sequence in which the TPM processes authorizations would enable a
+        // hammering attack on the Index."
+        let mut state = TpmState::manufacture().unwrap();
+        state.on_startup_clear().unwrap();
+        state.nv.define(pin_index(nt::PIN_PASS, 0, 5)).unwrap();
+
+        let mut p = Writer::new();
+        p.u16(32);
+        p.bytes(&[0u8; 32]);
+        p.u16(0);
+        p.u8(se::HMAC);
+        p.u16(alg::NULL);
+        p.u16(alg::SHA256);
+        let buf = command(
+            st::NO_SESSIONS,
+            cc::StartAuthSession,
+            &[rh::NULL, hc::NV_INDEX_FIRST],
+            &[],
+            &p.finish().unwrap(),
+        );
+        let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
+        let code = u32::from_be_bytes([r[6], r[7], r[8], r[9]]);
+        assert_eq!(
+            code & 0x03f,
+            rc::HANDLE & 0x03f,
+            "a PIN Index was bound to a session -> {code:08x}"
         );
     }
 

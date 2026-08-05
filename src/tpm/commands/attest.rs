@@ -52,7 +52,53 @@ fn signing_object(state: &TpmState, handle: u32) -> TpmResult<Object> {
     Ok(object.clone())
 }
 
-/// Build a TPMS_ATTEST and sign it.
+/// Hide the values an attestation would otherwise let a verifier correlate.
+///
+/// Part 3 clause 18.1 computes the value as
+/// `KDFa(signHandle->nameAlg, shProof, "OBFUSCATE", signHandle->QN, 0, 128)`,
+/// takes 64 of the returned bits into the version number and 32 each into the
+/// two counters, and says of TPM_RH_NULL that "the data structure is produced
+/// but not signed; and the values in the signed data structure are obfuscated",
+/// with the context integrity hash standing in for the nameAlg.
+fn obfuscated(
+    state: &TpmState,
+    sign_handle: u32,
+    qualified_name: &[u8],
+) -> TpmResult<(crate::tpm::structures::attest::ClockInfo, u64)> {
+    let mut clock = clock_info(state);
+    let mut firmware = crate::tpm::config::FIRMWARE_VERSION_1 as u64;
+    let hierarchy = if sign_handle == rh::NULL {
+        rh::NULL
+    } else {
+        signing_object(state, sign_handle)?.hierarchy
+    };
+    if matches!(hierarchy, rh::ENDORSEMENT | rh::PLATFORM) {
+        return Ok((clock, firmware));
+    }
+    let name_alg = if sign_handle == rh::NULL {
+        crate::tpm::config::CONTEXT_INTEGRITY_HASH_ALG
+    } else {
+        signing_object(state, sign_handle)?.public.name_alg
+    };
+    let value = crate::tpm::crypto::hmac::kdfa(
+        name_alg,
+        state.hierarchy_proof(rh::OWNER)?,
+        "OBFUSCATE",
+        qualified_name,
+        &[],
+        128,
+    )?;
+    firmware = firmware.wrapping_add(u64::from_be_bytes(value[..8].try_into().unwrap()));
+    clock.reset_count = clock
+        .reset_count
+        .wrapping_add(u32::from_be_bytes(value[8..12].try_into().unwrap()));
+    clock.restart_count = clock
+        .restart_count
+        .wrapping_add(u32::from_be_bytes(value[12..16].try_into().unwrap()));
+    Ok((clock, firmware))
+}
+
+/// Build and sign an attestation structure.
 ///
 /// When `sign_handle` is TPM_RH_NULL the structure is returned unsigned, which
 /// Part 3 clause 18.1 allows so a caller can inspect the values.
@@ -102,11 +148,17 @@ fn attest_and_sign(
         (other, _) => other,
     };
 
+    // Part 3 clause 18.1: the clock information and firmware version "may be
+    // considered privacy-sensitive because they would aid in the correlation
+    // of attestations by different keys. To provide improved privacy, the
+    // resetCount, restartCount, and firmwareVersion numbers are obfuscated
+    // when the signing key is not in the Endorsement or Platform hierarchies."
+    let (clock, firmware) = obfuscated(state, sign_handle, &qualified_signer)?;
     let attest = Attest::new(
         Tpm2bName::from_slice(&qualified_signer)?,
         extra_data.clone(),
-        clock_info(state),
-        crate::tpm::config::FIRMWARE_VERSION_1 as u64,
+        clock,
+        firmware,
         attested,
     );
     let body = attest.to_bytes();
@@ -250,17 +302,22 @@ pub fn quote(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let selection = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
-    // The digest uses the nameAlg of the signing key, as clause 18.4.3 says.
-    let name_alg = if sign_handle == rh::NULL {
-        alg::SHA256
+    // Part 3 clause 18.4.1: "the TPM will hash the list of PCR selected by
+    // PCRselect using the hash algorithm in the selected signing scheme. If
+    // the selected signing scheme or the scheme hash algorithm is
+    // TPM_ALG_NULL, then the TPM shall return TPM_RC_SCHEME." The nameAlg of
+    // the key is a different algorithm whenever the two were chosen apart.
+    let hash_alg = if sign_handle == rh::NULL {
+        in_scheme
+            .hash_alg()
+            .unwrap_or(crate::tpm::config::CONTEXT_INTEGRITY_HASH_ALG)
     } else {
-        signing_object(state, sign_handle)
-            .map_err(|e| e.with_handle(1))?
-            .public
-            .name_alg
+        let object = signing_object(state, sign_handle).map_err(|e| e.with_handle(1))?;
+        let scheme = super::crypto::signing_scheme_at(&object, &in_scheme, 2)?;
+        scheme.hash_alg().ok_or(TpmRc(rc::SCHEME).with_parameter(2))?
     };
     let filtered = state.pcr.filter_selection(&selection);
-    let pcr_digest = state.pcr.selection_digest(name_alg, &filtered)?;
+    let pcr_digest = state.pcr.selection_digest(hash_alg, &filtered)?;
 
     let attested = Attested::Quote {
         pcr_select: filtered,
@@ -557,5 +614,43 @@ mod tests {
         assert_eq!(attest.magic, TPM_GENERATED_VALUE);
         assert_eq!(attest.extra_data.as_slice(), b"qualifier");
         assert!(attest.qualified_signer.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+    use crate::tpm::core::state::TpmState;
+
+    #[test]
+    fn a_key_outside_the_two_hierarchies_has_its_counters_hidden() {
+        // Part 3 clause 18.1: "the resetCount, restartCount, and
+        // firmwareVersion numbers are obfuscated when the signing key is not in
+        // the Endorsement or Platform hierarchies", and a null signing key is
+        // obfuscated too.
+        let mut state = TpmState::manufacture().unwrap();
+        state.on_startup_clear().unwrap();
+        let plain = clock_info(&state);
+
+        let (hidden, firmware) = obfuscated(&state, rh::NULL, &rh::NULL.to_be_bytes()).unwrap();
+        assert!(
+            hidden.reset_count != plain.reset_count
+                || hidden.restart_count != plain.restart_count,
+            "the counters came through unchanged"
+        );
+        assert_ne!(
+            firmware,
+            crate::tpm::config::FIRMWARE_VERSION_1 as u64,
+            "the version came through unchanged"
+        );
+
+        // A different qualified name gives a different value, which is what
+        // stops one attestation being tied to another.
+        let (other, _) = obfuscated(&state, rh::NULL, b"another name").unwrap();
+        assert_ne!(
+            (hidden.reset_count, hidden.restart_count),
+            (other.reset_count, other.restart_count),
+            "two keys were hidden the same way"
+        );
     }
 }

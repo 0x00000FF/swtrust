@@ -214,6 +214,16 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
             first.auth.clear();
         }
     }
+    // Part 3 clause 24.8.1 says of TPM2_HierarchyChangeAuth that "the response
+    // HMAC is computed using the new authValue", which the command has just
+    // written into the hierarchy.
+    if request.code == crate::tpm::constants::cc::HierarchyChangeAuth {
+        if let (Some(first), Ok(handle)) = (contexts.first_mut(), request.handle(0)) {
+            if let Ok(entity) = dispatch::entity(state, handle) {
+                first.auth = entity.auth;
+            }
+        }
+    }
 
     let mut parameters = response.parameters.clone();
     dispatch::encrypt_parameters(state, &request, &mut parameters, &auth_values)?;
