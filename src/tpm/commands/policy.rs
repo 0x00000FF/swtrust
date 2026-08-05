@@ -348,15 +348,15 @@ fn check_cp_hash(s: &Session, cp_hash_a: &[u8]) -> TpmResult<()> {
     // indicates, and the note beside it: "Policy context other than the
     // policySession->policyDigest may be updated for a trial policy but it is
     // not required." A trial session cannot authorize anything, so the
-    // restriction it would record is never read.
-    if s.is_trial() {
-        return Ok(());
-    }
-    if let Some(current) = &s.policy.cp_hash {
-        if current.as_slice() != cp_hash_a {
-            return Err(TpmRc(rc::CPHASH));
+    // restriction it would record is never read. The size is still required of
+    // it, because that comes from the hash the caller chose for this session.
+    if !s.is_trial() {
+        if let Some(current) = &s.policy.cp_hash {
+            if current.as_slice() != cp_hash_a {
+                return Err(TpmRc(rc::CPHASH));
+            }
+            return Ok(());
         }
-        return Ok(());
     }
     if cp_hash_a.len() != hash::digest_size(s.auth_hash)? {
         return Err(TpmRc(rc::SIZE).with_parameter(2));
