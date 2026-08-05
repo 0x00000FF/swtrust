@@ -202,8 +202,11 @@ impl Unmarshal for LockoutState {
             lockout_recovery: r.u32()?,
             in_lockout: r.u8()? != 0,
             next_recovery: r.u64()?,
-            // The special lockout is measured against Time, which a power
-            // cycle restarts, so a record does not carry the moment it ends.
+            // Both deadlines are in Time, which a power cycle restarts, so a
+            // record carries neither. on_startup puts them back against the
+            // Time this epoch begins with, and ends a special lockout whose
+            // interval is zero, which Part 1 clause 16.8.5 leaves to "the next
+            // TPM2_Startup()".
             lockout_until: 0,
         })
     }
@@ -964,8 +967,13 @@ impl TpmState {
         let count = bounded_count(&mut r, 512)?;
         state.audit.commands = (0..count).map(|_| r.u32()).collect::<TpmResult<_>>()?;
 
-        // A record from before this was written down knows only the counters
-        // it still holds, which the store works out for itself as they load.
+        // A record from before this was written down knows only the counters it
+        // still holds, which the store works out for itself as they load. One
+        // whose highest counter had already been undefined cannot say so, and
+        // there is nowhere else to look: a counter of that Name defined again
+        // under this build starts from the highest that is left. Part 3 clause
+        // 31.2 asks for more than that, and only a record that carries the mark
+        // can give it.
         let counter_floor = if version >= FIRST_WITH_COUNTER_FLOOR {
             r.u64()?
         } else {
@@ -1253,6 +1261,27 @@ mod tests {
         assert_eq!(s.lockout.next_recovery, 10_000, "the deadline was not rebased");
         s.advance_time(10_000);
         assert_eq!(s.lockout.failed_tries, 0);
+    }
+
+    #[test]
+    fn a_special_lockout_survives_the_record_and_ends_on_its_own() {
+        // Part 1 clause 16.8.5 keeps the state until the TPM has been powered
+        // for lockoutRecovery, and clause 25.3.1 measures that against Time,
+        // which a power cycle restarts. So the record carries the state and the
+        // startup gives it a deadline in the epoch it is about to run in.
+        let mut s = TpmState::manufacture().unwrap();
+        s.lockout.lockout_recovery = 5;
+        s.lockout.in_lockout = true;
+        s.lockout.lockout_until = 5_000;
+        let saved = s.save().unwrap();
+
+        let mut back = TpmState::load(&saved).unwrap();
+        assert!(back.lockout.in_lockout, "the record did not carry it");
+        back.on_startup_clear().unwrap();
+        assert!(back.lockout.in_lockout, "the startup ended it too soon");
+        assert_eq!(back.lockout.lockout_until, 5_000, "it was left without a deadline");
+        back.advance_time(5_000);
+        assert!(!back.lockout.in_lockout, "it never ended");
     }
 
     #[test]
