@@ -208,16 +208,57 @@ fn define(
     state: &mut TpmState,
     auth_handle: u32,
     auth: Vec<u8>,
-    mut public: NvPublic,
+    public: NvPublic,
 ) -> TpmResult<Response> {
     validate_new_public(state, &public, auth_handle)?;
-    if auth.len() > crate::tpm::structures::base::MAX_DIGEST_SIZE {
+    // Part 1 clause 34.2.1 makes the authValue of an Index no larger than the
+    // digest of its own nameAlg, not of the largest the TPM implements.
+    let name_digest = crate::tpm::crypto::hash::digest_size(public.name_alg)
+        .map_err(|e| e.with_parameter(2))?;
+    if auth.len() > name_digest {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
-    // The TPM records which authority defined the Index.
-    public
-        .attributes
-        .set(NvAttributes::PLATFORMCREATE, auth_handle == rh::PLATFORM);
+    // Part 3 clause 31.3.1: "if platformAuth/platformPolicy is used for
+    // authorization, then TPMA_NV_PLATFORMCREATE shall be SET in publicInfo.
+    // If ownerAuth/ownerPolicy is used for authorization, TPMA_NV_PLATFORMCREATE
+    // shall be CLEAR in publicInfo. If TPMA_NV_PLATFORMCREATE is not set
+    // correctly for the authorization, the TPM shall return
+    // TPM_RC_ATTRIBUTES." The caller says which it meant rather than having it
+    // written in silently.
+    let platform_create = public.attributes.has(NvAttributes::PLATFORMCREATE);
+    if platform_create != (auth_handle == rh::PLATFORM) {
+        return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+    }
+    // The same clause: "if TPMA_NV_POLICY_DELETE is SET, then the
+    // authorization shall be with Platform Authorization."
+    if public.attributes.has(NvAttributes::POLICY_DELETE) && auth_handle != rh::PLATFORM {
+        return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+    }
+    // "The TPM shall return TPM_RC_ATTRIBUTES if TPMA_NV_WRITTEN,
+    // TPMA_NV_READLOCKED, or TPMA_NV_WRITELOCKED is SET."
+    if public.attributes.has(NvAttributes::READLOCKED)
+        || public.attributes.has(NvAttributes::WRITELOCKED)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+    }
+    match public.attributes.index_type() {
+        // "If nvIndexType is TPM_NT_PIN_FAIL, then TPMA_NV_NO_DA shall be SET."
+        nt::PIN_FAIL if !public.attributes.has(NvAttributes::NO_DA) => {
+            return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+        }
+        // "If nvIndexType is TPM_NT_PIN_FAIL or TPM_NT_PIN_PASS, then at least
+        // one of TPMA_NV_PPWRITE, TPMA_NV_OWNERWRITE, or TPMA_NV_POLICYWRITE
+        // shall be SET ... TPMA_NV_AUTHWRITE shall be CLEAR."
+        nt::PIN_FAIL | nt::PIN_PASS => {
+            let has_writer = public.attributes.has(NvAttributes::PPWRITE)
+                || public.attributes.has(NvAttributes::OWNERWRITE)
+                || public.attributes.has(NvAttributes::POLICYWRITE);
+            if !has_writer || public.attributes.has(NvAttributes::AUTHWRITE) {
+                return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
+            }
+        }
+        _ => {}
+    }
     if public.attributes.index_type() == nt::COUNTER
         && state.nv.counter_count() as u32 >= config::MIN_COUNTER_INDICES
     {
@@ -246,8 +287,15 @@ pub fn nv_undefine_space(state: &mut TpmState, request: &Request) -> TpmResult<R
     if platform_created && auth_handle != rh::PLATFORM {
         return Err(TpmRc(rc::NV_AUTHORIZATION).with_handle(1));
     }
-    if !platform_created && auth_handle != rh::OWNER {
-        return Err(TpmRc(rc::NV_AUTHORIZATION).with_handle(1));
+    // The note under clause 31.4.1: "an Index with TPMA_NV_PLATFORMCREATE
+    // CLEAR may be deleted with Platform Authorization as long as shEnable is
+    // SET. If shEnable is CLEAR, indexes created using Owner Authorization are
+    // not accessible even for deletion by the platform."
+    if !platform_created {
+        let by_platform = auth_handle == rh::PLATFORM && state.hierarchies.owner.enabled;
+        if auth_handle != rh::OWNER && !by_platform {
+            return Err(TpmRc(rc::NV_AUTHORIZATION).with_handle(1));
+        }
     }
     state.nv.undefine(nv_handle)?;
     respond(|_| Ok(()))
@@ -623,5 +671,117 @@ mod tests {
         i.public.auth_policy = Tpm2bDigest::from_slice(&[0u8; 32]).unwrap();
         assert!(validate_new_public(&state, &i.public, rh::OWNER).is_err());
         assert!(validate_new_public(&state, &i.public, rh::PLATFORM).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod define_tests {
+    use super::*;
+    use crate::tpm::constants::{alg, hc};
+    use crate::tpm::core::state::TpmState;
+    use crate::tpm::structures::base::Tpm2bDigest;
+
+    fn public(index_type: u8, attributes: u32, size: u16) -> NvPublic {
+        NvPublic {
+            nv_index: hc::NV_INDEX_FIRST,
+            name_alg: alg::SHA256,
+            attributes: NvAttributes(attributes).with_index_type(index_type),
+            auth_policy: Tpm2bDigest::empty(),
+            data_size: size,
+        }
+    }
+
+    #[test]
+    fn the_defining_authority_has_to_match_platform_create() {
+        // Part 3 clause 31.3.1: "if TPMA_NV_PLATFORMCREATE is not set correctly
+        // for the authorization, the TPM shall return TPM_RC_ATTRIBUTES."
+        let mut state = TpmState::manufacture().unwrap();
+        let owner = public(nt::ORDINARY, NvAttributes::AUTHREAD | NvAttributes::AUTHWRITE, 8);
+        assert!(define(&mut state, rh::OWNER, Vec::new(), owner.clone()).is_ok());
+
+        let mut state = TpmState::manufacture().unwrap();
+        assert_eq!(
+            define(&mut state, rh::PLATFORM, Vec::new(), owner)
+                .unwrap_err()
+                .value()
+                & 0x03f,
+            rc::ATTRIBUTES & 0x03f,
+            "the platform defined an Index that did not say so"
+        );
+
+        let mut state = TpmState::manufacture().unwrap();
+        let platform = public(
+            nt::ORDINARY,
+            NvAttributes::AUTHREAD | NvAttributes::AUTHWRITE | NvAttributes::PLATFORMCREATE,
+            8,
+        );
+        assert_eq!(
+            define(&mut state, rh::OWNER, Vec::new(), platform)
+                .unwrap_err()
+                .value()
+                & 0x03f,
+            rc::ATTRIBUTES & 0x03f,
+            "the owner defined an Index marked as the platform's"
+        );
+    }
+
+    #[test]
+    fn a_pin_index_has_to_be_shaped_the_way_the_clause_says() {
+        // Clause 31.3.1: a PIN Fail Index needs TPMA_NV_NO_DA, and either kind
+        // needs a write authority other than TPMA_NV_AUTHWRITE, which "shall
+        // be CLEAR".
+        let mut state = TpmState::manufacture().unwrap();
+        let no_da_missing =
+            public(nt::PIN_FAIL, NvAttributes::AUTHREAD | NvAttributes::OWNERWRITE, 8);
+        assert_eq!(
+            define(&mut state, rh::OWNER, Vec::new(), no_da_missing)
+                .unwrap_err()
+                .value()
+                & 0x03f,
+            rc::ATTRIBUTES & 0x03f,
+            "a PIN Fail Index without NO_DA was defined"
+        );
+
+        let mut state = TpmState::manufacture().unwrap();
+        let auth_write = public(
+            nt::PIN_PASS,
+            NvAttributes::AUTHREAD | NvAttributes::AUTHWRITE | NvAttributes::OWNERWRITE,
+            8,
+        );
+        assert_eq!(
+            define(&mut state, rh::OWNER, Vec::new(), auth_write)
+                .unwrap_err()
+                .value()
+                & 0x03f,
+            rc::ATTRIBUTES & 0x03f,
+            "a PIN Index with AUTHWRITE was defined"
+        );
+
+        let mut state = TpmState::manufacture().unwrap();
+        let good = public(
+            nt::PIN_PASS,
+            NvAttributes::AUTHREAD | NvAttributes::OWNERWRITE,
+            8,
+        );
+        assert!(
+            define(&mut state, rh::OWNER, Vec::new(), good).is_ok(),
+            "the shape the clause describes was refused"
+        );
+    }
+
+    #[test]
+    fn an_authorization_value_fits_the_index_name_algorithm() {
+        // Part 1 clause 34.2.1 bounds it by the Index's own nameAlg.
+        let mut state = TpmState::manufacture().unwrap();
+        let mut p = public(nt::ORDINARY, NvAttributes::AUTHREAD | NvAttributes::AUTHWRITE, 8);
+        p.name_alg = alg::SHA256;
+        assert_eq!(
+            define(&mut state, rh::OWNER, vec![0u8; 48], p)
+                .unwrap_err()
+                .value()
+                & 0x03f,
+            rc::SIZE & 0x03f,
+            "a SHA-384 sized value was taken for a SHA-256 Index"
+        );
     }
 }

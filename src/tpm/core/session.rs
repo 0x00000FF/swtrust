@@ -701,6 +701,17 @@ impl SessionSlots {
         Ok(())
     }
 
+    /// True when a counter has reached the end and cannot hand out a number
+    /// that has not been handed out before.
+    ///
+    /// Clause 27.5 says the TPM has to be able "to ensure that the restored
+    /// context is the correct context regardless of the number of contexts
+    /// created". A counter that has stopped would give every later context the
+    /// same number, so the TPM says it can take no more instead.
+    pub fn counters_exhausted(&self) -> bool {
+        self.context_counter == u64::MAX || self.object_counter == u64::MAX
+    }
+
     /// Take the next session identifier, which clause 27.2.2 does when a
     /// session context is created or loaded.
     pub fn next_context_id(&mut self) -> u64 {
@@ -749,6 +760,9 @@ impl SessionSlots {
             return Err(TpmRc(rc::SESSION_HANDLES));
         }
         self.check_gap()?;
+        if self.counters_exhausted() {
+            return Err(TpmRc(rc::CONTEXT_GAP));
+        }
         let handle = session.handle;
         let id = self.next_context_id();
         self.version.insert(handle, id);

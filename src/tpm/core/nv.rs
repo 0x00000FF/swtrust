@@ -349,12 +349,14 @@ impl NvStore {
             if index.public.attributes.has(NvAttributes::READ_STCLEAR) {
                 index.set_read_lock(false);
             }
-            if index.public.attributes.has(NvAttributes::WRITE_STCLEAR) {
-                let permanent = index.public.attributes.has(NvAttributes::WRITEDEFINE)
-                    && index.written();
-                if !permanent {
-                    index.set_write_lock(false);
-                }
+            // Part 3 clause 9.3.2: "for each NV Index with TPMA_NV_WRITEDEFINE
+            // CLEAR or TPMA_NV_WRITTEN CLEAR, TPMA_NV_WRITELOCKED shall be
+            // CLEAR." A lock is permanent only where the Index says the write
+            // is defined and has been made, whatever attribute set the lock.
+            let permanent =
+                index.public.attributes.has(NvAttributes::WRITEDEFINE) && index.written();
+            if !permanent {
+                index.set_write_lock(false);
             }
             // An orderly Index that is not a counter loses its data, because
             // the value was only ever held in RAM.

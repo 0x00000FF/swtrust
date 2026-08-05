@@ -330,6 +330,11 @@ fn unmarshal_session(body: &[u8]) -> TpmResult<Session> {
 /// TPM2_ContextSave, Part 3 clause 28.2.
 pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
+    // A counter that has stopped would stamp every later context with the same
+    // number, which clause 27.5 does not allow the TPM to let happen.
+    if state.sessions.counters_exhausted() {
+        return Err(TpmRc(rc::CONTEXT_GAP));
+    }
 
     let (hierarchy, saved_handle, body, sequence) =
         if crate::tpm::core::session::is_session_handle(handle) {
