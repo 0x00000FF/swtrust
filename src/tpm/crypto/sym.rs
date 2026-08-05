@@ -242,8 +242,122 @@ pub fn xor_obfuscate(
     Ok(())
 }
 
+/// True when `key` is one the specification will not have.
+///
+/// Part 1 clause 8.4.10.4: "in the case of DES, there are 64 known weak or
+/// semi-weak keys. None of them are allowed. In the case of AES, at least one
+/// bit in the upper half of the key must be set."
+pub fn is_weak_key(algorithm: u16, key: &[u8]) -> bool {
+    match algorithm {
+        alg::AES | alg::SM4 | alg::CAMELLIA => {
+            let upper = &key[..key.len() / 2];
+            upper.iter().all(|b| *b == 0)
+        }
+        alg::TDES => key.chunks(8).any(is_weak_des_key),
+        _ => false,
+    }
+}
+
+/// The weak and semi-weak DES keys, which clause 8.4.10.4 refuses.
+///
+/// A key is one of them when the two halves its schedule starts from, C0 and
+/// D0, are each all zeros, all ones, or one of the two alternating patterns.
+/// Those are the halves that survive every rotation the schedule applies, so
+/// the sixteen round keys repeat instead of differing, which is what makes the
+/// key weak. Deriving them is exact where a copied list could be mistyped.
+fn is_weak_des_key(key: &[u8]) -> bool {
+    /// PC-1 of FIPS 46-3, as one based positions in the 64 bit key counting
+    /// from the most significant. The first 28 make C0 and the rest D0.
+    const PC1: [u8; 56] = [
+        57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 27, 19, 11, 3,
+        60, 52, 44, 36, 63, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22, 14, 6, 61, 53, 45,
+        37, 29, 21, 13, 5, 28, 20, 12, 4,
+    ];
+    const HALVES: [u32; 4] = [0x000_0000, 0xfff_ffff, 0x555_5555, 0xaaa_aaaa];
+    if key.len() != 8 {
+        return false;
+    }
+    let whole = u64::from_be_bytes([
+        key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+    ]);
+    let mut c0: u32 = 0;
+    let mut d0: u32 = 0;
+    for (i, position) in PC1.iter().enumerate() {
+        let bit = ((whole >> (64 - position)) & 1) as u32;
+        if i < 28 {
+            c0 = (c0 << 1) | bit;
+        } else {
+            d0 = (d0 << 1) | bit;
+        }
+    }
+    HALVES.contains(&c0) && HALVES.contains(&d0)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_weak_key_is_recognised() {
+        // Part 1 clause 8.4.10.4: of an AES key "at least one bit in the upper
+        // half of the key must be set".
+        assert!(is_weak_key(alg::AES, &[0u8; 16]));
+        let mut k = [0u8; 16];
+        k[15] = 1;
+        assert!(is_weak_key(alg::AES, &k), "only the lower half was set");
+        k[0] = 1;
+        assert!(!is_weak_key(alg::AES, &k));
+
+        // The same clause refuses the 64 weak and semi-weak DES keys. The
+        // all-zero key and the alternating pattern are two of them.
+        assert!(is_weak_key(alg::TDES, &[0x01u8; 8]));
+        assert!(is_weak_key(
+            alg::TDES,
+            &[0x1f, 0x1f, 0x1f, 0x1f, 0x0e, 0x0e, 0x0e, 0x0e]
+        ));
+        assert!(!is_weak_key(
+            alg::TDES,
+            &[0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1]
+        ));
+
+        // The four patterns for each half give sixteen keys once the parity
+        // bits are filled in, which is the published set of four weak and
+        // twelve semi-weak keys. Counting them checks the derivation against
+        // something known rather than against itself.
+        let patterns: [u64; 4] = [0x000_0000, 0xfff_ffff, 0x555_5555, 0xaaa_aaaa];
+        let mut found = 0;
+        for c in patterns {
+            for d in patterns {
+                let key = des_key_from_halves(c, d);
+                assert!(is_weak_key(alg::TDES, &key), "{key:02x?} was not refused");
+                found += 1;
+            }
+        }
+        assert_eq!(found, 16);
+    }
+
+    /// Put C0 and D0 back through PC-1 to get the key they came from, with
+    /// odd parity in the low bit of each octet.
+    fn des_key_from_halves(c0: u64, d0: u64) -> [u8; 8] {
+        const PC1: [u8; 56] = [
+            57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 27, 19,
+            11, 3, 60, 52, 44, 36, 63, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22, 14, 6,
+            61, 53, 45, 37, 29, 21, 13, 5, 28, 20, 12, 4,
+        ];
+        let joined = (c0 << 28) | d0;
+        let mut whole: u64 = 0;
+        for (i, position) in PC1.iter().enumerate() {
+            let bit = (joined >> (55 - i)) & 1;
+            whole |= bit << (64 - position);
+        }
+        let mut key = whole.to_be_bytes();
+        for b in key.iter_mut() {
+            *b &= 0xfe;
+            if (b.count_ones() % 2) == 0 {
+                *b |= 1;
+            }
+        }
+        key
+    }
+
     use super::*;
 
     fn hex(s: &str) -> Vec<u8> {

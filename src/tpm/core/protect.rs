@@ -116,9 +116,24 @@ pub fn wrap_private(
     // after decryption.
     let mut inner = Writer::new();
     inner.sized16(sensitive);
-    let plaintext = inner.finish()?;
+    wrap_private_body(parent_name_alg, parent_seed, symmetric, name, &inner.finish()?)
+}
 
-    let encrypted = symmetric_wrap(parent_name_alg, parent_seed, symmetric, name, &plaintext)?;
+/// Wrap a body that is already in the shape the outer phase encrypts.
+///
+/// Part 1 clause 20.3.2.3 says the outer wrapper encrypts "the encSensitive
+/// produced by phase 1", and clause 20.3.2.2 gives that as
+/// `innerIntegrity || sensitive` under the inner cipher. It carries its own
+/// length, so putting another size around it would describe a structure no
+/// other TPM writes.
+pub fn wrap_private_body(
+    parent_name_alg: u16,
+    parent_seed: &[u8],
+    symmetric: &SymDef,
+    name: &[u8],
+    plaintext: &[u8],
+) -> TpmResult<Vec<u8>> {
+    let encrypted = symmetric_wrap(parent_name_alg, parent_seed, symmetric, name, plaintext)?;
     let integrity = outer_integrity(parent_name_alg, parent_seed, &encrypted, name)?;
 
     let mut out = Writer::new();
@@ -155,6 +170,28 @@ pub fn unwrap_private(
     let size = r.u16().map_err(|_| TpmRc(rc::SENSITIVE))? as usize;
     let body = r.take(size).map_err(|_| TpmRc(rc::SENSITIVE))?;
     Ok(body.to_vec())
+}
+
+/// Undo [`wrap_private_body`], giving back what the outer phase encrypted
+/// without reading a length out of it.
+pub fn unwrap_private_body(
+    parent_name_alg: u16,
+    parent_seed: &[u8],
+    symmetric: &SymDef,
+    name: &[u8],
+    private: &[u8],
+) -> TpmResult<Vec<u8>> {
+    let mut r = Reader::new(private);
+    let integrity = Tpm2bDigest::unmarshal(&mut r).map_err(|_| TpmRc(rc::INTEGRITY))?;
+    let encrypted = r.take_rest();
+    if encrypted.is_empty() {
+        return Err(TpmRc(rc::INTEGRITY));
+    }
+    let expected = outer_integrity(parent_name_alg, parent_seed, encrypted, name)?;
+    if !constant_time_eq(integrity.as_slice(), &expected) {
+        return Err(TpmRc(rc::INTEGRITY));
+    }
+    symmetric_unwrap(parent_name_alg, parent_seed, symmetric, name, encrypted)
 }
 
 /// Compare two octet strings without an early exit.

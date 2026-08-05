@@ -172,13 +172,29 @@ pub fn duplicate(state: &mut TpmState, request: &Request) -> TpmResult<Response>
             .ok_or(TpmRc(rc::TYPE).with_handle(2))?;
         let (seed, secret) = seed_to_parent(state, &new_parent, b"DUPLICATE\0")
             .map_err(|e| e.with_handle(2))?;
-        let wrapped = protect::wrap_private(
-            new_parent.public.name_alg,
-            &seed,
-            &parent_symmetric,
-            &object.name,
-            &body,
-        )?;
+        // Part 1 clause 20.3.2.3: the outer phase encrypts "the encSensitive
+        // produced by phase 1". With an inner wrapper that is
+        // innerIntegrity || TPM2B_SENSITIVE under the inner cipher, which
+        // carries its own length; without one clause 20.3.2.2 makes
+        // encSensitive the TPM2B_SENSITIVE itself, and that is the size the
+        // ordinary wrap puts on.
+        let wrapped = if symmetric_alg.is_null() {
+            protect::wrap_private(
+                new_parent.public.name_alg,
+                &seed,
+                &parent_symmetric,
+                &object.name,
+                &body,
+            )?
+        } else {
+            protect::wrap_private_body(
+                new_parent.public.name_alg,
+                &seed,
+                &parent_symmetric,
+                &object.name,
+                &body,
+            )?
+        };
         (wrapped, secret)
     };
 
@@ -235,24 +251,59 @@ pub fn import(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let object_name = names::object_name(&public)?;
 
     // Undo the outer wrap the source TPM applied.
+    // Part 3 clause 13.3.1: "if encryptedDuplication is SET in objectPublic,
+    // then inSymSeed and encryptionKey shall not be Empty buffers
+    // (TPM_RC_ATTRIBUTES)." Without this an object that asks to travel
+    // encrypted could be imported in the clear.
+    if public
+        .object_attributes
+        .has(ObjectAttributes::ENCRYPTED_DUPLICATION)
+    {
+        if in_symmetric_seed.is_empty() {
+            return Err(TpmRc(rc::ATTRIBUTES).with_parameter(4));
+        }
+        if encryption_key.is_empty() {
+            return Err(TpmRc(rc::ATTRIBUTES).with_parameter(1));
+        }
+    }
+
     let mut body = if in_symmetric_seed.is_empty() {
         duplicate_blob.as_slice().to_vec()
     } else {
         let seed = seed_from_parent(&parent, in_symmetric_seed.as_slice(), b"DUPLICATE\0")
             .map_err(|e| e.with_parameter(4))?;
-        protect::unwrap_private(
-            parent.public.name_alg,
-            &seed,
-            &parent_symmetric,
-            &object_name,
-            duplicate_blob.as_slice(),
-        )?
+        if symmetric_alg.is_null() {
+            protect::unwrap_private(
+                parent.public.name_alg,
+                &seed,
+                &parent_symmetric,
+                &object_name,
+                duplicate_blob.as_slice(),
+            )?
+        } else {
+            protect::unwrap_private_body(
+                parent.public.name_alg,
+                &seed,
+                &parent_symmetric,
+                &object_name,
+                duplicate_blob.as_slice(),
+            )?
+        }
     };
 
     // Then the inner wrap, if there was one.
     if !symmetric_alg.is_null() {
         if encryption_key.len() != symmetric_alg.key_bits as usize / 8 {
             return Err(TpmRc(rc::SIZE).with_parameter(1));
+        }
+        // Clause 13.3.1: "if a weak symmetric key is being imported, the TPM
+        // shall return TPM_RC_KEY." Part 1 clause 8.4.10.4 says which those
+        // are: of an AES key "at least one bit in the upper half of the key
+        // must be set", and none of the 64 known weak or semi-weak DES keys is
+        // allowed.
+        if crate::tpm::crypto::sym::is_weak_key(symmetric_alg.algorithm, encryption_key.as_slice())
+        {
+            return Err(TpmRc(rc::KEY).with_parameter(1));
         }
         body = inner_unwrap(
             public.name_alg,
@@ -309,7 +360,9 @@ pub fn rewrap(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
             .ok_or(TpmRc(rc::TYPE).with_handle(1))?;
         let seed = seed_from_parent(&parent, in_secret.as_slice(), b"DUPLICATE\0")
             .map_err(|e| e.with_parameter(3))?;
-        protect::unwrap_private(
+        // TPM2_Rewrap changes the outer wrapper and nothing else, so it takes
+        // the blob as it stands rather than reading a length out of it.
+        protect::unwrap_private_body(
             parent.public.name_alg,
             &seed,
             &parent_symmetric,
@@ -333,7 +386,7 @@ pub fn rewrap(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
             .ok_or(TpmRc(rc::TYPE).with_handle(2))?;
         let (seed, secret) =
             seed_to_parent(state, &parent, b"DUPLICATE\0").map_err(|e| e.with_handle(2))?;
-        let wrapped = protect::wrap_private(
+        let wrapped = protect::wrap_private_body(
             parent.public.name_alg,
             &seed,
             &parent_symmetric,
@@ -454,5 +507,42 @@ mod tests {
     fn the_duplicate_label_is_terminated() {
         assert_eq!(duplicate_label(), b"DUPLICATE\0");
         assert_eq!(*duplicate_label().last().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod wrapper_tests {
+    use crate::tpm::constants::alg;
+    use crate::tpm::core::protect;
+    use crate::tpm::structures::schemes::SymDef;
+
+    #[test]
+    fn an_inner_wrapped_body_keeps_its_own_length_through_the_outer_phase() {
+        // Part 1 clause 20.3.2.3: the outer phase encrypts "the encSensitive
+        // produced by phase 1". With an inner wrapper that is already
+        // innerIntegrity || TPM2B_SENSITIVE under the inner cipher and carries
+        // its own length, so another size around it would describe a structure
+        // no other TPM writes.
+        let seed = vec![0x5au8; 32];
+        let symmetric = SymDef::new(alg::AES, 128, alg::CFB);
+        let name = b"a name".to_vec();
+        let body = vec![0xa5u8; 70];
+
+        let wrapped =
+            protect::wrap_private_body(alg::SHA256, &seed, &symmetric, &name, &body).unwrap();
+        let back =
+            protect::unwrap_private_body(alg::SHA256, &seed, &symmetric, &name, &wrapped).unwrap();
+        assert_eq!(back, body, "the body did not come back as it went in");
+
+        // The ordinary form does add a length, which is the TPM2B_SENSITIVE's
+        // own, so the two are not interchangeable and the blobs differ.
+        let ordinary =
+            protect::wrap_private(alg::SHA256, &seed, &symmetric, &name, &body).unwrap();
+        assert_ne!(
+            ordinary.len(),
+            wrapped.len(),
+            "the two wrappings produced the same shape"
+        );
+        assert_eq!(ordinary.len(), wrapped.len() + 2);
     }
 }
