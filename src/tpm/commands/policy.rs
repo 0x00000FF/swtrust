@@ -600,6 +600,9 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
                 == crate::tpm::structures::attributes::nt::PIN_PASS
         });
     let hierarchy = ticket_hierarchy(state, auth_handle);
+    // Part 3 clause 23.4.2: "if policyTicket is a NULL Ticket, then timeout is
+    // the Empty Buffer", so a PIN Pass Index answers with neither.
+    let timeout = if pin_pass { Vec::new() } else { timeout };
     let ticket = if pin_pass {
         Ticket::null(st::AUTH_SECRET)
     } else {

@@ -359,9 +359,21 @@ impl PcrBanks {
     ///
     /// This is what TPM2_Startup(CLEAR) does.
     pub fn reset_all(&mut self) {
+        self.reset_all_but(None);
+    }
+
+    /// Reset every register but the one an H-CRTM sequence has already set.
+    ///
+    /// Part 1 clause 31.3: "if PCR[0] is initialized by an H-CRTM event before
+    /// TPM2_Startup(), then TPM2_Startup(TPM_SU_CLEAR) will not change the
+    /// value of PCR[0]."
+    pub fn reset_all_but(&mut self, keep: Option<u16>) {
         for (alg, bank) in self.banks.iter_mut() {
             let size = digest_size(*alg).unwrap_or(0);
             for (index, reg) in bank.iter_mut().enumerate() {
+                if keep == Some(index as u16) {
+                    continue;
+                }
                 let fill = if attributes(index as u16).starts_at_ones {
                     0xff
                 } else {
@@ -394,6 +406,11 @@ impl PcrBanks {
 
     /// Reset one PCR in every bank, checking the locality.
     pub fn reset(&mut self, index: u16, locality: u8) -> TpmResult<()> {
+        // Part 1 clause 14.8 allocates per register, so one that no bank has
+        // is not there to reset and its counter does not move.
+        if !self.algorithms().iter().any(|a| self.has_pcr(*a, index)) {
+            return Ok(());
+        }
         if !is_implemented(index) {
             return Err(TpmRc(rc::VALUE));
         }

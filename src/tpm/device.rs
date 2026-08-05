@@ -287,6 +287,11 @@ impl Device for Tpm {
         {
             let mut state = self.locked();
             state.started = false;
+            // _TPM_Init is where a stored PCR allocation takes effect, before
+            // an H-CRTM sequence could measure into a bank.
+            if let Err(e) = state.on_init() {
+                self.logger.line(&format!("cannot allocate the PCR: {}", e.0));
+            }
             state.objects.clear();
             // Only what was in TPM memory goes away with the power. Part 1
             // clause 27.5 keeps a saved session context across a TPM Restart
@@ -431,6 +436,7 @@ impl Device for Tpm {
                     continue;
                 }
                 let _ = state.pcr.extend(config::HCRTM_PCR, 4, &[(a, digest)]);
+                state.hcrtm_before_startup = true;
             }
         }
     }

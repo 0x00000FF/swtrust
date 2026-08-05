@@ -221,6 +221,17 @@ pub fn check_handle_available(state: &TpmState, handle: u32) -> TpmResult<()> {
         }
         return Ok(());
     }
+    // Part 2 Table 45 says of each enable that objects in the hierarchy it
+    // names "may not be used", which is as true of one that is loaded as of
+    // one that is persistent.
+    if crate::tpm::core::object::ObjectSlots::is_transient(handle) {
+        if let Ok(crate::tpm::core::object::Slot::Object(object)) = state.objects.get(handle) {
+            if !state.hierarchies.is_enabled(object.hierarchy) {
+                return Err(TpmRc(rc::HIERARCHY));
+            }
+        }
+        return Ok(());
+    }
     if crate::tpm::core::nv::NvStore::is_nv_handle(handle) {
         if let Ok(index) = state.nv.get(handle) {
             let platform_created = index.public.attributes.has(

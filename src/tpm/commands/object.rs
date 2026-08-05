@@ -1034,6 +1034,11 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     {
         return Err(TpmRc(rc::HIERARCHY).with_parameter(3));
     }
+    // Part 2 Table 45: an object of a hierarchy whose enable is CLEAR "may not
+    // be used", so one is not loaded into it either.
+    if !state.hierarchies.is_enabled(hierarchy) {
+        return Err(TpmRc(rc::HIERARCHY).with_parameter(3));
+    }
 
     let parent_qn = names::handle_name(hierarchy);
     let object = Object::new(public, sensitive, hierarchy, &parent_qn, false)?;

@@ -1014,8 +1014,10 @@ pub fn ecdh_zgen(state: &TpmState, request: &Request) -> TpmResult<Response> {
     r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
+    // Part 3 clause 14.5.1 asks for "a loaded ECC key" with TPM_RC_KEY, and
+    // keeps TPM_RC_ATTRIBUTES for what the key may do.
     if object.public.object_type != alg::ECC {
-        return Err(TpmRc(rc::TYPE).with_handle(1));
+        return Err(TpmRc(rc::KEY).with_handle(1));
     }
     if !object
         .public
@@ -1024,7 +1026,7 @@ pub fn ecdh_zgen(state: &TpmState, request: &Request) -> TpmResult<Response> {
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }
-    // Part 3 clause 14.5.1: the key "shall be restricted CLEAR
+    // The same clause: the key "shall be restricted CLEAR
     // (TPM_RC_ATTRIBUTES)" and its scheme "shall be TPM_ALG_ECDH or
     // TPM_ALG_NULL (TPM_RC_SCHEME)". A restricted key would otherwise answer
     // with a shared secret the TPM is supposed to keep to itself.

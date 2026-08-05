@@ -436,6 +436,11 @@ pub struct TpmState {
     pub act: crate::tpm::core::act::Act,
     /// Data collected between _TPM_Hash_Start and _TPM_Hash_End.
     pub hcrtm_buffer: Option<Vec<u8>>,
+    /// Set when an H-CRTM sequence measured into PCR 0 before TPM2_Startup.
+    ///
+    /// Part 1 clause 31.3 leaves that register alone at the startup which
+    /// follows, and sets it to the locality of the command otherwise.
+    pub hcrtm_before_startup: bool,
     /// Set by the running command to keep itself out of the command audit.
     ///
     /// Part 3 clause 21.1 audits TPM2_SetCommandCodeAuditStatus except when it
@@ -502,6 +507,7 @@ impl TpmState {
             test_failure: None,
             rng,
             hcrtm_buffer: None,
+            hcrtm_before_startup: false,
             command_audit_suppressed: false,
         })
     }
@@ -524,7 +530,15 @@ impl TpmState {
         let ever_started =
             self.ever_started || self.clock.reset_count > 0 || self.clock.restart_count > 0;
         self.hierarchies.on_reset(&mut self.rng, !restart)?;
-        self.pcr.allocate(&self.pcr_allocation.clone())?;
+        // Part 1 clause 31.3 keeps PCR 0 when an H-CRTM sequence set it before
+        // this startup, and puts every other register back to its reset value.
+        let keep = self.hcrtm_before_startup.then_some(config::HCRTM_PCR);
+        self.pcr.reset_all_but(keep);
+        self.hcrtm_before_startup = false;
+        // The allocation is put in place at _TPM_Init, which Part 3 clause
+        // 22.5.1 names as the moment a stored request takes effect, and which
+        // comes before an H-CRTM sequence may measure into PCR 0. Reallocating
+        // here would throw that measurement away.
         if !restart {
             self.pcr.reset_update_counter();
         }
@@ -622,6 +636,20 @@ impl TpmState {
             return true;
         }
         false
+    }
+
+    /// Put the stored PCR allocation in place, which _TPM_Init does.
+    ///
+    /// Part 3 clause 22.5.1: TPM2_PCR_Allocate stores the request "for use
+    /// during the next _TPM_Init operation. The PCR allocation in place when
+    /// this command is executed will be retained until the next _TPM_Init."
+    /// Clause 22.9.1 lets an H-CRTM sequence measure into PCR 0 before
+    /// TPM2_Startup arrives, so the banks have to be the new ones by then.
+    pub fn on_init(&mut self) -> TpmResult<()> {
+        self.pcr.allocate(&self.pcr_allocation.clone())?;
+        self.hcrtm_before_startup = false;
+        self.pcr_allocation_pending = false;
+        Ok(())
     }
 
     /// Apply TPM2_Startup(TPM_SU_STATE), which is a TPM Resume.
@@ -2113,6 +2141,52 @@ mod tests {
             back.sessions.context_counter(),
             counter,
             "the session counter moved, which would hand a number out twice"
+        );
+    }
+
+    #[test]
+    fn a_pcr_allocation_takes_effect_at_init_and_not_at_startup() {
+        // Part 3 clause 22.5.1 stores the request "for use during the next
+        // _TPM_Init operation", and clause 22.9.1 lets an H-CRTM sequence
+        // measure into PCR 0 before TPM2_Startup arrives. Reallocating at the
+        // startup instead would throw that measurement away.
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear().unwrap();
+        s.pcr_allocation = vec![(alg::SHA256, vec![true; 24])];
+
+        // Nothing has happened yet: the banks are the ones in place.
+        assert!(s.pcr.has_bank(alg::SHA384), "the change came too early");
+
+        s.on_init().unwrap();
+        assert!(!s.pcr.has_bank(alg::SHA384), "the change did not come at init");
+
+        // Part 1 clause 31.3: a measurement an H-CRTM sequence put in PCR 0
+        // before the startup survives it, and everything else is reset.
+        s.pcr.extend_one(alg::SHA256, 0, &[0xab; 32]).unwrap();
+        s.pcr.extend_one(alg::SHA256, 8, &[0xcd; 32]).unwrap();
+        let measured = s.pcr.read(alg::SHA256, 0).unwrap().to_vec();
+        let other = s.pcr.read(alg::SHA256, 8).unwrap().to_vec();
+        s.hcrtm_before_startup = true;
+        s.on_startup_clear().unwrap();
+        assert_eq!(
+            s.pcr.read(alg::SHA256, 0).unwrap(),
+            &measured[..],
+            "the startup discarded what the H-CRTM sequence measured"
+        );
+        assert_ne!(
+            s.pcr.read(alg::SHA256, 8).unwrap(),
+            &other[..],
+            "the startup left a register that is not PCR 0"
+        );
+
+        // Without an H-CRTM sequence the startup resets PCR 0 as well.
+        s.pcr.extend_one(alg::SHA256, 0, &[0xab; 32]).unwrap();
+        let measured = s.pcr.read(alg::SHA256, 0).unwrap().to_vec();
+        s.on_startup_clear().unwrap();
+        assert_ne!(
+            s.pcr.read(alg::SHA256, 0).unwrap(),
+            &measured[..],
+            "PCR 0 was kept without an H-CRTM sequence"
         );
     }
 
