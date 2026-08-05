@@ -485,6 +485,10 @@ struct DerivationParent {
     sensitive: Vec<u8>,
     hierarchy: u32,
     qualified_name: Vec<u8>,
+    /// A Derivation Parent is still the object's parent, so Part 2 clauses
+    /// 8.3.3.8 and 8.3.3.9 let a derived object carry what it carries.
+    firmware_limited: bool,
+    svn_limited: bool,
 }
 
 /// Resolve a handle to a Derivation Parent, or nothing if it is not one.
@@ -536,6 +540,14 @@ fn derivation_parent_of(object: &Object) -> TpmResult<DerivationParent> {
         sensitive,
         hierarchy: object.hierarchy,
         qualified_name: object.qualified_name.clone(),
+        firmware_limited: object
+            .public
+            .object_attributes
+            .has(ObjectAttributes::FIRMWARE_LIMITED),
+        svn_limited: object
+            .public
+            .object_attributes
+            .has(ObjectAttributes::SVN_LIMITED),
     })
 }
 
@@ -553,9 +565,7 @@ fn derive_object(
     let template = TpmtPublic::unmarshal_with(&mut r, true).map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
     object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
-    // A Derivation Parent is an ordinary object, so a derived object may claim
-    // neither of the two limited attributes.
-    object::validate_limited_attributes(&template, false, false)
+    object::validate_limited_attributes(&template, parent.firmware_limited, parent.svn_limited)
         .map_err(|e| e.with_parameter(2))?;
 
     // Clause 12.9.1 names the one input check that is specific to derivation:
@@ -1105,6 +1115,15 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
 pub fn read_public(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let object = if crate::tpm::core::object::ObjectSlots::is_transient(handle) {
+        // Part 3 clause 12.4.1: "If objectHandle references a sequence object,
+        // the TPM shall return TPM_RC_SEQUENCE", which is not the answer a
+        // handle that names nothing at all gets.
+        if matches!(
+            state.objects.get(handle),
+            Ok(crate::tpm::core::object::Slot::Sequence(_))
+        ) {
+            return Err(TpmRc(rc::SEQUENCE).with_handle(1));
+        }
         state.objects.object(handle).map_err(|e| e.with_handle(1))?
     } else {
         state

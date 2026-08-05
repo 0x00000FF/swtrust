@@ -6230,3 +6230,64 @@ fn a_limited_attribute_needs_a_hierarchy_that_has_it() {
         "TPM2_CreateLoaded let an owner object claim firmwareLimited"
     );
 }
+
+
+/// Part 3 clause 24.3.1 has TPM2_HierarchyControl flush "any transient objects
+/// in the hierarchy", and Part 1 clause 41.6 makes a firmware-limited hierarchy
+/// a derivation of its base, so an object under it belongs to the base too.
+#[test]
+fn disabling_a_hierarchy_flushes_the_objects_of_the_ones_derived_from_it() {
+    let h = Harness::started("fwflush");
+
+    let primary = |hierarchy: u32| -> u32 {
+        let template = storage_template();
+        let mut p = Writer::new();
+        p.u16(4);
+        p.u16(0);
+        p.u16(0);
+        p.u16(template.len() as u16);
+        p.bytes(&template);
+        p.u16(0);
+        p.u32(0);
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::CreatePrimary,
+            &[hierarchy],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+        Reader::new(&r.body).u32().unwrap()
+    };
+
+    let owner_key = primary(rh::OWNER);
+    let fw_key = primary(rh::FW_OWNER);
+    let svn_key = primary(hc::SVN_OWNER_FIRST);
+    let loaded = |handle: u32| -> bool {
+        h.tpm.with_state(|s| s.objects.object(handle).is_ok())
+    };
+    assert!(loaded(owner_key) && loaded(fw_key) && loaded(svn_key));
+
+    // Turn the storage hierarchy off.
+    let mut p = Writer::new();
+    p.u32(rh::OWNER);
+    p.u8(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyControl,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "HierarchyControl -> {:08x}", r.code);
+
+    assert!(!loaded(owner_key), "the owner object survived the disable");
+    assert!(
+        !loaded(fw_key),
+        "a firmware-limited object survived its base hierarchy being disabled"
+    );
+    assert!(
+        !loaded(svn_key),
+        "an SVN-limited object survived its base hierarchy being disabled"
+    );
+}

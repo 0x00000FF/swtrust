@@ -348,8 +348,16 @@ impl ObjectSlots {
     /// TPM2_Clear and TPM2_HierarchyControl both need this so that objects
     /// under a hierarchy that has gone away cannot still be used.
     pub fn flush_hierarchy(&mut self, hierarchy: u32) {
+        // Part 1 clause 41.6 derives every firmware-limited and SVN-limited
+        // hierarchy from a base one, so an object under one of those belongs to
+        // the base as much as an object under the base itself. Disabling the
+        // base, or changing its seed, reaches both.
+        let belongs = |h: u32| {
+            h == hierarchy
+                || crate::tpm::core::hierarchy::Hierarchies::base_of(h) == Some(hierarchy)
+        };
         self.slots.retain(|_, slot| match slot {
-            Slot::Object(o) => o.hierarchy != hierarchy,
+            Slot::Object(o) => !belongs(o.hierarchy),
             Slot::Sequence(_) => true,
         });
     }
