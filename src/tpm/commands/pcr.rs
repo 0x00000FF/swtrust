@@ -130,28 +130,39 @@ pub fn pcr_allocate(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let requested = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
 
-    let mut banks = Vec::new();
+    // Part 3 clause 22.5.1: "this command will only change the allocations of
+    // banks that are listed in pcrAllocation", and "if a bank is listed more
+    // than once, then the last selection in the pcrAllocation list is the one
+    // that the TPM will attempt to allocate". A selection with nothing in it
+    // takes the bank away, which is how the example in that clause moves every
+    // register from one bank to another.
+    let mut allocation = state.pcr_allocation.clone();
     for sel in &requested.items {
-        if sel.select.is_empty_selection() {
-            continue;
-        }
         if !config::implemented_pcr_banks().contains(&sel.hash_alg) {
             return Err(TpmRc(rc::HASH).with_parameter(1));
         }
-        if !banks.contains(&sel.hash_alg) {
-            banks.push(sel.hash_alg);
+        let mut bits = vec![false; config::IMPLEMENTATION_PCR as usize];
+        for index in sel.select.selected() {
+            if index >= config::IMPLEMENTATION_PCR as usize {
+                return Err(TpmRc(rc::VALUE).with_parameter(1));
+            }
+            bits[index] = true;
+        }
+        allocation.retain(|(a, _)| *a != sel.hash_alg);
+        if bits.iter().any(|b| *b) {
+            allocation.push((sel.hash_alg, bits));
         }
     }
-    if banks.is_empty() {
+    if allocation.is_empty() {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
-    if banks.len() > config::HASH_COUNT {
+    if allocation.len() > config::HASH_COUNT {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
 
     // The allocation takes effect at the next TPM Reset, so only the recorded
     // choice changes now.
-    state.pcr_allocation = banks;
+    state.pcr_allocation = allocation;
     let max_pcr = config::IMPLEMENTATION_PCR as u32;
     let size_needed = state.pcr_allocation.len() as u32 * max_pcr;
     let size_available = (config::NV_MEMORY_SIZE - state.nv.used()) as u32;

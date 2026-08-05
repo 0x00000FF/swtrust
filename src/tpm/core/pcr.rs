@@ -135,33 +135,79 @@ pub fn no_increment(index: u16) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PcrBanks {
     /// Registers keyed by hash algorithm, each holding IMPLEMENTATION_PCR
-    /// digests of that algorithm's size.
+    /// digests of that algorithm's size. A register that the bank does not
+    /// have allocated is still stored, and `allocated` says which those are.
     banks: BTreeMap<u16, Vec<Vec<u8>>>,
+    /// Which registers of each bank are allocated.
+    ///
+    /// Part 1 clause 14.8 allocates per register rather than per bank: "the
+    /// allocation structure has a PCR selection for each implemented hash
+    /// algorithm. To allocate a PCR in a bank, the corresponding bit would be
+    /// SET in the selection for that bank."
+    allocated: BTreeMap<u16, Vec<bool>>,
     /// Advanced whenever a PCR that increments is extended or reset.
     update_counter: u32,
 }
 
 impl PcrBanks {
     /// Allocate the given banks and set every register to its reset value.
-    pub fn new(algorithms: &[u16]) -> TpmResult<PcrBanks> {
+    pub fn new(allocation: &[(u16, Vec<bool>)]) -> TpmResult<PcrBanks> {
         let mut banks = PcrBanks::default();
-        banks.allocate(algorithms)?;
+        banks.allocate(allocation)?;
         Ok(banks)
+    }
+
+    /// Every register of every named bank, which is what a TPM whose platform
+    /// asks for nothing finer is manufactured with.
+    pub fn whole_banks(algorithms: &[u16]) -> Vec<(u16, Vec<bool>)> {
+        algorithms
+            .iter()
+            .map(|a| (*a, vec![true; config::IMPLEMENTATION_PCR as usize]))
+            .collect()
     }
 
     /// Replace the allocation, discarding the previous registers.
     ///
     /// Part 3 TPM2_PCR_Allocate takes effect on the next TPM Reset, so the
     /// caller is responsible for deferring this until then.
-    pub fn allocate(&mut self, algorithms: &[u16]) -> TpmResult<()> {
+    pub fn allocate(&mut self, allocation: &[(u16, Vec<bool>)]) -> TpmResult<()> {
         let mut banks = BTreeMap::new();
-        for a in algorithms {
+        let mut allocated = BTreeMap::new();
+        for (a, bits) in allocation {
+            if !bits.iter().any(|b| *b) {
+                // A bank with nothing selected is not allocated at all, which
+                // is how Part 3 clause 22.5.1 has a caller take one away.
+                continue;
+            }
             let size = digest_size(*a).ok_or(TpmRc(rc::HASH))?;
             banks.insert(*a, vec![vec![0u8; size]; config::IMPLEMENTATION_PCR as usize]);
+            let mut flags = vec![false; config::IMPLEMENTATION_PCR as usize];
+            for (i, b) in bits.iter().take(flags.len()).enumerate() {
+                flags[i] = *b;
+            }
+            allocated.insert(*a, flags);
         }
         self.banks = banks;
+        self.allocated = allocated;
         self.reset_all();
         Ok(())
+    }
+
+    /// True when `index` of `hash_alg` is one of the allocated registers.
+    pub fn has_pcr(&self, hash_alg: u16, index: u16) -> bool {
+        self.allocated
+            .get(&hash_alg)
+            .and_then(|bits| bits.get(index as usize))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The allocation, as the banks and the registers each has.
+    pub fn allocation(&self) -> Vec<(u16, Vec<bool>)> {
+        self.allocated
+            .iter()
+            .map(|(a, bits)| (*a, bits.clone()))
+            .collect()
     }
 
     /// The allocated hash algorithms, in increasing order.
@@ -485,7 +531,9 @@ impl PcrBanks {
             };
             if self.banks.contains_key(&sel.hash_alg) {
                 for index in sel.select.selected() {
-                    if index < config::IMPLEMENTATION_PCR as usize {
+                    if index < config::IMPLEMENTATION_PCR as usize
+                        && self.has_pcr(sel.hash_alg, index as u16)
+                    {
                         filtered.select(index);
                     }
                 }
@@ -518,7 +566,7 @@ mod tests {
     use crate::tpm::constants::alg;
 
     fn banks() -> PcrBanks {
-        PcrBanks::new(config::DEFAULT_PCR_BANKS).unwrap()
+        PcrBanks::new(&PcrBanks::whole_banks(config::DEFAULT_PCR_BANKS)).unwrap()
     }
 
     #[test]
@@ -823,12 +871,13 @@ mod tests {
     fn reallocation_resets_every_register() {
         let mut b = banks();
         b.extend(0, 0, &[(alg::SHA256, vec![1u8; 32])]).unwrap();
-        b.allocate(&[alg::SHA256, alg::SHA512]).unwrap();
+        b.allocate(&PcrBanks::whole_banks(&[alg::SHA256, alg::SHA512]))
+            .unwrap();
         assert_eq!(b.algorithms(), vec![alg::SHA256, alg::SHA512]);
         assert!(b.read(alg::SHA256, 0).unwrap().iter().all(|v| *v == 0));
         assert!(!b.has_bank(alg::SHA384));
         assert_eq!(
-            b.allocate(&[alg::RSA]).unwrap_err(),
+            b.allocate(&PcrBanks::whole_banks(&[alg::RSA])).unwrap_err(),
             TpmRc(rc::HASH)
         );
     }

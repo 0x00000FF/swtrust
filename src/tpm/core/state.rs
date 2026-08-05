@@ -27,6 +27,9 @@ use super::session::SessionSlots;
 /// it is still read rather than being thrown away: a TPM whose state a caller
 /// depends on should not lose it because this build learned a new field.
 ///
+/// Version 9 wrote which registers of each bank are allocated, which Part 1
+/// clause 14.8 chooses per register rather than per bank.
+///
 /// Version 8 wrote TPMA_STARTUP_CLEAR, which carries the Read-Only mode Part 1
 /// clause 42.2 keeps across a TPM Resume.
 ///
@@ -49,7 +52,10 @@ use super::session::SessionSlots;
 /// It was never released, so version 1 means the layout that came before the
 /// byte and nothing else. A file of the other shape can only have been written
 /// by a developer running that build, and is not one this reads.
-const STATE_VERSION: u32 = 8;
+const STATE_VERSION: u32 = 9;
+/// Version 8 named whole PCR banks where Part 1 clause 14.8 allocates per
+/// register.
+const STATE_VERSION_WITHOUT_PCR_BITS: u32 = 8;
 /// Version 7 did not record TPMA_STARTUP_CLEAR, so Read-Only mode was lost
 /// whenever the state went through a file.
 const STATE_VERSION_WITHOUT_STARTUP_CLEAR: u32 = 7;
@@ -71,6 +77,7 @@ const FIRST_WITH_RESET_VALUE: u32 = 5;
 const FIRST_WITH_OBJECT_COUNTER: u32 = 6;
 const FIRST_WITH_COUNTER_FLOOR: u32 = 7;
 const FIRST_WITH_STARTUP_CLEAR: u32 = 8;
+const FIRST_WITH_PCR_BITS: u32 = 9;
 /// Version 3 did not record which session contexts had been saved.
 const STATE_VERSION_WITHOUT_SESSIONS: u32 = 3;
 /// Version 2 recorded the profile but not the clearCount of Part 1 Equation 52.
@@ -358,7 +365,11 @@ pub struct TpmState {
     pub permanent: PermanentAttributes,
     pub clock: ClockState,
     /// PCR banks that will be allocated at the next TPM Reset.
-    pub pcr_allocation: Vec<u16>,
+    /// The allocation the next _TPM_Init will put in place, as the registers
+    /// each bank has. Part 1 clause 14.8 allocates per register, and Part 3
+    /// clause 22.5.1 keeps the change "for use during the next _TPM_Init
+    /// operation".
+    pub pcr_allocation: Vec<(u16, Vec<bool>)>,
     pub nv: NvStore,
     pub persistent: BTreeMap<u32, Object>,
     /// Commands that need physical presence.
@@ -453,7 +464,7 @@ impl TpmState {
                 safe: true,
                 ..ClockState::default()
             },
-            pcr_allocation: config::DEFAULT_PCR_BANKS.to_vec(),
+            pcr_allocation: PcrBanks::whole_banks(config::DEFAULT_PCR_BANKS),
             nv: NvStore::new(),
             persistent: BTreeMap::new(),
             pp_commands: Vec::new(),
@@ -467,7 +478,7 @@ impl TpmState {
             shutdown_type: su::NONE,
             started: false,
             startup_clear: StartupClearAttributes(0),
-            pcr: PcrBanks::new(config::DEFAULT_PCR_BANKS)?,
+            pcr: PcrBanks::new(&PcrBanks::whole_banks(config::DEFAULT_PCR_BANKS))?,
             objects: ObjectSlots::new(),
             sessions: SessionSlots::new(),
             locality: 0,
@@ -754,8 +765,19 @@ impl TpmState {
         w.u16(self.shutdown_type);
 
         w.u32(self.pcr_allocation.len() as u32);
-        for a in &self.pcr_allocation {
+        for (a, bits) in &self.pcr_allocation {
             w.u16(*a);
+            // The registers of the bank, as the bit array a TPMS_PCR_SELECTION
+            // carries.
+            let octets = (config::IMPLEMENTATION_PCR as usize).div_ceil(8);
+            let mut raw = vec![0u8; octets];
+            for (i, set) in bits.iter().enumerate() {
+                if *set {
+                    raw[i / 8] |= 1 << (i % 8);
+                }
+            }
+            w.u8(octets as u8);
+            w.bytes(&raw);
         }
         // A TPM Resume restores the Resume PCR, so their values have to come
         // back with the rest of the state.
@@ -863,6 +885,7 @@ impl TpmState {
         if !matches!(
             version,
             STATE_VERSION
+                | STATE_VERSION_WITHOUT_PCR_BITS
                 | STATE_VERSION_WITHOUT_STARTUP_CLEAR
                 | STATE_VERSION_WITHOUT_COUNTER_FLOOR
                 | STATE_VERSION_WITHOUT_OBJECT_COUNTER
@@ -947,21 +970,34 @@ impl TpmState {
         state.shutdown_type = r.u16()?;
 
         let count = bounded_count(&mut r, config::HASH_COUNT)?;
-        let saved_allocation: Vec<u16> = (0..count).map(|_| r.u16()).collect::<TpmResult<_>>()?;
+        let mut saved_allocation: Vec<(u16, Vec<bool>)> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let hash_alg = r.u16()?;
+            let bits = if version >= FIRST_WITH_PCR_BITS {
+                let octets = r.u8()? as usize;
+                let raw = r.take(octets)?.to_vec();
+                (0..config::IMPLEMENTATION_PCR as usize)
+                    .map(|i| raw.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0))
+                    .collect()
+            } else {
+                // A record from before the bits were written named whole banks.
+                vec![true; config::IMPLEMENTATION_PCR as usize]
+            };
+            saved_allocation.push((hash_alg, bits));
+        }
         // A file written when this TPM still allocated a bank it no longer
         // implements names that bank here, and the bank is dropped rather than
         // brought back. The values that follow are self describing and a bank
         // with nowhere to go is discarded as they are read, so the record still
         // lines up.
         state.pcr_allocation = saved_allocation
-            .iter()
-            .copied()
-            .filter(|a| config::implemented_pcr_banks().contains(a))
+            .into_iter()
+            .filter(|(a, _)| config::implemented_pcr_banks().contains(a))
             .collect();
         // Dropping every bank would leave a TPM with no PCR at all, so the
         // allocation a manufactured TPM has is used instead.
         if state.pcr_allocation.is_empty() {
-            state.pcr_allocation = config::DEFAULT_PCR_BANKS.to_vec();
+            state.pcr_allocation = PcrBanks::whole_banks(config::DEFAULT_PCR_BANKS);
         }
         // The banks the allocation names are what the TPM comes up with, then
         // the saved register values go back into them.
@@ -1619,16 +1655,24 @@ mod tests {
         // Find the allocation, which is a count followed by that many
         // algorithms, and put SM3-256 in front of what is there. The
         // profile lists it as optional and this build does not have it.
+        // An entry is the algorithm and the registers it has, as the octets a
+        // TPMS_PCR_SELECTION carries.
+        fn entry(w: &mut Writer, hash_alg: u16) {
+            w.u16(hash_alg);
+            w.u8(3);
+            w.bytes(&[0xff, 0xff, 0xff]);
+        }
+
         let mut w = Writer::new();
         w.u32(2);
-        w.u16(alg::SM3_256);
-        w.u16(alg::SHA256);
+        entry(&mut w, alg::SM3_256);
+        entry(&mut w, alg::SHA256);
         let replacement = w.finish().unwrap();
 
         let mut w = Writer::new();
         w.u32(config::DEFAULT_PCR_BANKS.len() as u32);
         for a in config::DEFAULT_PCR_BANKS {
-            w.u16(*a);
+            entry(&mut w, *a);
         }
         let current = w.finish().unwrap();
 
@@ -1643,10 +1687,10 @@ mod tests {
         let back = TpmState::load(&older).expect("a file naming SM3-256 was refused");
         assert_eq!(back.hierarchies.owner.auth, b"ownerauth");
         assert!(
-            !back.pcr_allocation.contains(&alg::SM3_256),
+            !back.pcr_allocation.iter().any(|(a, _)| *a == alg::SM3_256),
             "a bank the TPM does not implement must not come back"
         );
-        assert!(back.pcr_allocation.contains(&alg::SHA256));
+        assert!(back.pcr_allocation.iter().any(|(a, _)| *a == alg::SHA256));
     }
 
     /// Part 2 clause 10.10.1 says safe means "no value of Clock greater than
@@ -1845,8 +1889,31 @@ mod tests {
         s.nv.set_counter_floor(0xaabb_ccdd_eeff_0011);
         let current = s.save().unwrap();
 
+        // Version 8 named whole banks, without the registers each has.
+        let mut v8 = current.clone();
+        v8[..4].copy_from_slice(&8u32.to_be_bytes());
+        {
+            // Each entry loses the octet count and the three octets after it.
+            let mut out = Vec::with_capacity(v8.len());
+            let count_at = position_of(&v8, &(config::DEFAULT_PCR_BANKS.len() as u32).to_be_bytes());
+            out.extend_from_slice(&v8[..count_at + 4]);
+            let mut at = count_at + 4;
+            for _ in 0..config::DEFAULT_PCR_BANKS.len() {
+                out.extend_from_slice(&v8[at..at + 2]);
+                at += 2 + 1 + 3;
+            }
+            out.extend_from_slice(&v8[at..]);
+            v8 = out;
+        }
+        let back = TpmState::load(&v8).expect("a version 8 record was refused");
+        assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
+        assert!(
+            back.pcr_allocation.iter().all(|(_, bits)| bits.iter().all(|b| *b)),
+            "a record naming whole banks came back with less"
+        );
+
         // Version 7 did not write TPMA_STARTUP_CLEAR.
-        let mut v7 = current.clone();
+        let mut v7 = v8.clone();
         v7[..4].copy_from_slice(&7u32.to_be_bytes());
         let sessions_at = v7.len() - (4 + 8 + 8);
         v7.drain(sessions_at - 4..sessions_at);
@@ -1992,9 +2059,22 @@ mod tests {
         s.nv.set_counter_floor(0x1234_5678_9abc_def0);
         s.startup_clear = crate::tpm::structures::attributes::StartupClearAttributes(0x0a0b_0c0d);
         let mut saved = s.save().unwrap();
-        // Version 5 wrote neither TPMA_STARTUP_CLEAR nor the counter mark.
+        // Version 5 wrote neither TPMA_STARTUP_CLEAR nor the counter mark, and
+        // named whole PCR banks without the registers each has.
         let flags_at = position_of(&saved, &0x0a0b_0c0du32.to_be_bytes());
         saved.drain(flags_at..flags_at + 4);
+        {
+            let count_at =
+                position_of(&saved, &(config::DEFAULT_PCR_BANKS.len() as u32).to_be_bytes());
+            let mut out = saved[..count_at + 4].to_vec();
+            let mut at = count_at + 4;
+            for _ in 0..config::DEFAULT_PCR_BANKS.len() {
+                out.extend_from_slice(&saved[at..at + 2]);
+                at += 2 + 1 + 3;
+            }
+            out.extend_from_slice(&saved[at..]);
+            saved = out;
+        }
 
         // A version 5 record carried one context counter, the one this build
         // keeps for objects, and no counter high water mark.
@@ -2086,7 +2166,7 @@ mod tests {
         s.lockout.failed_tries = 3;
         s.clock.clock = 123_456;
         s.clock.reset_count = 5;
-        s.pcr_allocation = vec![alg::SHA256, alg::SHA384];
+        s.pcr_allocation = PcrBanks::whole_banks(&[alg::SHA256, alg::SHA384]);
         s.pp_commands = vec![0x0000_0126, 0x0000_0127];
         s.audit.alg = alg::SHA256;
         s.audit.digest = vec![1u8; 32];
@@ -2106,7 +2186,10 @@ mod tests {
         assert_eq!(back.lockout, s.lockout);
         assert_eq!(back.clock.clock, 123_456);
         assert_eq!(back.clock.reset_count, 5);
-        assert_eq!(back.pcr_allocation, vec![alg::SHA256, alg::SHA384]);
+        assert_eq!(
+            back.pcr_allocation,
+            PcrBanks::whole_banks(&[alg::SHA256, alg::SHA384])
+        );
         assert_eq!(back.pcr.algorithms(), vec![alg::SHA256, alg::SHA384]);
         assert_eq!(back.pp_commands, s.pp_commands);
         assert_eq!(back.audit.digest, s.audit.digest);
@@ -2156,6 +2239,8 @@ mod tests {
         w.u32(config::DEFAULT_PCR_BANKS.len() as u32);
         for a in config::DEFAULT_PCR_BANKS {
             w.u16(*a);
+            w.u8(3);
+            w.bytes(&[0xff, 0xff, 0xff]);
         }
         let allocation = w.finish().unwrap();
         // The record holds seeds and proofs taken from the generator, so the

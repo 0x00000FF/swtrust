@@ -1519,6 +1519,87 @@ fn read_only_mode_refuses_what_table_207_names() {
     assert_eq!(r.code, rc::SUCCESS, "a restart kept Read-Only mode");
 }
 
+/// A TPML_PCR_SELECTION of one bank with the given registers.
+fn selection(banks: &[(u16, &[usize])]) -> Vec<u8> {
+    let mut p = Writer::new();
+    p.u32(banks.len() as u32);
+    for (alg, indices) in banks {
+        p.u16(*alg);
+        p.u8(3);
+        let mut bits = [0u8; 3];
+        for i in *indices {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+        p.bytes(&bits);
+    }
+    p.finish().unwrap()
+}
+
+#[test]
+fn pcr_allocate_changes_only_the_banks_it_names() {
+    // Part 3 clause 22.5.1: "this command will only change the allocations of
+    // banks that are listed in pcrAllocation", a selection with nothing in it
+    // takes a bank away, and "if a bank is listed more than once, then the last
+    // selection in the pcrAllocation list is the one that the TPM will attempt
+    // to allocate". Part 1 clause 14.8 allocates per register.
+    let h = Harness::started("pcralloc");
+
+    // Give SHA-256 two registers and say nothing about SHA-384.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::PCR_Allocate,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &selection(&[(alg::SHA256, &[0, 1])]),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "PCR_Allocate -> {:08x}", r.code);
+
+    // It takes effect at the next reset.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS);
+
+    // SHA-256 now has two registers, and asking for a third gets nothing.
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PCR_Read,
+        &[],
+        None,
+        &selection(&[(alg::SHA256, &[0, 1, 2])]),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let mut reader = Reader::new(&r.body);
+    let _counter = reader.u32().unwrap();
+    assert_eq!(reader.u32().unwrap(), 1, "one selection comes back");
+    assert_eq!(reader.u16().unwrap(), alg::SHA256);
+    let size = reader.u8().unwrap() as usize;
+    let bits = reader.take(size).unwrap();
+    assert_eq!(bits[0], 0b011, "the reply named registers that are not there");
+
+    // SHA-384 was not listed, so it kept every register it had.
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PCR_Read,
+        &[],
+        None,
+        &selection(&[(alg::SHA384, &[0, 1, 2])]),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let mut reader = Reader::new(&r.body);
+    let _counter = reader.u32().unwrap();
+    assert_eq!(reader.u32().unwrap(), 1);
+    assert_eq!(reader.u16().unwrap(), alg::SHA384);
+    let size = reader.u8().unwrap() as usize;
+    let bits = reader.take(size).unwrap();
+    assert_eq!(
+        bits[0], 0b111,
+        "a bank the command did not name lost registers"
+    );
+}
+
 #[test]
 fn a_context_of_a_disabled_hierarchy_does_not_load() {
     // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
