@@ -70,6 +70,31 @@ impl Harness {
         self.tpm.execute(0, &v)
     }
 
+    /// Send a command that names two handles, each with a password.
+    fn send_two_auth(&self, command: u32, handles: &[u32; 2], parameters: &[u8]) -> Vec<u8> {
+        let mut auth = Vec::new();
+        for _ in 0..2 {
+            auth.extend_from_slice(&0x4000_0009u32.to_be_bytes()); // TPM_RS_PW
+            auth.extend_from_slice(&0u16.to_be_bytes());
+            auth.push(0);
+            auth.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        let mut body = Vec::new();
+        for h in handles {
+            body.extend_from_slice(&h.to_be_bytes());
+        }
+        body.extend_from_slice(&(auth.len() as u32).to_be_bytes());
+        body.extend_from_slice(&auth);
+        body.extend_from_slice(parameters);
+
+        let mut v = st::SESSIONS.to_be_bytes().to_vec();
+        v.extend_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+        v.extend_from_slice(&command.to_be_bytes());
+        v.extend_from_slice(&body);
+        self.tpm.execute(0, &v)
+    }
+
     /// The timer this TPM reports, as a timeout and its attributes.
     fn act(&self) -> (u32, u32) {
         let mut body = cap::ACT.to_be_bytes().to_vec();

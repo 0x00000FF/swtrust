@@ -693,6 +693,14 @@ fn permanent_handles() -> Vec<u32> {
         rh::FW_ENDORSEMENT,
         rh::FW_PLATFORM,
         rh::FW_NULL,
+        // Part 3 clause 30.2: "There are separate handles for each SVN from 0
+        // to the firmware's current SVN (up to UINT16_MAX), which are not
+        // returned. Instead, only the handles associated with SVN 0 are
+        // returned."
+        rh::SVN_OWNER_BASE,
+        rh::SVN_ENDORSEMENT_BASE,
+        rh::SVN_PLATFORM_BASE,
+        rh::SVN_NULL_BASE,
     ]
 }
 
@@ -754,7 +762,9 @@ fn tpm_properties(state: &TpmState, property: u32) -> Vec<TaggedProperty> {
         TaggedProperty::new(pt::VENDOR_TPM_TYPE, config::VENDOR_TPM_TYPE),
         TaggedProperty::new(pt::FIRMWARE_VERSION_1, config::FIRMWARE_VERSION_1),
         TaggedProperty::new(pt::FIRMWARE_VERSION_2, config::FIRMWARE_VERSION_2),
-        TaggedProperty::new(pt::INPUT_BUFFER, config::MAX_COMMAND_SIZE),
+        // Part 2 Table 28: "the maximum size of a parameter (typically,
+        // TPM2B_MAX_BUFFER)", which is not the size of the whole command.
+        TaggedProperty::new(pt::INPUT_BUFFER, config::MAX_DIGEST_BUFFER as u32),
         TaggedProperty::new(pt::HR_TRANSIENT_MIN, config::MAX_LOADED_OBJECTS as u32),
         TaggedProperty::new(pt::HR_PERSISTENT_MIN, config::MIN_EVICT_OBJECTS as u32),
         TaggedProperty::new(pt::HR_LOADED_MIN, config::MAX_LOADED_SESSIONS as u32),

@@ -66,7 +66,7 @@ fn obfuscated(
     qualified_name: &[u8],
 ) -> TpmResult<(crate::tpm::structures::attest::ClockInfo, u64)> {
     let mut clock = clock_info(state);
-    let mut firmware = crate::tpm::config::FIRMWARE_VERSION_1 as u64;
+    let mut firmware = crate::tpm::config::FIRMWARE_VERSION;
     let hierarchy = if sign_handle == rh::NULL {
         rh::NULL
     } else {
@@ -357,7 +357,7 @@ pub fn get_time(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
             time: state.clock.time,
             clock_info: clock_info(state),
         },
-        firmware_version: crate::tpm::config::FIRMWARE_VERSION_1 as u64,
+        firmware_version: crate::tpm::config::FIRMWARE_VERSION,
     };
     let (info, signature) =
         attest_and_sign(state, sign_handle, 2, &in_scheme, &qualifying_data, attested, 2)?;
@@ -682,8 +682,23 @@ mod privacy_tests {
         );
         assert_ne!(
             firmware,
-            crate::tpm::config::FIRMWARE_VERSION_1 as u64,
+            crate::tpm::config::FIRMWARE_VERSION,
             "the version came through unchanged"
+        );
+
+        // Part 2 Table 28 makes TPM_PT_FIRMWARE_VERSION_1 "the
+        // most-significant 32 bits" of the version and _2 the
+        // least-significant ones, and Table 153 gives TPMS_ATTEST one UINT64
+        // for both, so what is obfuscated covers the whole of it.
+        assert_eq!(
+            crate::tpm::config::FIRMWARE_VERSION,
+            ((crate::tpm::config::FIRMWARE_VERSION_1 as u64) << 32)
+                | crate::tpm::config::FIRMWARE_VERSION_2 as u64
+        );
+        assert_ne!(
+            crate::tpm::config::FIRMWARE_VERSION,
+            crate::tpm::config::FIRMWARE_VERSION_1 as u64,
+            "the version an attestation carries is only its high half"
         );
 
         // A different qualified name gives a different value, which is what

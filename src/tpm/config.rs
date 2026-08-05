@@ -210,6 +210,15 @@ pub const PS_REVISION: u32 = 0x0000_0107;
 pub const FIRMWARE_VERSION_1: u32 = 0x0001_0000;
 /// TPM_PT_FIRMWARE_VERSION_2, build in the high half and revision in the low half.
 pub const FIRMWARE_VERSION_2: u32 = 0x0000_0000;
+/// The firmware version an attestation carries.
+///
+/// Part 2 Table 28 makes TPM_PT_FIRMWARE_VERSION_1 "the most-significant 32
+/// bits" of the version and TPM_PT_FIRMWARE_VERSION_2 the least-significant
+/// ones, and Table 153 gives TPMS_ATTEST a single UINT64 firmwareVersion, so
+/// the attestation carries both halves.
+pub const FIRMWARE_VERSION: u64 =
+    ((FIRMWARE_VERSION_1 as u64) << 32) | FIRMWARE_VERSION_2 as u64;
+
 /// Firmware version rendered as major.minor.build.revision.
 pub const FIRMWARE_VERSION_STRING: &str = "1.0.0.0";
 /// Manufacturer name rendered as text.
