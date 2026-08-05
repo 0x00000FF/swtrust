@@ -344,6 +344,14 @@ fn check_cp_hash(s: &Session, cp_hash_a: &[u8]) -> TpmResult<()> {
     if cp_hash_a.is_empty() {
         return Ok(());
     }
+    // Part 3 clause 23.1 leaves a trial session every validation the command
+    // indicates, and the note beside it: "Policy context other than the
+    // policySession->policyDigest may be updated for a trial policy but it is
+    // not required." A trial session cannot authorize anything, so the
+    // restriction it would record is never read.
+    if s.is_trial() {
+        return Ok(());
+    }
     if let Some(current) = &s.policy.cp_hash {
         if current.as_slice() != cp_hash_a {
             return Err(TpmRc(rc::CPHASH));
@@ -483,11 +491,14 @@ pub fn policy_signed(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let session_start_time = policy_session(state, policy_session_handle)?.start_time;
     let timeout = authorization_timeout(session_start_time, expiration, nonce_tpm.is_empty());
     // Part 3 clause 23.2.2 refuses an authorization whose limit has already
-    // gone by, and one recorded against an earlier run of Time.
+    // gone by, and one recorded against an earlier run of Time. Clause 23.1
+    // leaves that to a session which is not a trial: the limit is measured
+    // against the clock of this TPM, not of the one the policy is being
+    // computed for.
     if let Some(expires) = timeout_value(&timeout) {
         let s = policy_session(state, policy_session_handle)?;
         let stale = s.time_epoch != state.clock.time_epoch;
-        if stale || expires < state.clock.time {
+        if !is_trial && (stale || expires < state.clock.time) {
             return Err(TpmRc(rc::EXPIRED).with_parameter(4));
         }
     }
@@ -582,10 +593,11 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
 
     let session_start_time = policy_session(state, policy_session_handle)?.start_time;
     let timeout = authorization_timeout(session_start_time, expiration, nonce_tpm.is_empty());
+    // The same clause, and the same reason for leaving a trial session out.
     if let Some(expires) = timeout_value(&timeout) {
         let s = policy_session(state, policy_session_handle)?;
         let stale = s.time_epoch != state.clock.time_epoch;
-        if stale || expires < state.clock.time {
+        if !is_trial && (stale || expires < state.clock.time) {
             return Err(TpmRc(rc::EXPIRED).with_parameter(4));
         }
     }
@@ -645,6 +657,10 @@ pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let cp_hash_a = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
     let policy_ref = Tpm2bNonce::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
     let auth_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(4))?;
+    // Part 2 clause 10.5.3 gives a TPM2B_NAME either a handle or "the Name of
+    // the entity", which is a hash algorithm and a digest of its size. A Name
+    // that is neither is refused whatever kind of session this is.
+    check_key_name(auth_name.as_slice()).map_err(|e| e.with_parameter(4))?;
     let ticket = Ticket::unmarshal_tagged(&mut r, &[st::AUTH_SIGNED, st::AUTH_SECRET])
         .map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
@@ -769,7 +785,18 @@ pub fn policy_pcr(state: &mut TpmState, request: &Request) -> TpmResult<Response
     if !s.is_trial() && !expected.is_empty() && expected.as_slice() != digest.as_slice() {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
-    let mut data = filtered.to_bytes();
+    // Part 3 clause 23.7.1: for a trial session "the TPM will not check any PCR
+    // and will compute policyDigest := H(policyDigest || TPM_CC_PolicyPCR ||
+    // pcrs || pcrDigest). In this computation, pcrs is the input parameter
+    // without modification", because "the pcrs parameter is expected to match
+    // the configuration of the TPM for which the policy is being computed which
+    // may not be the same as the TPM on which the trial policy is being
+    // computed."
+    let mut data = if s.is_trial() {
+        selection.to_bytes()
+    } else {
+        filtered.to_bytes()
+    };
     if s.is_trial() && !expected.is_empty() {
         data.extend_from_slice(expected.as_slice());
     } else {
@@ -793,11 +820,13 @@ pub fn policy_locality(state: &mut TpmState, request: &Request) -> TpmResult<Res
     }
 
     let s = policy_session(state, handle)?;
-    // Narrowing only: a second call may not widen what the first allowed.
+    // Narrowing only: a second call may not widen what the first allowed. What
+    // the session recorded is context, which Part 3 clause 23.1 leaves a trial
+    // session out of.
     let combined = match s.policy.locality {
         Some(existing) => {
             let both = existing & locality.0;
-            if both == 0 {
+            if both == 0 && !s.is_trial() {
                 return Err(TpmRc(rc::RANGE).with_parameter(1));
             }
             both
@@ -815,13 +844,19 @@ pub fn policy_command_code(state: &mut TpmState, request: &Request) -> TpmResult
     let mut r = request.reader();
     let code = r.u32().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
-    if super::table::lookup(code).is_none() {
-        return Err(TpmRc(rc::VALUE).with_parameter(1));
-    }
     let s = policy_session(state, handle)?;
-    if let Some(existing) = s.policy.command_code {
-        if existing != code {
+    // Part 3 clause 23.11.1 refuses a command code this TPM does not implement,
+    // and a second one that differs from the first. Clause 23.1 leaves both to
+    // a session that is not a trial: the policy may be for a TPM that
+    // implements more than this one.
+    if !s.is_trial() {
+        if super::table::lookup(code).is_none() {
             return Err(TpmRc(rc::VALUE).with_parameter(1));
+        }
+        if let Some(existing) = s.policy.command_code {
+            if existing != code {
+                return Err(TpmRc(rc::VALUE).with_parameter(1));
+            }
         }
     }
     s.extend_policy(cc::PolicyCommandCode, &code.to_be_bytes())?;
@@ -847,6 +882,12 @@ pub fn policy_physical_presence(state: &mut TpmState, request: &Request) -> TpmR
 /// policySession->cpHash." This TPM keeps them apart so that each is checked
 /// against what it means, and this is the shared slot they would have used.
 fn shared_cp_hash_taken(s: &Session) -> bool {
+    // The note beside clause 23.1 makes that context optional for a trial
+    // session, which returns TPM_RC_SUCCESS "unless there is an unmarshaling
+    // error in the parameters of the command".
+    if s.is_trial() {
+        return false;
+    }
     s.bind != crate::tpm::constants::rh::NULL
         || s.policy.cp_hash.is_some()
         || s.policy.name_hash.is_some()
@@ -862,6 +903,11 @@ pub fn policy_cp_hash(state: &mut TpmState, request: &Request) -> TpmResult<Resp
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
+    // Clause 23.13.1: "If cpHashA does not have the size of the
+    // policySession->policyDigest, the TPM shall return TPM_RC_SIZE." The size
+    // comes from the hash the caller chose for this session, not from anything
+    // this TPM holds, so a trial computing a policy for another TPM is held to
+    // it as well.
     if cp_hash_a.len() != hash::digest_size(s.auth_hash)? {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
@@ -943,8 +989,10 @@ pub fn policy_nv_written(state: &mut TpmState, request: &Request) -> TpmResult<R
     };
     r.expect_end()?;
     let s = policy_session(state, handle)?;
+    // What an earlier call recorded is context, which the note beside Part 3
+    // clause 23.1 leaves optional for a trial session.
     if let Some(existing) = s.policy.nv_written {
-        if existing != written {
+        if existing != written && !s.is_trial() {
             return Err(TpmRc(rc::VALUE).with_parameter(1));
         }
     }
@@ -1426,8 +1474,9 @@ pub fn policy_transport_spdm(state: &mut TpmState, request: &Request) -> TpmResu
 
     let s = policy_session(state, handle)?;
     // The assertion may only be made once, so a second one cannot replace the
-    // keys the first tied the policy to.
-    if s.policy.secure_channel_required {
+    // keys the first tied the policy to. That record is context, which a trial
+    // session need not keep.
+    if s.policy.secure_channel_required && !s.is_trial() {
         return Err(TpmRc(rc::VALUE));
     }
     let auth_hash = s.auth_hash;

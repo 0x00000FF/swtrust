@@ -315,7 +315,7 @@ pub fn test_parms(_state: &TpmState, request: &Request) -> TpmResult<Response> {
     respond(|_| Ok(()))
 }
 
-/// TPM2_ECC_Parameters, Part 3 clause 14.7.
+/// TPM2_ECC_Parameters, Part 3 clause 14.6.
 pub fn ecc_parameters(_state: &TpmState, request: &Request) -> TpmResult<Response> {
     use crate::tpm::structures::base::Tpm2bEccParameter;
 
@@ -825,7 +825,7 @@ fn pcr_properties(property: u32) -> Vec<TaggedPcrSelect> {
     out
 }
 
-/// TPM2_Vendor_TCG_Test, Part 3 clause 38.1.
+/// TPM2_Vendor_TCG_Test, Part 3 clause 34.2.
 ///
 /// The command exists so a caller can check that command dispatch works. The
 /// input data is returned unchanged.

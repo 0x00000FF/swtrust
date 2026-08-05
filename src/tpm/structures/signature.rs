@@ -170,9 +170,17 @@ impl Ticket {
         if !allowed.contains(&tag) {
             return Err(TpmRc(rc::TAG));
         }
+        // Part 2 Table 105 gives a TPMT_TK_AUTH a TPMI_RH_HIERARCHY+ hierarchy,
+        // and Table 71 ends that type with "#TPM_RC_VALUE — response code
+        // returned if the handle is out of range", so a handle that names no
+        // hierarchy does not unmarshal.
+        let hierarchy = r.u32()?;
+        if !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(hierarchy) {
+            return Err(TpmRc(rc::VALUE));
+        }
         Ok(Ticket {
             tag,
-            hierarchy: r.u32()?,
+            hierarchy,
             digest: crate::tpm::structures::base::Tpm2bDigest::unmarshal(r)?,
         })
     }

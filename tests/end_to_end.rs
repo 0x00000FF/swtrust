@@ -1981,7 +1981,13 @@ fn a_trial_policy_session_accumulates_a_digest() {
     .unwrap();
     assert!(r.body.ends_with(&expected), "policy digest did not match");
 
-    // A second, different command code is refused.
+    // A second, different command code is taken by a trial session, which the
+    // note beside Part 3 clause 23.1 allows: "Policy context other than the
+    // policySession->policyDigest may be updated for a trial policy but it is
+    // not required", and such a session returns TPM_RC_SUCCESS "unless there is
+    // an unmarshaling error in the parameters of the command". The refusal a
+    // real session makes is checked in
+    // the_assertions_that_share_the_cp_hash_exclude_one_another.
     let mut p = Writer::new();
     p.u32(cc::Quote);
     let r = h.send(&command(
@@ -1991,7 +1997,7 @@ fn a_trial_policy_session_accumulates_a_digest() {
         None,
         &p.finish().unwrap(),
     ));
-    assert_eq!(r.code & 0x03f, rc::VALUE & 0x03f);
+    assert_eq!(r.code, rc::SUCCESS, "a trial session was held to the first code");
 
     // TPM2_PolicyRestart clears it again.
     let r = h.send(&command(st::NO_SESSIONS, cc::PolicyRestart, &[session], None, &[]));
@@ -4908,12 +4914,15 @@ fn a_capability_assertion_is_held_to_the_property_the_tpm_reports() {
 fn the_assertions_that_share_the_cp_hash_exclude_one_another() {
     let h = Harness::started("cphashslot");
 
+    // The exclusivity belongs to a session that can authorize: Part 3 clause
+    // 23.1 leaves a trial session out of the validations and makes the context
+    // they read optional.
     let session = || -> u32 {
         let mut p = Writer::new();
         p.u16(16);
         p.bytes(&[0u8; 16]);
         p.u16(0);
-        p.u8(se::TRIAL);
+        p.u8(se::POLICY);
         p.u16(alg::NULL);
         p.u16(alg::SHA256);
         let r = h.send(&command(
@@ -4998,7 +5007,7 @@ fn the_assertions_that_share_the_cp_hash_exclude_one_another() {
     p.u16(16);
     p.bytes(&[0u8; 16]);
     p.u16(0);
-    p.u8(se::TRIAL);
+    p.u8(se::POLICY);
     p.u16(alg::NULL);
     p.u16(alg::SHA256);
     let r = h.send(&command(
@@ -5284,5 +5293,78 @@ fn encrypt_decrypt_names_the_key_and_the_mode_the_way_the_clause_does() {
         encrypt(parent, alg::CFB),
         rc::KEY | 0x080 | (1 << 8),
         "a key of another type was not a key error"
+    );
+}
+
+
+/// Part 3 clause 23.7.1: for a trial session "the TPM will not check any PCR
+/// and will compute policyDigest := H(policyDigest || TPM_CC_PolicyPCR || pcrs
+/// || pcrDigest). In this computation, pcrs is the input parameter without
+/// modification", because "the pcrs parameter is expected to match the
+/// configuration of the TPM for which the policy is being computed which may
+/// not be the same as the TPM on which the trial policy is being computed."
+#[test]
+fn a_trial_policy_pcr_takes_the_selection_it_was_given() {
+    let h = Harness::started("trialpcr");
+
+    let session = |kind: u8| -> u32 {
+        let mut p = Writer::new();
+        p.u16(16);
+        p.bytes(&[0u8; 16]);
+        p.u16(0);
+        p.u8(kind);
+        p.u16(alg::NULL);
+        p.u16(alg::SHA256);
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::StartAuthSession,
+            &[rh::NULL, rh::NULL],
+            None,
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+        u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]])
+    };
+    let digest = |handle: u32| -> Vec<u8> {
+        let r = h.send(&command(st::NO_SESSIONS, cc::PolicyGetDigest, &[handle], None, &[]));
+        assert_eq!(r.code, rc::SUCCESS);
+        r.body[2..].to_vec()
+    };
+
+    // A bank this TPM does not have, named beside one it does. A real session
+    // would drop the bank it cannot answer for; a trial keeps the selection.
+    let mut p = Writer::new();
+    p.u16(32);
+    p.bytes(&[0xab; 32]); // the caller's pcrDigest
+    p.u32(2); // two selections
+    p.u16(alg::SHA256);
+    p.u8(3);
+    p.bytes(&[0x01, 0x00, 0x00]);
+    p.u16(alg::SM3_256);
+    p.u8(3);
+    p.bytes(&[0x01, 0x00, 0x00]);
+    let selection = p.finish().unwrap();
+    let t = session(se::TRIAL);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PolicyPCR,
+        &[t],
+        None,
+        &selection,
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "PolicyPCR -> {:08x}", r.code);
+
+    // The digest the clause gives, over the selection as sent.
+    let mut data = selection[34..].to_vec();
+    data.extend_from_slice(&[0xab; 32]);
+    let expected = swtrust::tpm::crypto::hash::digest_parts(
+        alg::SHA256,
+        &[&[0u8; 32], &cc::PolicyPCR.to_be_bytes(), &data],
+    )
+    .unwrap();
+    assert_eq!(
+        digest(t),
+        expected,
+        "the trial session modified the selection it was given"
     );
 }
