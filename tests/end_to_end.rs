@@ -5948,3 +5948,52 @@ fn hmac_refuses_a_restricted_key_and_names_a_key_that_cannot_sign() {
         "a key that cannot sign was not reported as a key error"
     );
 }
+
+
+/// Part 1 clause 34.7.2.2: "When an external device is used for non-volatile
+/// storage, that device may not always be accessible to the TPM command
+/// execution engine. When the memory is not accessible, operations that require
+/// update of NV will return TPM_RC_NV_UNAVAILABLE."
+#[test]
+fn a_command_that_writes_nv_is_refused_while_nv_is_away() {
+    let h = Harness::started("nvaway");
+
+    // A command that writes NV, and one that does not.
+    let extend = || -> u32 {
+        let mut p = Writer::new();
+        p.u32(1);
+        p.u16(alg::SHA256);
+        p.bytes(&[0xab; 32]);
+        h.send(&command(
+            st::SESSIONS,
+            cc::PCR_Extend,
+            &[10],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+    let read = || -> u32 {
+        h.send(&command(st::NO_SESSIONS, cc::GetRandom, &[], None, &[0, 8])).code
+    };
+    let counter = || h.tpm.with_state(|s| s.pcr.update_counter());
+
+    h.tpm.nv_off();
+    let before = counter();
+    assert_eq!(
+        extend(),
+        rc::NV_UNAVAILABLE,
+        "a command that writes NV ran while NV was away"
+    );
+    assert_eq!(
+        counter(),
+        before,
+        "the command changed a register before it was refused"
+    );
+    // A command that does not write NV is unaffected.
+    assert_eq!(read(), rc::SUCCESS, "a command that writes nothing was refused");
+
+    h.tpm.nv_on();
+    assert_eq!(extend(), rc::SUCCESS, "NV did not come back");
+    assert_ne!(counter(), before);
+}

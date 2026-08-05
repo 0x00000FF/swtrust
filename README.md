@@ -230,6 +230,22 @@ same TPM2_CreatePrimary always rebuilds the same key, and changing the seed
 with TPM2_Clear, TPM2_ChangePPS or TPM2_ChangeEPS makes every object under
 that hierarchy unloadable.
 
+## What the state file does not protect
+
+Part 1 clause 34.7.2.1 requires TPM state held outside the TPM to be encrypted,
+integrity checked and rollback protected. This TPM keeps its state as a hex
+text file, which is the interface it was asked for, and that file has none of
+those protections: a host that can read it can read the hierarchy seeds, the
+proofs and the authorization values, and a host that can write it can replace
+them or put back an older copy.
+
+That is inherent to a software TPM without a hardware root of trust. The
+protections the clause asks for need a key the host cannot reach, and there is
+nowhere on the host to keep one that the host cannot also read. A TPM whose
+state can be edited by whoever runs it is a development and test instrument,
+not a substitute for a discrete TPM, and it is used here for what a discrete
+TPM is exercised by: firmware, BitLocker, and the tools that talk to a TPM.
+
 ## Commands that report a limitation
 
 - TPM2_ACT_SetTimeout, TPM2_AC_Send and TPM2_SetCapability answer

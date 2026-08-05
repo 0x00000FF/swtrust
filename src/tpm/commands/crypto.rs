@@ -254,7 +254,7 @@ pub fn verify_message(
         return Err(TpmRc(rc::HANDLE).with_handle(1));
     };
     let SignatureValue::Hmac(mac_value) = &signature.signature else {
-        return Err(TpmRc(rc::SIGNATURE).with_parameter(1));
+        return Err(TpmRc(rc::SIGNATURE));
     };
     let expected = mac::hmac(
         mac_value.hash_alg,
@@ -262,7 +262,7 @@ pub fn verify_message(
         message,
     )?;
     if !crate::tpm::core::protect::constant_time_eq(&expected, &mac_value.digest) {
-        return Err(TpmRc(rc::SIGNATURE).with_parameter(1));
+        return Err(TpmRc(rc::SIGNATURE));
     }
     Ok(())
 }
@@ -766,13 +766,13 @@ fn verify_digest(object: &Object, digest: &[u8], signature: &TpmtSignature) -> T
             };
             let public = rsa::RsaPublic::new(modulus.as_slice(), exponent)?;
             let recovered = rsa::public_op(&public, sig.sig.as_slice())
-                .map_err(|_| TpmRc(rc::SIGNATURE).with_parameter(2))?;
+                .map_err(|_| TpmRc(rc::SIGNATURE))?;
             match signature.sig_alg {
                 alg::RSASSA => {
                     let expected =
                         rsa::pkcs1v15_sign_encode(sig.hash, digest, public.size())?;
                     if recovered != expected {
-                        return Err(TpmRc(rc::SIGNATURE).with_parameter(2));
+                        return Err(TpmRc(rc::SIGNATURE));
                     }
                 }
                 alg::RSAPSS => {
@@ -783,7 +783,7 @@ fn verify_digest(object: &Object, digest: &[u8], signature: &TpmtSignature) -> T
                         &recovered[recovered.len() - em_len..],
                         public.bits(),
                     )
-                    .map_err(|_| TpmRc(rc::SIGNATURE).with_parameter(2))?;
+                    .map_err(|_| TpmRc(rc::SIGNATURE))?;
                 }
                 _ => return Err(TpmRc(rc::SCHEME).with_parameter(2)),
             }
@@ -816,7 +816,7 @@ fn verify_digest(object: &Object, digest: &[u8], signature: &TpmtSignature) -> T
                 ),
                 _ => Err(TpmRc(rc::SCHEME).with_parameter(2)),
             }
-            .map_err(|_| TpmRc(rc::SIGNATURE).with_parameter(2))
+            .map_err(|_| TpmRc(rc::SIGNATURE))
         }
         (PublicId::KeyedHash(_), SignatureValue::Hmac(ha)) => {
             let Some(sensitive) = &object.sensitive else {
@@ -824,11 +824,11 @@ fn verify_digest(object: &Object, digest: &[u8], signature: &TpmtSignature) -> T
             };
             let expected = mac::hmac(ha.hash_alg, sensitive.sensitive.as_slice(), digest)?;
             if !crate::tpm::core::protect::constant_time_eq(&expected, &ha.digest) {
-                return Err(TpmRc(rc::SIGNATURE).with_parameter(2));
+                return Err(TpmRc(rc::SIGNATURE));
             }
             Ok(())
         }
-        _ => Err(TpmRc(rc::SIGNATURE).with_parameter(2)),
+        _ => Err(TpmRc(rc::SIGNATURE)),
     }
 }
 
@@ -871,6 +871,10 @@ pub fn sign(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 }
 
 /// TPM2_VerifySignature, Part 3 clause 20.1.
+///
+/// A signature that does not verify is TPM_RC_SIGNATURE with nothing added to
+/// it: Part 3 clause 4.1 gives the rule and the example, "since TPM_RC_SIGNATURE
+/// cannot have a number added, TPM_RCS_SIGNATURE is not defined".
 pub fn verify_signature(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let key_handle = request.handle(0)?;
     let mut r = request.reader();

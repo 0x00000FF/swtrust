@@ -41,6 +41,18 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     if !state.started && !dispatch::allowed_before_startup(request.code) {
         return Err(TpmRc(rc::INITIALIZE));
     }
+    // Part 1 clause 34.7.2.2: "When an external device is used for
+    // non-volatile storage, that device may not always be accessible to the
+    // TPM command execution engine. When the memory is not accessible,
+    // operations that require update of NV will return TPM_RC_NV_UNAVAILABLE."
+    // The answer comes before the command runs, so nothing changes that the
+    // file cannot be told about.
+    let writes_nv = super::table::lookup(request.code)
+        .map(|i| i.nv)
+        .unwrap_or(false);
+    if !state.nv_available && writes_nv {
+        return Err(TpmRc(rc::NV_UNAVAILABLE));
+    }
     if state.started && request.code == cc::Startup {
         return Err(TpmRc(rc::INITIALIZE));
     }

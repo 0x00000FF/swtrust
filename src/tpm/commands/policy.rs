@@ -29,6 +29,17 @@ pub fn start_auth_session(state: &mut TpmState, request: &Request) -> TpmResult<
     let auth_hash = r.u16().map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
+    // Part 3 clause 11.1.1: "If symmetric specifies a block cipher, then
+    // TPM_ALG_CFB is the only allowed value for the mode field in the symmetric
+    // parameter (TPM_RC_MODE)." The parameter protection of clause 21.3 is
+    // defined in terms of CFB alone.
+    if symmetric.algorithm != alg::NULL
+        && symmetric.algorithm != alg::XOR
+        && symmetric.mode != alg::CFB
+    {
+        return Err(TpmRc(rc::MODE).with_parameter(4));
+    }
+
     if !session::is_session_type(session_type) {
         return Err(TpmRc(rc::VALUE).with_parameter(3));
     }

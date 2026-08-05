@@ -574,6 +574,13 @@ fn build_capability(
             Ok((more, Capabilities::EccCurves(TpmlEccCurve { items })))
         }
         cap::AUTH_POLICIES => {
+            // Part 3 Table 236 note 3: "The TPM will return TPM_RC_VALUE if the
+            // handle does not reference the range for permanent handles."
+            if (property >> crate::tpm::constants::hc::HR_SHIFT) as u8
+                != crate::tpm::constants::ht::PERMANENT
+            {
+                return Err(TpmRc(rc::VALUE).with_parameter(2));
+            }
             let all = auth_policies(state, property);
             let (items, more) = take(all, count, TpmlTaggedPolicy::MAX);
             Ok((more, Capabilities::AuthPolicies(TpmlTaggedPolicy { items })))

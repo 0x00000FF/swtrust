@@ -321,12 +321,17 @@ impl Device for Tpm {
         // NV to be brought up to date.
         let writes_nv = code.map(Tpm::writes_nv).unwrap_or(false);
         if (writes_nv || clock_rolled_over) && !self.persist() {
-            // Part 1 clause 34.7.2.2: "When the memory is not accessible,
-            // operations that require update of NV will return
-            // TPM_RC_NV_UNAVAILABLE." The command has already run, so what the
-            // TPM holds and what the file holds have parted company; saying so
-            // is the only honest answer, and the warning tells the caller the
-            // change did not reach NV.
+            // Part 1 clause 34.7.2.2 answers TPM_RC_NV_UNAVAILABLE when the
+            // memory cannot be updated. This one was reached only after the
+            // command ran, so what the TPM holds and what the file holds have
+            // parted company; clause 34.7.3 says that where "recovery from an
+            // actual write failure is impossible, the TPM should disable the
+            // affected NV locations", so NV is marked away and every later
+            // command that would write it is refused before it changes
+            // anything. The platform brings NV back with its own signal.
+            self.locked().nv_available = false;
+            self.logger
+                .line("NV is no longer available: the state could not be written");
             if writes_nv {
                 return error_response(TpmRc(rc::NV_UNAVAILABLE));
             }
