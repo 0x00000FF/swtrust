@@ -1038,6 +1038,10 @@ impl TpmState {
             return Err(TpmRc(rc::BAD_CONTEXT));
         }
         state.manufactured = r.u8()? != 0;
+        // Every record older than version 10 carries neither the H-CRTM startup
+        // method nor the locality, whichever of the earlier layouts it has, so
+        // none of them can answer what the startup before it was.
+        state.startup_method_unknown = version < FIRST_WITH_HCRTM_METHOD;
 
         for slot in 0..4 {
             let seed = read_sized(&mut r)?;
@@ -1290,8 +1294,6 @@ impl TpmState {
             if version >= FIRST_WITH_HCRTM_METHOD {
                 state.hcrtm_at_last_startup = r.u8()? != 0;
                 state.startup_locality = r.u8()?;
-            } else {
-                state.startup_method_unknown = true;
             }
         }
 
@@ -2417,6 +2419,36 @@ mod tests {
             back.on_startup_state(0).unwrap_err(),
             TpmRc(rc::VALUE).with_parameter(1),
             "a record that cannot say was resumed anyway"
+        );
+
+        // The same holds for the layouts before that one, which reach the load
+        // by a different path and are just as silent about the startup.
+        let mut older = TpmState::manufacture().unwrap();
+        older.shutdown_type = crate::tpm::constants::su::STATE;
+        let mut v7 = older.save().unwrap();
+        v7[..4].copy_from_slice(&7u32.to_be_bytes());
+        let sessions_at = v7.len() - (4 + 8 + 8);
+        // Version 7 wrote neither TPMA_STARTUP_CLEAR nor the two octets after
+        // it, and named whole PCR banks.
+        v7.drain(sessions_at - 6..sessions_at);
+        {
+            let banks = config::DEFAULT_PCR_BANKS.len() as u32;
+            let count_at = position_of(&v7, &banks.to_be_bytes());
+            let mut out = v7[..count_at + 4].to_vec();
+            let mut at = count_at + 4;
+            for _ in 0..config::DEFAULT_PCR_BANKS.len() {
+                out.extend_from_slice(&v7[at..at + 2]);
+                at += 2 + 1 + 3;
+            }
+            out.extend_from_slice(&v7[at..]);
+            v7 = out;
+        }
+        let mut back = TpmState::load(&v7).expect("a version 7 record was refused");
+        back.on_init().unwrap();
+        assert_eq!(
+            back.on_startup_state(0).unwrap_err(),
+            TpmRc(rc::VALUE).with_parameter(1),
+            "a record from before TPMA_STARTUP_CLEAR was resumed anyway"
         );
         // Even from the locality the startup actually used, because the record
         // does not carry that either.

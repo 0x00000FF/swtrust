@@ -42,13 +42,18 @@ pub fn parse_header(buf: &[u8]) -> Result<CommandHeader, TpmRc> {
     }
     let tag = u16::from_be_bytes([buf[0], buf[1]]);
     if tag != st::NO_SESSIONS && tag != st::SESSIONS {
-        // Part 3 clause 5.2 item 1 names TPM_RC_BAD_TAG for a tag that is
-        // neither, and Part 2 clause 9.39 explains the value: "The response
-        // code for a bad command tag has the same value as the TPM 1.2 response
-        // code (TPM_BAD_TAG). This value is used in case the software is not
-        // compatible with this specification and an unexpected response code
-        // might have unexpected side effects."
-        return Err(TpmRc(rc::BAD_TAG));
+        // Part 3 clause 5.2 item 1 names TPM_RC_BAD_TAG here, and clause 6.1
+        // says which of the two answers a TPM gives: "If the tag of the command
+        // is not a recognized command tag, the TPM error response will differ
+        // depending on TPM 1.2 compatibility. If the TPM supports 1.2
+        // compatibility, the TPM shall return a tag of TPM_TAG_RSP_COMMAND and
+        // an appropriate TPM 1.2 response code (TPM_BADTAG = 00 00 00 1E). If
+        // the TPM does not have compatibility with TPM 1.2, the TPM shall
+        // return TPM_ST_NO_SESSION and a response code of TPM_RC_TAG." Part 2
+        // clause 6.6.1 says the same. This TPM has no 1.2 compatibility, and
+        // firmware that sends a 1.2 command to tell the families apart takes
+        // the 1.2 shaped answer to mean a 1.2 TPM is there.
+        return Err(TpmRc(rc::TAG));
     }
     if buf.len() < HEADER_SIZE {
         return Err(TpmRc(rc::COMMAND_SIZE));
@@ -66,14 +71,10 @@ pub fn parse_header(buf: &[u8]) -> Result<CommandHeader, TpmRc> {
 
 /// Build the ten octet response used for every failure.
 ///
-/// Part 2 clause 6.6 requires a failure to carry TPM_ST_NO_SESSIONS, a size of
-/// ten and the response code, and that holds for an unrecognised command tag
-/// as well. Part 2 Table 19 offers TPM_ST_RSP_COMMAND for that one case,
-/// "because an error in the command tag may prevent determination of the
-/// family", but it is the tag of a TPM 1.2 response and this TPM implements no
-/// 1.2 compatibility. Firmware tells the families apart by sending a 1.2
-/// command first, and answering it in the 1.2 shape is taken to mean a 1.2 TPM
-/// is present.
+/// Part 2 clause 6.6.1 requires a failure to carry TPM_ST_NO_SESSIONS, a size
+/// of ten and the response code. The TPM_TAG_RSP_COMMAND form beside it is for
+/// a TPM that has TPM 1.2 compatibility, which this one does not, so an
+/// unrecognised command tag is answered like any other failure.
 pub fn error_response(code: TpmRc) -> Vec<u8> {
     let mut w = Writer::with_capacity(HEADER_SIZE);
     w.u16(st::NO_SESSIONS);
@@ -542,27 +543,27 @@ mod tests {
     }
 
     #[test]
-    fn unrecognised_tag_is_rejected_with_tpm_rc_bad_tag() {
+    fn unrecognised_tag_is_rejected_with_tpm_rc_tag() {
         // TPM_TAG_RQU_COMMAND from TPM 1.2 is not a TPM 2.0 command tag.
         let cmd = [
             0x00u8, 0xc1, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x44,
         ];
-        assert_eq!(parse_header(&cmd).unwrap_err(), TpmRc(rc::BAD_TAG));
+        assert_eq!(parse_header(&cmd).unwrap_err(), TpmRc(rc::TAG));
         // TPM_ST_NULL is not a command tag either.
         let cmd = [
             0x80u8, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x44,
         ];
-        assert_eq!(parse_header(&cmd).unwrap_err(), TpmRc(rc::BAD_TAG));
+        assert_eq!(parse_header(&cmd).unwrap_err(), TpmRc(rc::TAG));
     }
 
     #[test]
     fn the_tag_is_checked_before_the_size() {
         // A truncated buffer that already carries a bad tag reports the tag,
         // matching the validation order of Part 3 clause 5.2.
-        assert_eq!(parse_header(&[0x00, 0xc1]).unwrap_err(), TpmRc(rc::BAD_TAG));
+        assert_eq!(parse_header(&[0x00, 0xc1]).unwrap_err(), TpmRc(rc::TAG));
         assert_eq!(
             parse_header(&[0x00, 0xc1, 0x00, 0x00]).unwrap_err(),
-            TpmRc(rc::BAD_TAG)
+            TpmRc(rc::TAG)
         );
         // A good tag with too few octets is a size problem.
         assert_eq!(
@@ -598,12 +599,7 @@ mod tests {
             r,
             vec![0x80, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x00]
         );
-        // A bad command tag carries the code TPM 1.2 used for it, in the
-        // response shape of this family.
-        let r = error_response(TpmRc(rc::BAD_TAG));
-        assert_eq!(&r[0..2], &st::NO_SESSIONS.to_be_bytes());
-        assert_eq!(&r[6..10], &rc::BAD_TAG.to_be_bytes());
-        assert_eq!(rc::BAD_TAG, 0x1e, "the value TPM 1.2 returned for TPM_BADTAG");
+        // Every failure, including a bad command tag, uses TPM_ST_NO_SESSIONS.
         let r = error_response(TpmRc(rc::TAG));
         assert_eq!(&r[0..2], &st::NO_SESSIONS.to_be_bytes());
         assert_eq!(&r[6..10], &rc::TAG.to_be_bytes());

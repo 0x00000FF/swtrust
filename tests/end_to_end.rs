@@ -290,13 +290,15 @@ fn read_clock_reports_the_reset_count() {
     assert_eq!(reader.u8().unwrap(), 1, "safe");
 }
 
-/// Part 3 clause 5.2 item 1 answers a tag that is neither TPM_ST_SESSIONS nor
-/// TPM_ST_NO_SESSIONS with TPM_RC_BAD_TAG, which Part 2 clause 9.39 gives "the
-/// same value as the TPM 1.2 response code (TPM_BAD_TAG)... in case the
-/// software is not compatible with this specification and an unexpected
-/// response code might have unexpected side effects."
+/// Part 3 clause 6.1: "If the tag of the command is not a recognized command
+/// tag, the TPM error response will differ depending on TPM 1.2 compatibility.
+/// If the TPM supports 1.2 compatibility, the TPM shall return a tag of
+/// TPM_TAG_RSP_COMMAND and an appropriate TPM 1.2 response code (TPM_BADTAG =
+/// 00 00 00 1E). If the TPM does not have compatibility with TPM 1.2, the TPM
+/// shall return TPM_ST_NO_SESSION and a response code of TPM_RC_TAG." This TPM
+/// has no 1.2 compatibility.
 #[test]
-fn a_bad_tag_is_reported_with_the_code_a_tpm_1_2_used() {
+fn a_bad_tag_is_reported_as_a_tpm_without_1_2_compatibility_reports_it() {
     let h = Harness::started("badtag");
     // TPM_TAG_RQU_COMMAND is what a caller that expects a TPM 1.2 sends, which
     // is how firmware tells the two families apart. The response is in the
@@ -306,9 +308,13 @@ fn a_bad_tag_is_reported_with_the_code_a_tpm_1_2_used() {
     w.u32(10);
     w.u32(cc::GetRandom);
     let r = h.send(&w.finish().unwrap());
-    assert_eq!(r.code, rc::BAD_TAG);
-    assert_eq!(r.code, 0x1e, "the value TPM 1.2 returned for TPM_BADTAG");
+    assert_eq!(r.code, rc::TAG);
     assert_eq!(r.tag, st::NO_SESSIONS);
+    assert_ne!(
+        r.tag,
+        st::RSP_COMMAND,
+        "a caller that expects a TPM 1.2 must not read this as one"
+    );
 
     // A tag this family defines but which is not a command tag is refused the
     // same way.
@@ -317,7 +323,7 @@ fn a_bad_tag_is_reported_with_the_code_a_tpm_1_2_used() {
     w.u32(10);
     w.u32(cc::GetRandom);
     let r = h.send(&w.finish().unwrap());
-    assert_eq!(r.code, rc::BAD_TAG);
+    assert_eq!(r.code, rc::TAG);
     assert_eq!(r.tag, st::NO_SESSIONS);
 }
 
@@ -5104,13 +5110,22 @@ fn a_trial_session_reaches_the_digest_without_the_validations() {
         .code
     };
 
-    // An offset past the end of TPMS_TIME_INFO, which a real session is held
-    // to and a trial one is not.
+    // Part 3 clause 23.10.1 tells the two offset failures apart: "If the
+    // number of octets to be compared overflows the TPMS_TIME_INFO structure,
+    // the TPM returns TPM_RC_RANGE. If offset is greater than the size of the
+    // marshaled TPMS_TIME_INFO structure, the TPM returns TPM_RC_VALUE." The
+    // structure is Time, Clock, resetCount, restartCount and safe.
+    let info_size = 8 + 8 + 4 + 4 + 1;
     let s = session(false);
     assert_eq!(
         counter_timer(s, &[0u8; 8], 60, eo::EQ),
+        rc::VALUE | 0x080 | 0x040 | (2 << 8),
+        "an offset past the structure was not a value error"
+    );
+    assert_eq!(
+        counter_timer(s, &[0u8; 8], info_size - 4, eo::EQ),
         rc::RANGE | 0x080 | 0x040 | (2 << 8),
-        "a real session took an offset past the structure"
+        "a comparison that overflows the structure was not a range error"
     );
     let t = session(true);
     assert_eq!(
@@ -5141,5 +5156,133 @@ fn a_trial_session_reaches_the_digest_without_the_validations() {
         digest(t3),
         digest(s3),
         "a trial policy and a real one reached different digests"
+    );
+}
+
+
+/// Part 3 clause 15.2.1: "keyHandle shall reference a symmetric cipher object
+/// (TPM_RC_KEY)... If the mode of the key is not TPM_ALG_NULL, then that is the
+/// only mode that can be used with the key and the caller is required to set
+/// mode either to TPM_ALG_NULL or to the same mode as the key (TPM_RC_MODE)."
+#[test]
+fn encrypt_decrypt_names_the_key_and_the_mode_the_way_the_clause_does() {
+    let h = Harness::started("encdec");
+
+    // A symmetric key whose mode is fixed to CFB, under a storage parent.
+    let template = storage_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0); // outsideInfo
+    p.u32(0); // creationPCR
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let parent = Reader::new(&r.body).u32().unwrap();
+
+    let mut p = Writer::new();
+    p.u16(4); // TPM2B_SENSITIVE_CREATE: an empty auth and no data
+    p.u16(0);
+    p.u16(0);
+    let public = {
+        let mut w = Writer::new();
+        w.u16(alg::SYMCIPHER);
+        w.u16(alg::SHA256);
+        // fixedTPM fixedParent sensitiveDataOrigin userWithAuth sign decrypt
+        w.u32(0x0000_0002 | 0x0000_0010 | 0x0000_0020 | 0x0000_0040 | 0x0004_0000 | 0x0002_0000);
+        w.u16(0); // authPolicy
+        w.u16(alg::AES);
+        w.u16(128);
+        w.u16(alg::CFB);
+        w.u16(0); // unique
+        w.finish().unwrap()
+    };
+    p.u16(public.len() as u16);
+    p.bytes(&public);
+    p.u16(0); // outsideInfo
+    p.u32(0); // creationPCR
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Create,
+        &[parent],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Create -> {:08x}", r.code);
+
+    let mut r2 = Reader::new(&r.body);
+    // A response with sessions puts parameterSize before the parameters.
+    let _param_size = r2.u32().unwrap();
+    let private = {
+        let n = r2.u16().unwrap() as usize;
+        r2.take(n).unwrap().to_vec()
+    };
+    let pub_area = {
+        let n = r2.u16().unwrap() as usize;
+        r2.take(n).unwrap().to_vec()
+    };
+    let mut p = Writer::new();
+    p.u16(private.len() as u16);
+    p.bytes(&private);
+    p.u16(pub_area.len() as u16);
+    p.bytes(&pub_area);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Load,
+        &[parent],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Load -> {:08x}", r.code);
+    let key = Reader::new(&r.body).u32().unwrap();
+
+    let encrypt = |handle: u32, mode: u16| -> u32 {
+        let mut p = Writer::new();
+        p.u8(0); // decrypt
+        p.u16(mode);
+        p.u16(16); // ivIn
+        p.bytes(&[0u8; 16]);
+        p.u16(16); // inData
+        p.bytes(&[0u8; 16]);
+        h.send(&command(
+            st::SESSIONS,
+            cc::EncryptDecrypt,
+            &[handle],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+
+    // The mode the key fixed, and TPM_ALG_NULL which means that mode.
+    assert_eq!(encrypt(key, alg::CFB), rc::SUCCESS, "the fixed mode was refused");
+    assert_eq!(encrypt(key, alg::NULL), rc::SUCCESS, "TPM_ALG_NULL was refused");
+
+    // Another mode is TPM_RC_MODE, not TPM_RC_VALUE.
+    assert_eq!(
+        encrypt(key, alg::CBC),
+        rc::MODE | 0x080 | 0x040 | (2 << 8),
+        "a mode the key does not have was not a mode error"
+    );
+    // And a value that is no mode at all is refused the same way.
+    assert_eq!(
+        encrypt(key, alg::SHA256),
+        rc::MODE | 0x080 | 0x040 | (2 << 8),
+        "a value that is not a cipher mode was accepted as one"
+    );
+
+    // A key that is not a symmetric cipher object is TPM_RC_KEY.
+    assert_eq!(
+        encrypt(parent, alg::CFB),
+        rc::KEY | 0x080 | (1 << 8),
+        "a key of another type was not a key error"
     );
 }

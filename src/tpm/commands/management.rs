@@ -362,6 +362,17 @@ pub fn get_capability(state: &TpmState, request: &Request) -> TpmResult<Response
     })
 }
 
+/// Whether `capability` is one of the TPM_CAP of Part 2 Table 22.
+///
+/// The table ends with "#TPM_RC_VALUE", so a value outside it is a parameter
+/// that failed to unmarshal rather than a capability the TPM does not answer
+/// for. TPM2_GetCapability reaches the same conclusion through the collection
+/// below; TPM2_PolicyCapability needs it before deciding what a trial session
+/// may skip.
+pub fn is_capability(capability: u32) -> bool {
+    (cap::FIRST..=cap::LAST).contains(&capability) || capability == cap::VENDOR_PROPERTY
+}
+
 /// The property structure that TPM2_PolicyCapability compares against.
 ///
 /// Part 3 clause 23.23.1 has the TPM "fetch the indicated property that is used

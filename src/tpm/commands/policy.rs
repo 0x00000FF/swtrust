@@ -649,40 +649,15 @@ pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         .map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
-    // A null ticket carries no proof, so it authorizes nothing.
-    if ticket.digest.is_empty() {
-        return Err(TpmRc(rc::TICKET).with_parameter(5));
-    }
-    // The authorization that produced the ticket recorded in the top bit of
-    // the timeout whether it also expires on a TPM Reset, which decides which
-    // counters went into the ticket.
-    let expires_on_reset = _timeout
-        .as_slice()
-        .first()
-        .map(|b| b & 0x80 != 0)
-        .unwrap_or(false);
-    // The ticket must be one this TPM produced for exactly these values.
-    let expected = authorization_ticket_hmac(
-        state,
-        ticket.hierarchy,
-        ticket.tag,
-        cp_hash_a.as_slice(),
-        policy_ref.as_slice(),
-        auth_name.as_slice(),
-        _timeout.as_slice(),
-        !expires_on_reset,
-    )
-    .map_err(|_| TpmRc(rc::TICKET).with_parameter(5))?;
-    if !crate::tpm::core::protect::constant_time_eq(&expected, ticket.digest.as_slice()) {
-        return Err(TpmRc(rc::TICKET).with_parameter(5));
-    }
-    // An expired ticket no longer authorizes anything. Part 3 clause 23.2.2
-    // also refuses one whose run of Time has passed, which the epoch inside
-    // the ticket already covers for a ticket that expires.
-    if let Some(expires) = timeout_value(_timeout.as_slice()) {
-        if state.clock.time > expires {
-            return Err(TpmRc(rc::EXPIRED).with_parameter(1));
-        }
+    // Part 3 clause 23.1 leaves a trial session the digest and none of the
+    // validations, and the note in clause 23.16.1 says why that matters here:
+    // "A NULL ticket is useful in a trial policy, where the caller uses the TPM
+    // to perform policy calculations but does not have a valid authorization
+    // ticket." Which command the digest names still comes from the ticket tag,
+    // which the unmarshalling above has already held to one of the two.
+    let is_trial = policy_session(state, policy_session_handle)?.is_trial();
+    if !is_trial {
+        validate_ticket(state, &ticket, &cp_hash_a, &policy_ref, &auth_name, &_timeout)?;
     }
     let command_code = if ticket.tag == st::AUTH_SIGNED {
         cc::PolicySigned
@@ -695,6 +670,53 @@ pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     set_cp_hash(s, cp_hash_a.as_slice());
     record_expiration(s, _timeout.as_slice());
     respond(|_| Ok(()))
+}
+
+/// The ticket a TPM2_PolicyTicket presents must be one this TPM produced for
+/// exactly these values, and must not have expired.
+fn validate_ticket(
+    state: &TpmState,
+    ticket: &Ticket,
+    cp_hash_a: &Tpm2bDigest,
+    policy_ref: &Tpm2bNonce,
+    auth_name: &Tpm2bName,
+    timeout: &Tpm2bTimeout,
+) -> TpmResult<()> {
+    // A null ticket carries no proof, so it authorizes nothing.
+    if ticket.digest.is_empty() {
+        return Err(TpmRc(rc::TICKET).with_parameter(5));
+    }
+    // The authorization that produced the ticket recorded in the top bit of
+    // the timeout whether it also expires on a TPM Reset, which decides which
+    // counters went into the ticket.
+    let expires_on_reset = timeout
+        .as_slice()
+        .first()
+        .map(|b| b & 0x80 != 0)
+        .unwrap_or(false);
+    let expected = authorization_ticket_hmac(
+        state,
+        ticket.hierarchy,
+        ticket.tag,
+        cp_hash_a.as_slice(),
+        policy_ref.as_slice(),
+        auth_name.as_slice(),
+        timeout.as_slice(),
+        !expires_on_reset,
+    )
+    .map_err(|_| TpmRc(rc::TICKET).with_parameter(5))?;
+    if !crate::tpm::core::protect::constant_time_eq(&expected, ticket.digest.as_slice()) {
+        return Err(TpmRc(rc::TICKET).with_parameter(5));
+    }
+    // An expired ticket no longer authorizes anything. Part 3 clause 23.2.2
+    // also refuses one whose run of Time has passed, which the epoch inside
+    // the ticket already covers for a ticket that expires.
+    if let Some(expires) = timeout_value(timeout.as_slice()) {
+        if state.clock.time > expires {
+            return Err(TpmRc(rc::EXPIRED).with_parameter(1));
+        }
+    }
+    Ok(())
 }
 
 /// TPM2_PolicyOR, Part 3 clause 23.6.
@@ -969,9 +991,13 @@ pub fn policy_counter_timer(state: &mut TpmState, request: &Request) -> TpmResul
     let operation = r.u16().map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
-    // Part 3 clause 23.1: a trial session updates the digest and "the indicated
-    // validations are not performed", which here are the range of the offset
-    // and the comparison itself.
+    if !is_operation(operation) {
+        return Err(TpmRc(rc::VALUE).with_parameter(3));
+    }
+    // Part 3 clause 23.10.1: "If policySession is a trial policy session, the
+    // TPM will update policySession->policyDigest as shown in Equation 6 and
+    // Equation 7 below and return TPM_RC_SUCCESS. It will not perform any
+    // validation."
     if !policy_session(state, handle)?.is_trial() {
         // The comparison is against the marshalled TPMS_TIME_INFO.
         let time_info = crate::tpm::structures::attest::TimeInfo {
@@ -980,9 +1006,16 @@ pub fn policy_counter_timer(state: &mut TpmState, request: &Request) -> TpmResul
         };
         let bytes = time_info.to_bytes();
         let start = offset as usize;
+        // The same clause tells the two failures apart: "If the number of
+        // octets to be compared overflows the TPMS_TIME_INFO structure, the TPM
+        // returns TPM_RC_RANGE. If offset is greater than the size of the
+        // marshaled TPMS_TIME_INFO structure, the TPM returns TPM_RC_VALUE."
+        if start > bytes.len() {
+            return Err(TpmRc(rc::VALUE).with_parameter(2));
+        }
         let end = start
             .checked_add(operand_b.len())
-            .ok_or(TpmRc(rc::VALUE).with_parameter(2))?;
+            .ok_or(TpmRc(rc::RANGE).with_parameter(2))?;
         if end > bytes.len() {
             return Err(TpmRc(rc::RANGE).with_parameter(2));
         }
@@ -1012,6 +1045,16 @@ pub fn policy_counter_timer(state: &mut TpmState, request: &Request) -> TpmResul
 }
 
 /// Apply a TPM_EO comparison to two equal length operands.
+/// Whether `operation` is one of the TPM_EO of Part 2 Table 20.
+///
+/// The table ends with "#TPM_RC_VALUE — response code returned when
+/// unmarshaling of this type fails", so a value that is not one of them is an
+/// unmarshalling error rather than an assertion that did not hold. Part 3
+/// clause 23.1 leaves a trial session every validation but that one.
+fn is_operation(operation: u16) -> bool {
+    compare(&[], &[], operation).is_some()
+}
+
 fn compare(a: &[u8], b: &[u8], operation: u16) -> Option<bool> {
     use crate::tpm::constants::eo;
 
@@ -1188,10 +1231,14 @@ pub fn policy_nv(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     let operation = r.u16().map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
+    if !is_operation(operation) {
+        return Err(TpmRc(rc::VALUE).with_parameter(3));
+    }
     // The Name of the Index goes into the digest, so it is read whether or not
-    // the assertion is evaluated. Part 3 clause 23.1 leaves a trial session the
-    // digest and none of the validations, which here are the state of the
-    // Index, the range of the read and the comparison.
+    // the assertion is evaluated. Part 3 clause 23.9.1: "If policySession is a
+    // trial policy session, the TPM will update policySession->policyDigest as
+    // shown in Equation 4 and Equation 5 below and return TPM_RC_SUCCESS. It
+    // will not perform any further validation."
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
     let nv_name = index.name()?;
     if !policy_session(state, handle)?.is_trial() {
@@ -1228,22 +1275,30 @@ pub fn policy_authorize_nv(state: &mut TpmState, request: &Request) -> TpmResult
     let nv_handle = request.handle(1)?;
     let handle = request.handle(2)?;
 
+    // Part 3 clause 23.22.1: "The authorization to read the NV Index must
+    // succeed even if policySession is a trial policy session. If policySession
+    // is a trial policy session, the TPM will update
+    // policySession->policyDigest as shown in Equation 9 below and return
+    // TPM_RC_SUCCESS. It will not perform any further validation." The Name is
+    // what Equation 9 covers, so it is read either way.
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
-    if index.read_locked {
-        return Err(TpmRc(rc::NV_LOCKED));
-    }
-    let stored = index.read(0, index.public.data_size)?;
     let nv_name = index.name()?;
 
-    let s = policy_session(state, handle)?;
-    if !s.is_trial() {
+    if !policy_session(state, handle)?.is_trial() {
+        let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
+        if index.read_locked {
+            return Err(TpmRc(rc::NV_LOCKED));
+        }
+        let stored = index.read(0, index.public.data_size)?;
         // The Index holds a TPMT_HA whose digest must match the session.
+        let s = policy_session(state, handle)?;
         let mut r = crate::tpm::marshal::Reader::new(&stored);
         let ha = crate::tpm::structures::base::TpmtHa::unmarshal(&mut r)?;
         if ha.hash_alg != s.auth_hash || ha.digest != s.policy.digest {
             return Err(TpmRc(rc::VALUE).with_handle(2));
         }
     }
+    let s = policy_session(state, handle)?;
     let digest_len = hash::digest_size(s.auth_hash)?;
     s.policy.digest = vec![0u8; digest_len];
     s.extend_policy(cc::PolicyAuthorizeNV, &nv_name)?;
@@ -1261,6 +1316,16 @@ pub fn policy_capability(state: &mut TpmState, request: &Request) -> TpmResult<R
     let property = r.u32().map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
+    if !is_operation(operation) {
+        return Err(TpmRc(rc::VALUE).with_parameter(3));
+    }
+    // Part 2 Table 22 ends the TPM_CAP values with "#TPM_RC_VALUE", so one that
+    // is not a capability at all is refused here rather than by the fetch. A
+    // capability that exists but has no property structure is a validation the
+    // clause below leaves to a session that is not a trial.
+    if !crate::tpm::commands::management::is_capability(capability) {
+        return Err(TpmRc(rc::VALUE).with_parameter(4));
+    }
     // Part 3 clause 23.1: "If the policySession parameter indicates a trial
     // policy session, then the policySession->policyDigest will be updated and
     // the indicated validations are not performed." A trial session is

@@ -1103,9 +1103,22 @@ pub fn encrypt_decrypt(
         _ => return Err(TpmRc(rc::VALUE).with_parameter(decrypt_parameter)),
     };
 
+    // Part 2 Table 87 lists the values a TPMI_ALG_CIPHER_MODE may take and ends
+    // with "#TPM_RC_MODE", so one that is not a mode is refused before the key
+    // is even looked at.
+    if !matches!(
+        mode,
+        alg::CTR | alg::OFB | alg::CBC | alg::CFB | alg::ECB | alg::NULL
+    ) {
+        return Err(TpmRc(rc::MODE).with_parameter(mode_parameter));
+    }
+
+    // Part 3 clause 15.2.1: "keyHandle shall reference a symmetric cipher
+    // object (TPM_RC_KEY) with the restricted attribute CLEAR
+    // (TPM_RC_ATTRIBUTES)."
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
     if object.public.object_type != alg::SYMCIPHER {
-        return Err(TpmRc(rc::TYPE).with_handle(1));
+        return Err(TpmRc(rc::KEY).with_handle(1));
     }
     if object
         .public
@@ -1118,7 +1131,7 @@ pub fn encrypt_decrypt(
         return Err(TpmRc(rc::HANDLE).with_handle(1));
     };
     let PublicParms::SymCipher { sym } = &object.public.parameters else {
-        return Err(TpmRc(rc::TYPE));
+        return Err(TpmRc(rc::KEY).with_handle(1));
     };
     // TPM_ALG_NULL means the mode fixed by the key.
     // Part 3 clause 15.2.1: "if the decrypt parameter of the command is TRUE,
@@ -1137,9 +1150,18 @@ pub fn encrypt_decrypt(
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }
 
+    // The same clause: "If the mode of the key is not TPM_ALG_NULL, then that is
+    // the only mode that can be used with the key and the caller is required to
+    // set mode either to TPM_ALG_NULL or to the same mode as the key
+    // (TPM_RC_MODE). If the mode of the key is TPM_ALG_NULL, then the caller
+    // may set mode to any valid symmetric encryption/decryption mode but may
+    // not select TPM_ALG_NULL (TPM_RC_MODE)."
     let mode = if mode == alg::NULL { sym.mode } else { mode };
     if sym.mode != alg::NULL && mode != sym.mode {
-        return Err(TpmRc(rc::VALUE).with_parameter(mode_parameter));
+        return Err(TpmRc(rc::MODE).with_parameter(mode_parameter));
+    }
+    if mode == alg::NULL {
+        return Err(TpmRc(rc::MODE).with_parameter(mode_parameter));
     }
 
     // Clause 15.2.1 gives CBC, CFB, OFB and CTR an ivIn "of the same size as
