@@ -134,7 +134,10 @@ pub const MAX_CONTEXT_SIZE: usize = if MAX_OBJECT_CONTEXT > MAX_SESSION_CONTEXT 
     MAX_SESSION_CONTEXT as usize
 };
 /// Largest number of octets accepted by TPM2_StirRandom.
-pub const MAX_RNG_ENTROPY_SIZE: usize = 64;
+/// Part 3 clause 16.2.1: the inData of TPM2_StirRandom "may not be larger
+/// than 128 octets", which is the size of the TPM2B_SENSITIVE_DATA it arrives
+/// in.
+pub const MAX_RNG_ENTROPY_SIZE: usize = 128;
 /// Largest number of algorithms in a TPML_ALG.
 pub const MAX_ALG_LIST_SIZE: usize = 128;
 /// Largest number of digests in a TPML_DIGEST_VALUES.

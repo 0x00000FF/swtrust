@@ -1302,11 +1302,17 @@ pub fn flush_context(state: &mut TpmState, request: &Request) -> TpmResult<Respo
             state.audit.exclusive_session = rh::UNASSIGNED;
         }
     } else if crate::tpm::core::object::ObjectSlots::is_transient(handle) {
+        // Only the object goes. Part 1 clause 27.5 says a session "is active
+        // until closed by the continueSession flag being FALSE or until the
+        // session context is flushed from the TPM by TPM2_FlushContext()", and
+        // clause 19.6 keeps a binding by recording the Name of the entity, and
+        // its authorization value as well where an entity could be deleted and
+        // remade. A session bound to an object that is gone stops matching; it
+        // is not closed.
         state
             .objects
             .remove(handle)
             .map_err(|e| e.with_parameter(1))?;
-        state.sessions.flush_bound_to(handle);
     } else {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }

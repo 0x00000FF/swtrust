@@ -1355,6 +1355,84 @@ fn a_saved_session_outlives_clear() {
 }
 
 #[test]
+fn stir_random_takes_the_hundred_and_twenty_eight_octets_it_is_given() {
+    // Part 3 Table 77 gives inData as a TPM2B_SENSITIVE_DATA and clause 16.2.1
+    // says it "may not be larger than 128 octets".
+    let h = Harness::started("stir");
+    for size in [1usize, 64, 128] {
+        let mut p = Writer::new();
+        p.u16(size as u16);
+        p.bytes(&vec![0x5au8; size]);
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::StirRandom,
+            &[],
+            None,
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "{size} octets -> {:08x}", r.code);
+    }
+    let mut p = Writer::new();
+    p.u16(129);
+    p.bytes(&vec![0x5au8; 129]);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StirRandom,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_ne!(r.code, rc::SUCCESS, "129 octets were taken");
+}
+
+#[test]
+fn a_session_bound_to_an_object_outlives_it() {
+    // Part 1 clause 27.5: a session "is active until closed by the
+    // continueSession flag being FALSE or until the session context is flushed
+    // from the TPM by TPM2_FlushContext()". Flushing the object it was bound
+    // to is neither.
+    let h = Harness::started("boundflush");
+    let object = ecc_kem_key(&h, None);
+
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0u8; 16]);
+    p.u16(0);
+    p.u8(se::HMAC);
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, object],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+    let session = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    let mut p = Writer::new();
+    p.u32(object);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::FlushContext,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "FlushContext -> {:08x}", r.code);
+
+    // The session is still there, which saving its context proves.
+    let r = h.send(&command(st::NO_SESSIONS, cc::ContextSave, &[session], None, &[]));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "the session went with the object -> {:08x}",
+        r.code
+    );
+}
+
+#[test]
 fn a_context_of_a_disabled_hierarchy_does_not_load() {
     // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
     // context is associated with a hierarchy that is disabled."

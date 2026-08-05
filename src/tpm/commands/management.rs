@@ -206,7 +206,12 @@ pub fn get_random(state: &mut TpmState, request: &Request) -> TpmResult<Response
 /// TPM2_StirRandom, Part 3 clause 16.2.
 pub fn stir_random(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let mut r = request.reader();
-    let data = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
+    // Part 3 Table 77 gives inData as a TPM2B_SENSITIVE_DATA, and clause
+    // 16.2.1 says it "may not be larger than 128 octets", which is the size
+    // that structure holds. A TPM2B_DIGEST would have refused everything past
+    // the largest digest.
+    let data = crate::tpm::structures::base::Tpm2bSensitiveData::unmarshal(&mut r)
+        .map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     if data.len() > config::MAX_RNG_ENTROPY_SIZE {
         return Err(TpmRc(rc::SIZE).with_parameter(1));

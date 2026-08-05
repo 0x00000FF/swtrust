@@ -626,10 +626,20 @@ impl SessionSlots {
         self.object_counter
     }
 
+    /// The next object context identifier, without taking it.
+    pub fn peek_object_id(&self) -> u64 {
+        self.object_counter
+    }
+
     /// Take the next object context identifier, clause 27.2.2.
+    ///
+    /// Both counters saturate rather than wrap. Clause 27.5 describes a
+    /// rollover scheme for a counter "only be large enough for the majority of
+    /// applications"; these are 64 bits wide, so a TPM cannot reach the end of
+    /// one, and stopping there is safer than handing out a number twice.
     pub fn next_object_id(&mut self) -> u64 {
         let id = self.object_counter;
-        self.object_counter = self.object_counter.wrapping_add(1);
+        self.object_counter = self.object_counter.saturating_add(1);
         id
     }
 
@@ -695,7 +705,7 @@ impl SessionSlots {
     /// session context is created or loaded.
     pub fn next_context_id(&mut self) -> u64 {
         let id = self.context_counter;
-        self.context_counter = self.context_counter.wrapping_add(1);
+        self.context_counter = self.context_counter.saturating_add(1);
         id
     }
 
@@ -892,20 +902,6 @@ impl SessionSlots {
         self.version.clear();
     }
 
-    /// Drop every session bound to `handle`, which happens when the entity the
-    /// session is bound to goes away.
-    pub fn flush_bound_to(&mut self, handle: u32) {
-        let going: Vec<u32> = self
-            .sessions
-            .iter()
-            .filter(|(_, s)| s.bind == handle)
-            .map(|(h, _)| *h)
-            .collect();
-        for h in going {
-            self.version.remove(&h);
-        }
-        self.sessions.retain(|_, s| s.bind != handle);
-    }
 }
 
 /// True when `handle` is in one of the session ranges.
@@ -1405,8 +1401,8 @@ mod tests {
         );
         slots.save(at_edge).unwrap();
 
-        // One more and the next number would be further out than that.
-        slots.next_context_id();
+        // Taking that one moved the counter, so the next would sit further out
+        // than the maximum and the window is full without another step.
         assert!(slots.at_context_gap(), "the window is not reported full");
 
         let mut past = session(se::HMAC);
@@ -1487,22 +1483,6 @@ mod tests {
         let mut s = session(se::HMAC);
         s.handle = handle;
         assert_eq!(slots.insert(s).unwrap_err(), TpmRc(rc::SESSION_MEMORY));
-    }
-
-    #[test]
-    fn flushing_by_bind_handle_drops_only_matching_sessions() {
-        let mut slots = SessionSlots::new();
-        let mut bound = session(se::HMAC);
-        bound.handle = hc::HMAC_SESSION_FIRST;
-        bound.bind = hc::TRANSIENT_FIRST;
-        slots.insert(bound).unwrap();
-        let mut other = session(se::HMAC);
-        other.handle = hc::HMAC_SESSION_FIRST + 1;
-        slots.insert(other).unwrap();
-
-        slots.flush_bound_to(hc::TRANSIENT_FIRST);
-        assert!(!slots.contains(hc::HMAC_SESSION_FIRST));
-        assert!(slots.contains(hc::HMAC_SESSION_FIRST + 1));
     }
 
     #[test]

@@ -354,14 +354,18 @@ pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Respon
             };
             // Part 1 clause 27.2.2 gives an object context its number from
             // objectContextID, which "is incremented each time an object
-            // context is saved", and not from the session counter. It is taken
-            // once the body is in hand, so a command that fails does not spend
-            // one.
-            let sequence_id = state.sessions.next_object_id();
-            (hierarchy, saved_handle, body, sequence_id)
+            // context is saved", and not from the session counter. It is only
+            // looked at here: sealing can still refuse a body that will not
+            // fit a context, and clause 5.2 leaves the TPM as it was when a
+            // command answers with an error.
+            (hierarchy, saved_handle, body, state.sessions.peek_object_id())
         };
 
     let blob = seal_context(state, hierarchy, sequence, saved_handle, &body)?;
+    if !crate::tpm::core::session::is_session_handle(handle) {
+        // Nothing else can refuse the command now, so the number is spent.
+        state.sessions.next_object_id();
+    }
     let context = Context {
         sequence,
         saved_handle,
@@ -399,7 +403,7 @@ pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Respon
         // sequence above 0x1010 or below 0x0F10 is an error.
         let current = state.sessions.context_counter().saturating_sub(1);
         context.sequence <= current
-            && context.sequence + config::CONTEXT_GAP_MAX as u64 >= current
+            && context.sequence.saturating_add(config::CONTEXT_GAP_MAX as u64) >= current
     } else {
         context.sequence < state.sessions.object_counter()
     };
