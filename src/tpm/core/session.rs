@@ -633,9 +633,41 @@ impl SessionSlots {
         id
     }
 
-    /// The oldest identifier a saved session still holds.
+    /// The lowest identifier any active session holds, saved or loaded.
+    ///
+    /// Part 3 Table 17 describes TPM_RC_CONTEXT_GAP as "the gap between the
+    /// lowest numbered active session and the highest numbered session is at
+    /// the limits of the session tracking logic", so a session that is loaded
+    /// counts as much as one that is put away.
+    pub fn oldest_active(&self) -> Option<u64> {
+        self.saved
+            .values()
+            .chain(self.version.values())
+            .copied()
+            .min()
+    }
+
+    /// The lowest identifier a saved session holds, which is the one the
+    /// remedy for a gap says to load.
     pub fn oldest_saved(&self) -> Option<u64> {
         self.saved.values().copied().min()
+    }
+
+    /// True when the tracking window is full.
+    pub fn at_context_gap(&self) -> bool {
+        match self.oldest_active() {
+            // Part 2 Table 30 makes TPM_PT_CONTEXT_GAP_MAX "the maximum
+            // allowed difference (unsigned) between the contextID values of
+            // two saved session contexts". A session taken now would carry
+            // the current counter, so the window is full once the difference
+            // has reached the maximum: one more would pass it. The oldest
+            // context is still loadable at exactly that distance, which is
+            // what clause 14.6.1 keeps by making its bound exclusive.
+            Some(oldest) => {
+                self.context_counter.saturating_sub(oldest) >= config::CONTEXT_GAP_MAX as u64
+            }
+            None => false,
+        }
     }
 
     /// Refuse a new identifier when an old saved context could no longer be
@@ -646,10 +678,8 @@ impl SessionSlots {
     /// creating the session would prevent recycling of old saved contexts."
     /// This TPM reports a gap in TPM_PT_CONTEXT_GAP_MAX, so it answers for one.
     fn check_gap(&self) -> TpmResult<()> {
-        if let Some(oldest) = self.oldest_saved() {
-            if self.context_counter.saturating_sub(oldest) >= config::CONTEXT_GAP_MAX as u64 {
-                return Err(TpmRc(rc::CONTEXT_GAP));
-            }
+        if self.at_context_gap() {
+            return Err(TpmRc(rc::CONTEXT_GAP));
         }
         Ok(())
     }
@@ -781,13 +811,13 @@ impl SessionSlots {
             Some(_) => return Err(TpmRc(rc::VALUE)),
             None => return Err(TpmRc(rc::HANDLE)),
         }
-        // Loading advances the counter, so the session comes back with a new
-        // identifier and the blob that brought it here is spent.
-        let id = self.next_context_id();
-        self.version.insert(handle, id);
         if self.sessions.len() >= config::MAX_LOADED_SESSIONS as usize {
             return Err(TpmRc(rc::SESSION_MEMORY));
         }
+        // Part 1 clause 27.2.2 advances the counter when a context is loaded,
+        // so it is taken once nothing is left that could refuse the load.
+        let id = self.next_context_id();
+        self.version.insert(handle, id);
         self.saved.remove(&handle);
         self.sessions.insert(handle, session);
         Ok(())
@@ -1335,18 +1365,34 @@ mod tests {
         // of old saved contexts."
         let mut slots = SessionSlots::new();
         let h = slots.insert(session(se::HMAC)).unwrap();
-        let (_blob, _id) = slots.save(h).unwrap();
-        // Walk the counter up to the far edge of the window the TPM reports.
-        for _ in 0..config::CONTEXT_GAP_MAX as u64 - 1 {
+        let (blob, id) = slots.save(h).unwrap();
+
+        // Walk the counter until a new session would sit further from the
+        // saved one than the reported maximum allows.
+        while slots.context_counter() - id < config::CONTEXT_GAP_MAX as u64 - 1 {
             slots.next_context_id();
         }
-        let mut s = session(se::HMAC);
-        s.handle = hc::HMAC_SESSION_FIRST + 1;
+        let mut edge = session(se::HMAC);
+        edge.handle = hc::HMAC_SESSION_FIRST + 1;
+        let at_edge = slots.insert(edge).unwrap();
+        slots.save(at_edge).unwrap();
+        assert!(slots.at_context_gap(), "the window is not reported full");
+
+        let mut past = session(se::HMAC);
+        past.handle = hc::HMAC_SESSION_FIRST + 2;
         assert_eq!(
-            slots.insert(s).unwrap_err(),
+            slots.insert(past).unwrap_err(),
             TpmRc(rc::CONTEXT_GAP),
             "a session was created past the gap"
         );
+
+        // Part 3 Table 17: "the remedy is to load the session context with the
+        // lowest number so that its tracking number can be updated."
+        slots.restore(blob, id).unwrap();
+        assert!(!slots.at_context_gap(), "loading the oldest did not close the gap");
+        let mut again = session(se::HMAC);
+        again.handle = hc::HMAC_SESSION_FIRST + 3;
+        assert!(slots.insert(again).is_ok(), "a session still could not be made");
     }
 
     #[test]

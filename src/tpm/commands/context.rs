@@ -387,15 +387,32 @@ pub fn context_load(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     // sequence counter. For a session, the sequence number must also be less
     // than the session sequence number, but it must also be greater that the
     // sequence number minus the allowable range for session sequence number."
-    let viable = if crate::tpm::core::session::is_session_handle(context.saved_handle) {
+    let is_session = crate::tpm::core::session::is_session_handle(context.saved_handle);
+    let viable = if is_session {
+        // Part 2 clause 14.6.1 gives the two bounds: an error "if an input
+        // value for sequence is larger than the value used in any saved
+        // context", and for a session an error "if the input value for
+        // sequence is less than the current value of contextID minus the
+        // maximum range for sessions". The lower bound is exclusive, so a
+        // sequence exactly that far back is still one the TPM can place.
         let counter = state.sessions.context_counter();
         context.sequence < counter
-            && context.sequence + config::CONTEXT_GAP_MAX as u64 > counter
+            && context.sequence + config::CONTEXT_GAP_MAX as u64 >= counter
     } else {
         context.sequence < state.sessions.object_counter()
     };
     if !viable {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
+    }
+    // Part 3 Table 17 gives the remedy for a full window: "load the session
+    // context with the lowest number so that its tracking number can be
+    // updated." While the window is full that is the only session context the
+    // TPM takes.
+    if is_session
+        && state.sessions.at_context_gap()
+        && Some(context.sequence) != state.sessions.oldest_saved()
+    {
+        return Err(TpmRc(rc::CONTEXT_GAP));
     }
     // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
     // context is associated with a hierarchy that is disabled." The note

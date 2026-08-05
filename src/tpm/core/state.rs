@@ -801,11 +801,18 @@ impl TpmState {
             version >= FIRST_WITH_CLEAR_COUNT,
             version >= FIRST_WITH_RESET_VALUE,
         )?;
-        // Part 1 Equation 52 wants a value of the vendor digest size. A record
-        // from before it was drawn carries none, and no startup would fill one
-        // that is not a reset, so one is drawn here. The contexts that build
-        // named the counter it used instead, and they stop verifying, which is
-        // what changing the value does.
+        // Part 1 Equation 52 wants a value of the vendor digest size, and a
+        // record from before it was drawn carries none. No startup short of a
+        // reset would fill one, so it is drawn here.
+        //
+        // A context saved by the build that wrote such a record cannot be
+        // loaded by this one in any case: the confidentiality construction
+        // changed at the same time, and clause 27.3.1 now puts the size field
+        // of the sensitive area under the cipher where that build left it
+        // outside. Reading a state file written by another build is not a
+        // state change of one running TPM, which is what clause 27.3.2 is
+        // about; it is the same situation as a field upgrade, after which a
+        // TPM does not undertake to load what it saved before.
         if state.clock.reset_value.is_empty() {
             use crate::tpm::crypto::rand::Rng;
             let size =
@@ -1001,13 +1008,19 @@ impl TpmState {
                 saved.push((handle, id));
             }
             let counter = r.u64()?;
-            // Clause 27.2.2 has two counters, and a record from before the
-            // second was written down starts it where the first stands, which
-            // is past every object context that build could have saved.
-            let object_counter = if version >= FIRST_WITH_OBJECT_COUNTER {
-                r.u64()?
+            // Clause 27.2.2 has two counters. A record from before the second
+            // was written down advanced one value for both, so that value is
+            // where the object counter goes: it is past every object context
+            // that build could have saved. The session counter cannot take it
+            // as well, because every object save moved it too and a saved
+            // session could then be further back than the window allows. It
+            // starts just past the newest saved session instead, which is
+            // where it would stand had only sessions moved it.
+            let (counter, object_counter) = if version >= FIRST_WITH_OBJECT_COUNTER {
+                (counter, r.u64()?)
             } else {
-                counter
+                let newest = saved.iter().map(|(_, id)| *id).max();
+                (newest.map(|n| n + 1).unwrap_or(counter), counter)
             };
             state
                 .sessions
@@ -1563,6 +1576,11 @@ mod tests {
             32,
             "a record with no reset value has one drawn for it"
         );
+        assert_eq!(
+            back.sessions.object_counter(),
+            s.sessions.object_counter(),
+            "the one counter such a record carries becomes the object one"
+        );
 
         // Version 3 wrote neither the saved session block nor the stateClear
         // byte of a persistent object.
@@ -1624,6 +1642,55 @@ mod tests {
             .position(|w| w == needle)
             .expect("the persistent block was not found");
         at + needle.len() + 4 + 1
+    }
+
+    #[test]
+    fn a_version_5_record_gives_its_one_counter_to_the_objects() {
+        // Version 5 moved one counter for both kinds of context, so a session
+        // saved early and a great many object saves afterwards would leave the
+        // session further back than the window allows. Part 1 clause 27.1 keeps
+        // a saved session valid until it is closed or the TPM is reset, so the
+        // session counter is put where only sessions would have taken it.
+        let mut s = TpmState::manufacture().unwrap();
+        let session = crate::tpm::core::session::Session::new(
+            hc::HMAC_SESSION_FIRST,
+            crate::tpm::constants::se::HMAC,
+            alg::SHA256,
+            vec![1u8; 32],
+            vec![2u8; 32],
+            vec![3u8; 32],
+            rh::NULL,
+            Vec::new(),
+            SymDef::null(),
+        )
+        .unwrap();
+        let handle = s.sessions.insert(session).unwrap();
+        s.sessions.save(handle).unwrap();
+        // Every object context that build saved moved the same value.
+        for _ in 0..100_000 {
+            s.sessions.next_object_id();
+        }
+        let saved = s.save().unwrap();
+
+        // A version 5 record carried one counter, the one this build keeps for
+        // objects, and nothing else.
+        let mut v5 = saved.clone();
+        v5[..4].copy_from_slice(&5u32.to_be_bytes());
+        let counter = s.sessions.object_counter();
+        v5.truncate(v5.len() - 8);
+        let at = v5.len() - 8;
+        v5[at..].copy_from_slice(&counter.to_be_bytes());
+
+        let back = TpmState::load(&v5).unwrap();
+        assert_eq!(
+            back.sessions.object_counter(),
+            counter,
+            "the object counter did not take the value the record carried"
+        );
+        assert!(
+            !back.sessions.at_context_gap(),
+            "the saved session came back outside the window"
+        );
     }
 
     #[test]
