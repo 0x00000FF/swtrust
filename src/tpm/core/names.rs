@@ -79,6 +79,28 @@ pub fn qualified_name(
 }
 
 /// Wrap a Name in a TPM2B_NAME, rejecting anything too long for the type.
+/// Whether a Name has one of the shapes Part 2 clause 10.4.3 gives it.
+///
+/// "The type of Name in the structure is determined by context and the size
+/// parameter. If size is four, then the Name is a handle. If size is zero, then
+/// no Name is present. Otherwise, the size shall be the size of a TPM_ALG_ID
+/// plus the size of the digest produced by the indicated hash algorithm." A
+/// Name of any other shape stands for no entity, so what is built from it could
+/// never be used.
+pub fn is_well_formed(name: &[u8]) -> bool {
+    if name.is_empty() || name.len() == 4 {
+        return true;
+    }
+    if name.len() < 2 {
+        return false;
+    }
+    let alg = u16::from_be_bytes([name[0], name[1]]);
+    match crate::tpm::crypto::hash::digest_size(alg) {
+        Ok(size) => name.len() == 2 + size,
+        Err(_) => false,
+    }
+}
+
 pub fn to_tpm2b(name: &[u8]) -> TpmResult<Tpm2bName> {
     Tpm2bName::from_slice(name).map_err(|_| TpmRc(rc::SIZE))
 }

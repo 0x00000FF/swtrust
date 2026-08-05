@@ -1208,6 +1208,13 @@ pub fn make_credential(state: &mut TpmState, request: &Request) -> TpmResult<Res
         .map_err(|e| e.with_parameter(2))?;
     r.expect_end()?;
 
+    // Part 2 clause 10.4.3 gives a TPM2B_NAME three shapes and no other. A Name
+    // of any other shape names no object, so the credential built from it could
+    // never be activated.
+    if !crate::tpm::core::names::is_well_formed(object_name.as_slice()) {
+        return Err(TpmRc(rc::SIZE).with_parameter(2));
+    }
+
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
         .clone();

@@ -5368,3 +5368,159 @@ fn a_trial_policy_pcr_takes_the_selection_it_was_given() {
         "the trial session modified the selection it was given"
     );
 }
+
+
+/// Part 3 clause 23.7.1: "When this command is executed,
+/// policySession->pcrUpdateCounter is checked to see if it has been previously
+/// set... If it has been set, it will be compared with the current value of
+/// pcrUpdateCounter to determine if any PCR changes have occurred. If the
+/// values are different, the TPM shall return TPM_RC_PCR_CHANGED."
+#[test]
+fn a_second_policy_pcr_after_a_pcr_changed_is_refused() {
+    let h = Harness::started("pcrchanged");
+
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0u8; 16]);
+    p.u16(0);
+    p.u8(se::POLICY);
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+    let session = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    let policy_pcr = |index: u8| -> u32 {
+        let mut p = Writer::new();
+        p.u16(0); // no pcrDigest, so the TPM uses its own
+        p.u32(1);
+        p.u16(alg::SHA256);
+        p.u8(3);
+        let mut bits = [0u8; 3];
+        bits[(index / 8) as usize] = 1 << (index % 8);
+        p.bytes(&bits);
+        h.send(&command(
+            st::NO_SESSIONS,
+            cc::PolicyPCR,
+            &[session],
+            None,
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+
+    assert_eq!(policy_pcr(16), rc::SUCCESS, "the first assertion was refused");
+    // A second one while nothing has changed is allowed: the counter is the
+    // one the session recorded.
+    assert_eq!(policy_pcr(17), rc::SUCCESS, "an unchanged counter was refused");
+
+    // Extend a register that counts, which moves pcrUpdateCounter.
+    let mut p = Writer::new();
+    p.u32(1);
+    p.u16(alg::SHA256);
+    p.bytes(&[0xcd; 32]);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::PCR_Extend,
+        &[10],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "PCR_Extend -> {:08x}", r.code);
+
+    assert_eq!(
+        policy_pcr(16),
+        rc::PCR_CHANGED,
+        "a policy collected assertions from two different PCR states"
+    );
+}
+
+
+/// Part 2 clause 10.4.3: "If size is four, then the Name is a handle. If size
+/// is zero, then no Name is present. Otherwise, the size shall be the size of a
+/// TPM_ALG_ID plus the size of the digest produced by the indicated hash
+/// algorithm." A permanent entity has a Name of the first kind, and
+/// TPM2_PolicySecret makes tickets for such entities.
+#[test]
+fn a_ticket_may_name_a_permanent_entity() {
+    let h = Harness::started("ticketname");
+
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0u8; 16]);
+    p.u16(0);
+    p.u8(se::POLICY);
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let session = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    // A ticket that names TPM_RH_OWNER, whose Name is the handle. The ticket
+    // itself is not one this TPM produced, so the answer says so rather than
+    // complaining about the Name.
+    let mut p = Writer::new();
+    p.u16(8); // timeout
+    p.bytes(&[0u8; 8]);
+    p.u16(0); // cpHashA
+    p.u16(0); // policyRef
+    p.u16(4); // authName: a handle
+    p.u32(rh::OWNER);
+    p.u16(st::AUTH_SECRET);
+    p.u32(rh::OWNER);
+    p.u16(32);
+    p.bytes(&[0xaa; 32]);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PolicyTicket,
+        &[session],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::TICKET | 0x080 | 0x040 | (5 << 8),
+        "a Name in handle form was taken for a malformed one -> {:08x}",
+        r.code
+    );
+
+    // A Name that is neither a handle nor a digest is still refused.
+    let mut p = Writer::new();
+    p.u16(8);
+    p.bytes(&[0u8; 8]);
+    p.u16(0);
+    p.u16(0);
+    // A hash algorithm followed by too few octets is no shape a Name has.
+    p.u16(7);
+    p.u16(alg::SHA256);
+    p.bytes(&[0u8; 5]);
+    p.u16(st::AUTH_SECRET);
+    p.u32(rh::OWNER);
+    p.u16(32);
+    p.bytes(&[0xaa; 32]);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::PolicyTicket,
+        &[session],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code & 0x03f,
+        rc::SIZE & 0x03f,
+        "a Name of no shape was accepted -> {:08x}",
+        r.code
+    );
+}

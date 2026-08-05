@@ -350,13 +350,14 @@ fn check_cp_hash(s: &Session, cp_hash_a: &[u8]) -> TpmResult<()> {
     // not required." A trial session cannot authorize anything, so the
     // restriction it would record is never read. The size is still required of
     // it, because that comes from the hash the caller chose for this session.
-    if !s.is_trial() {
-        if let Some(current) = &s.policy.cp_hash {
-            if current.as_slice() != cp_hash_a {
-                return Err(TpmRc(rc::CPHASH));
-            }
-            return Ok(());
+    if s.is_trial() {
+        return Ok(());
+    }
+    if let Some(current) = &s.policy.cp_hash {
+        if current.as_slice() != cp_hash_a {
+            return Err(TpmRc(rc::CPHASH));
         }
+        return Ok(());
     }
     if cp_hash_a.len() != hash::digest_size(s.auth_hash)? {
         return Err(TpmRc(rc::SIZE).with_parameter(2));
@@ -657,10 +658,9 @@ pub fn policy_ticket(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     let cp_hash_a = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(2))?;
     let policy_ref = Tpm2bNonce::unmarshal(&mut r).map_err(|e| e.with_parameter(3))?;
     let auth_name = Tpm2bName::unmarshal(&mut r).map_err(|e| e.with_parameter(4))?;
-    // Part 2 clause 10.5.3 gives a TPM2B_NAME either a handle or "the Name of
-    // the entity", which is a hash algorithm and a digest of its size. A Name
-    // that is neither is refused whatever kind of session this is.
-    check_key_name(auth_name.as_slice()).map_err(|e| e.with_parameter(4))?;
+    // The entity a ticket was made for may be a permanent handle, whose Name is
+    // the handle itself, so every shape Part 2 clause 10.4.3 allows is taken.
+    check_entity_name(auth_name.as_slice()).map_err(|e| e.with_parameter(4))?;
     let ticket = Ticket::unmarshal_tagged(&mut r, &[st::AUTH_SIGNED, st::AUTH_SECRET])
         .map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
@@ -802,10 +802,23 @@ pub fn policy_pcr(state: &mut TpmState, request: &Request) -> TpmResult<Response
     } else {
         data.extend_from_slice(&digest);
     }
-    s.extend_policy(cc::PolicyPCR, &data)?;
+    // Part 3 clause 23.7.1: "When this command is executed,
+    // policySession->pcrUpdateCounter is checked to see if it has been
+    // previously set... If it has been set, it will be compared with the
+    // current value of pcrUpdateCounter to determine if any PCR changes have
+    // occurred. If the values are different, the TPM shall return
+    // TPM_RC_PCR_CHANGED." Overwriting it instead would let one policy collect
+    // assertions about PCR states that never held at the same moment.
     if !s.is_trial() {
-        s.policy.pcr_update_counter = Some(counter);
+        match s.policy.pcr_update_counter {
+            Some(recorded) if recorded != counter => {
+                return Err(TpmRc(rc::PCR_CHANGED));
+            }
+            Some(_) => {}
+            None => s.policy.pcr_update_counter = Some(counter),
+        }
     }
+    s.extend_policy(cc::PolicyPCR, &data)?;
     respond(|_| Ok(()))
 }
 
@@ -815,11 +828,15 @@ pub fn policy_locality(state: &mut TpmState, request: &Request) -> TpmResult<Res
     let mut r = request.reader();
     let locality = LocalityAttributes::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
-    if locality.0 == 0 {
-        return Err(TpmRc(rc::RANGE).with_parameter(1));
-    }
 
     let s = policy_session(state, handle)?;
+    // Part 3 clause 23.8.1: "if the result of disabling localities results in
+    // no locality being enabled, the TPM will return TPM_RC_RANGE", which a
+    // locality of zero always does. Clause 23.1 leaves that to a session that
+    // is not a trial.
+    if locality.0 == 0 && !s.is_trial() {
+        return Err(TpmRc(rc::RANGE).with_parameter(1));
+    }
     // Narrowing only: a second call may not widen what the first allowed. What
     // the session recorded is context, which Part 3 clause 23.1 leaves a trial
     // session out of.
@@ -873,6 +890,23 @@ pub fn policy_physical_presence(state: &mut TpmState, request: &Request) -> TpmR
     respond(|_| Ok(()))
 }
 
+/// Require a digest the size of the session's policy digest.
+///
+/// Part 3 clause 23.1 leaves a trial session out of it: a TPM2B_DIGEST of any
+/// length up to its maximum unmarshals, so the size a command asks of it is one
+/// of "the indicated validations", and the note beside the clause says such a
+/// command returns TPM_RC_SUCCESS "unless there is an unmarshaling error in the
+/// parameters of the command".
+fn check_digest_size(s: &Session, digest: &[u8], parameter: usize) -> TpmResult<()> {
+    if s.is_trial() {
+        return Ok(());
+    }
+    if digest.len() != hash::digest_size(s.auth_hash)? {
+        return Err(TpmRc(rc::SIZE).with_parameter(parameter));
+    }
+    Ok(())
+}
+
 /// Whether the one slot the mutually exclusive assertions share is taken.
 ///
 /// Part 3 clauses 23.13.1, 23.14.1, 23.21.1 and 23.24.1 each say that only one
@@ -904,13 +938,8 @@ pub fn policy_cp_hash(state: &mut TpmState, request: &Request) -> TpmResult<Resp
 
     let s = policy_session(state, handle)?;
     // Clause 23.13.1: "If cpHashA does not have the size of the
-    // policySession->policyDigest, the TPM shall return TPM_RC_SIZE." The size
-    // comes from the hash the caller chose for this session, not from anything
-    // this TPM holds, so a trial computing a policy for another TPM is held to
-    // it as well.
-    if cp_hash_a.len() != hash::digest_size(s.auth_hash)? {
-        return Err(TpmRc(rc::SIZE).with_parameter(1));
-    }
+    // policySession->policyDigest, the TPM shall return TPM_RC_SIZE."
+    check_digest_size(s, cp_hash_a.as_slice(), 1)?;
     // Clause 23.13.1: "If policySession->cpHash is already set and not the
     // same as cpHashA, then the TPM shall return TPM_RC_CPHASH", and the note
     // below it explains that repeating the same value is allowed rather than
@@ -932,9 +961,7 @@ pub fn policy_name_hash(state: &mut TpmState, request: &Request) -> TpmResult<Re
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
-    if name_hash.len() != hash::digest_size(s.auth_hash)? {
-        return Err(TpmRc(rc::SIZE).with_parameter(1));
-    }
+    check_digest_size(s, name_hash.as_slice(), 1)?;
     // Clause 23.14.1: "If policySession->cpHash is already set, the TPM shall
     // return TPM_RC_CPHASH."
     if shared_cp_hash_taken(s) {
@@ -1009,15 +1036,13 @@ pub fn policy_template(state: &mut TpmState, request: &Request) -> TpmResult<Res
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
-    if template_hash.len() != hash::digest_size(s.auth_hash)? {
-        return Err(TpmRc(rc::SIZE).with_parameter(1));
-    }
+    check_digest_size(s, template_hash.as_slice(), 1)?;
     // Clause 23.21.1: "If policySession->isTemplateSet is SET and
     // policySession->cpHash is not equal to templateHash, the TPM shall return
     // TPM_RC_VALUE... Otherwise, if policySession->cpHash is already set, the
     // TPM shall return TPM_RC_CPHASH."
     if let Some(existing) = &s.policy.template_hash {
-        if existing != template_hash.as_slice() {
+        if existing != template_hash.as_slice() && !s.is_trial() {
             return Err(TpmRc(rc::VALUE).with_parameter(1));
         }
     } else if shared_cp_hash_taken(s) {
@@ -1444,9 +1469,7 @@ pub fn policy_parameters(state: &mut TpmState, request: &Request) -> TpmResult<R
     r.expect_end()?;
 
     let s = policy_session(state, handle)?;
-    if p_hash.len() != hash::digest_size(s.auth_hash)? {
-        return Err(TpmRc(rc::SIZE).with_parameter(1));
-    }
+    check_digest_size(s, p_hash.as_slice(), 1)?;
     // Clause 23.24.1: "If policySession->cpHash is already set, the TPM shall
     // return TPM_RC_CPHASH."
     if shared_cp_hash_taken(s) {
@@ -1507,6 +1530,25 @@ pub fn policy_transport_spdm(state: &mut TpmState, request: &Request) -> TpmResu
 ///
 /// Part 3 clause 23.25.1 requires a Name that is given to be a hash algorithm
 /// this TPM implements followed by a digest of that size.
+/// Whether a TPM2B_NAME has one of the shapes Part 2 clause 10.4.3 gives it.
+///
+/// "The type of Name in the structure is determined by context and the size
+/// parameter. If size is four, then the Name is a handle. If size is zero, then
+/// no Name is present. Otherwise, the size shall be the size of a TPM_ALG_ID
+/// plus the size of the digest produced by the indicated hash algorithm."
+fn check_entity_name(name: &[u8]) -> TpmResult<()> {
+    if name.is_empty() || name.len() == 4 {
+        return Ok(());
+    }
+    check_key_name(name)
+}
+
+/// Whether a Name is the Name of a key, which is always a digest.
+///
+/// Part 3 clause 23.16.1 asks it of keySign: "if the first two octets of
+/// keySign are not a valid hash algorithm, the TPM shall return TPM_RC_HASH. If
+/// the remainder of the Name is not the size of the indicated digest, the TPM
+/// shall return TPM_RC_SIZE."
 fn check_key_name(name: &[u8]) -> TpmResult<()> {
     if name.is_empty() {
         return Ok(());
