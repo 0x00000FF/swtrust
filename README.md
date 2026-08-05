@@ -67,6 +67,13 @@ and is otherwise hex, so it can be inspected and copied with ordinary tools.
 Writes go to a temporary file that is renamed over the old one, so an
 interrupted save never leaves a partial state behind.
 
+The header carries a version. A file an older build wrote is read with that
+build's layout, so a state file survives an upgrade; a file this build cannot
+place is refused rather than reinterpreted. A file written before the TPM
+recorded which startup method it last used cannot answer what
+TPM2_Startup(TPM_SU_STATE) has to compare against, so the first startup after
+such an upgrade has to be TPM_SU_CLEAR.
+
 ### Logs
 
 Every command and response pair is appended to `<log-dir>/YYYY-MM-DD.log`,
