@@ -6071,11 +6071,13 @@ fn a_firmware_limited_hierarchy_makes_keys_of_its_own() {
     // And the derivation is stable: the same handle gives the same key again.
     assert_eq!(public_of(&primary(rh::FW_OWNER)), b, "the derivation is not stable");
 
-    // A version above the one this firmware reports names no hierarchy.
+    // Part 2 Table 18: TPM_RC_SVN_LIMITED is "the hierarchy is SVN-limited but
+    // the Firmware SVN Secret associated with the given SVN is unavailable",
+    // which is what a version above the one this firmware reports has.
     let above = primary(hc::SVN_OWNER_FIRST + 1);
     assert_eq!(
         above.code,
-        rc::VALUE | 0x080 | (1 << 8),
+        rc::SVN_LIMITED,
         "an SVN above the firmware's own was accepted -> {:08x}",
         above.code
     );
@@ -6099,5 +6101,89 @@ fn a_firmware_limited_hierarchy_makes_keys_of_its_own() {
         rc::ATTRIBUTES | 0x080 | (2 << 8),
         "a firmware-limited object was made persistent -> {:08x}",
         r.code
+    );
+}
+
+
+/// Part 2 clauses 8.3.3.8 and 8.3.3.9 allow firmwareLimited and svnLimited to
+/// be SET at creation only when "fixedTPM is SET in template" and the same
+/// attribute "is SET in the object's parent", the note beside each adding that
+/// "for a Primary Object in a Firmware-limited hierarchy, the parent is
+/// considered to have firmwareLimited SET".
+#[test]
+fn a_limited_attribute_needs_a_hierarchy_that_has_it() {
+    let h = Harness::started("limitedattrs");
+
+    let primary = |hierarchy: u32, extra: u32| -> u32 {
+        let mut t = Writer::new();
+        t.u16(0x0023); // TPM_ALG_ECC
+        t.u16(alg::SHA256);
+        // fixedTPM fixedParent sensitiveDataOrigin userWithAuth restricted
+        // decrypt, plus whatever the caller is claiming
+        t.u32(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0001_0000 | 0x0002_0000 | extra);
+        t.u16(0); // authPolicy
+        t.u16(0x0006); // AES
+        t.u16(128);
+        t.u16(0x0043); // CFB
+        t.u16(0x0010); // scheme null
+        t.u16(0x0003); // NIST P-256
+        t.u16(0x0010); // kdf null
+        t.u16(0);
+        t.u16(0);
+        let template = t.finish().unwrap();
+
+        let mut p = Writer::new();
+        p.u16(4);
+        p.u16(0);
+        p.u16(0);
+        p.u16(template.len() as u16);
+        p.bytes(&template);
+        p.u16(0);
+        p.u32(0);
+        h.send(&command(
+            st::SESSIONS,
+            cc::CreatePrimary,
+            &[hierarchy],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+
+    const FIRMWARE_LIMITED: u32 = 0x0000_0100;
+    const SVN_LIMITED: u32 = 0x0000_0200;
+
+    // The ordinary hierarchy may claim neither.
+    assert_eq!(
+        primary(rh::OWNER, FIRMWARE_LIMITED),
+        rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
+        "an owner primary claimed firmwareLimited"
+    );
+    assert_eq!(
+        primary(rh::OWNER, SVN_LIMITED),
+        rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
+        "an owner primary claimed svnLimited"
+    );
+
+    // Each limited hierarchy gives its own attribute and not the other.
+    assert_eq!(
+        primary(rh::FW_OWNER, FIRMWARE_LIMITED),
+        rc::SUCCESS,
+        "a firmware-limited primary could not claim firmwareLimited"
+    );
+    assert_eq!(
+        primary(rh::FW_OWNER, SVN_LIMITED),
+        rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
+        "a firmware-limited primary claimed svnLimited"
+    );
+    assert_eq!(
+        primary(hc::SVN_OWNER_FIRST, SVN_LIMITED),
+        rc::SUCCESS,
+        "an SVN-limited primary could not claim svnLimited"
+    );
+    assert_eq!(
+        primary(hc::SVN_OWNER_FIRST, FIRMWARE_LIMITED),
+        rc::ATTRIBUTES | 0x080 | 0x040 | (2 << 8),
+        "an SVN-limited primary claimed firmwareLimited"
     );
 }

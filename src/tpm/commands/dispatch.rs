@@ -207,6 +207,14 @@ pub fn handle_name(state: &TpmState, handle: u32) -> TpmResult<Vec<u8>> {
 /// whose enable is CLEAR. This runs over the handle area before the command
 /// does, so a command that takes no authorization is stopped as well.
 pub fn check_handle_available(state: &TpmState, handle: u32) -> TpmResult<()> {
+    // A limited hierarchy is there while its base is, so a caller cannot tell
+    // a right authorization from a wrong one against a hierarchy that is off.
+    if crate::tpm::core::hierarchy::Hierarchies::is_limited(handle) {
+        if !state.hierarchies.is_enabled(handle) {
+            return Err(TpmRc(rc::HIERARCHY));
+        }
+        return Ok(());
+    }
     if crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(handle) {
         if !state.hierarchies.is_enabled(handle) {
             return Err(TpmRc(rc::HIERARCHY));

@@ -685,6 +685,14 @@ fn permanent_handles() -> Vec<u32> {
         rh::PLATFORM,
         rh::PLATFORM_NV,
         rh::ACT_0,
+        // Part 1 clause 41.6 refers to the firmware-limited hierarchies "by
+        // reserved permanent handles", and this TPM answers to all four. The
+        // SVN-limited ones are ranges rather than single handles, and Part 3
+        // Table 236 note 5 keeps them out of this list.
+        rh::FW_OWNER,
+        rh::FW_ENDORSEMENT,
+        rh::FW_PLATFORM,
+        rh::FW_NULL,
     ]
 }
 

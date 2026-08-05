@@ -85,16 +85,31 @@ pub struct Hierarchies {
     pub null: Hierarchy,
     /// phEnableNV, which gates NV Indices created by the platform.
     pub platform_nv_enabled: bool,
-    /// The Firmware Secret of Part 1 Table 43.
+    /// The secret a bootloader would hold, which both limited kinds derive
+    /// from.
     ///
-    /// Clause 41.6 gives every firmware-limited and SVN-limited hierarchy a
-    /// seed and a proof "derived from the base hierarchy's primary seed / proof
-    /// value, as well as the additional secret". On a TPM whose firmware is
-    /// measured and latched by a bootloader that secret comes from the
-    /// hardware; here it is drawn at manufacture and kept with the rest of the
-    /// state, so a firmware-limited key is reproducible for as long as this
-    /// build is the firmware and useless once the state is remade.
-    pub firmware_secret: Vec<u8>,
+    /// Part 1 clause 41.6 gives every firmware-limited and SVN-limited
+    /// hierarchy a seed and a proof "derived from the base hierarchy's primary
+    /// seed / proof value, as well as the additional secret", and Table 43
+    /// names the two additional secrets: the Firmware Secret and the Firmware
+    /// SVN Secret. Clause 41.4 has both come from a bootloader that measured
+    /// the firmware, this one standing in for what the bootloader keeps: it is
+    /// drawn at manufacture and kept with the state.
+    ///
+    /// The Firmware Secret is not this value but a derivation of it that
+    /// includes the code of the running image, so that clause 41.7's
+    /// "cryptographically limited to the current firmware image" holds: another
+    /// build of this TPM, given the same state, derives a different one. The
+    /// Firmware SVN Secret is derived from this value alone, because clause
+    /// 41.7 keeps SVN-limited objects "available to TPM firmware updates as
+    /// long as those updates' SVNs are greater than or equal to the SVN".
+    pub bootloader_secret: Vec<u8>,
+    /// The code of the running image, which the Firmware Secret includes.
+    ///
+    /// This is what the pre-operational integrity test of FIPS 140-3 clause
+    /// 10.3.1 computes over the executable, and it is not part of the state:
+    /// the image the TPM is running decides it.
+    pub firmware_code: Vec<u8>,
 }
 
 impl Hierarchies {
@@ -106,7 +121,8 @@ impl Hierarchies {
             endorsement: Hierarchy::new(rng)?,
             null: Hierarchy::new(rng)?,
             platform_nv_enabled: true,
-            firmware_secret: rng.bytes(config::PRIMARY_SEED_SIZE)?,
+            bootloader_secret: rng.bytes(config::PRIMARY_SEED_SIZE)?,
+            firmware_code: Vec::new(),
         })
     }
 
@@ -149,16 +165,23 @@ impl Hierarchies {
         None
     }
 
-    /// True when `handle` names a firmware-limited or SVN-limited hierarchy
-    /// this TPM has.
+    /// True when `handle` is a firmware-limited or SVN-limited value of
+    /// TPMI_RH_HIERARCHY.
+    ///
+    /// Every such handle is a member of the type whatever version this
+    /// firmware is: what a version above it lacks is the secret, which
+    /// [`Hierarchies::limited_secret_available`] answers for.
+    pub fn is_limited(handle: u32) -> bool {
+        Self::base_of(handle).is_some()
+    }
+
+    /// True when the secret a limited hierarchy is derived from is there.
     ///
     /// The example in clause 41.4 has the hardware "reject the request if
-    /// requestedSvn is > LATCHED_FW_SVN", so a version above the one this
-    /// firmware reports names no hierarchy.
-    pub fn is_limited(handle: u32) -> bool {
-        if Self::base_of(handle).is_none() {
-            return false;
-        }
+    /// requestedSvn is > LATCHED_FW_SVN". Part 2 Table 18 gives that its own
+    /// response code: TPM_RC_SVN_LIMITED is "the hierarchy is SVN-limited but
+    /// the Firmware SVN Secret associated with the given SVN is unavailable".
+    pub fn limited_secret_available(handle: u32) -> bool {
         match Self::svn_of(handle) {
             Some(svn) => svn <= config::FIRMWARE_SVN,
             None => true,
@@ -176,7 +199,7 @@ impl Hierarchies {
             Some(svn) => {
                 let mut secret = crate::tpm::crypto::hmac::kdfa(
                     config::CONTEXT_INTEGRITY_HASH_ALG,
-                    &self.firmware_secret,
+                    &self.bootloader_secret,
                     "SVN_SECRET",
                     &[],
                     &[],
@@ -190,7 +213,22 @@ impl Hierarchies {
                 }
                 Ok((secret, "H_SVN_SECRET"))
             }
-            None => Ok((self.firmware_secret.clone(), "H_FW_SECRET")),
+            // Clause 41.7: a firmware-limited object is "cryptographically
+            // limited to the current firmware image; if the image is upgraded
+            // or downgraded, all firmware-objects that were limited to the
+            // previously installed firmware image are lost", so the code of the
+            // image goes into the secret.
+            None => Ok((
+                crate::tpm::crypto::hmac::kdfa(
+                    config::CONTEXT_INTEGRITY_HASH_ALG,
+                    &self.bootloader_secret,
+                    "FW_SECRET",
+                    &self.firmware_code,
+                    &[],
+                    (config::PRIMARY_SEED_SIZE * 8) as u32,
+                )?,
+                "H_FW_SECRET",
+            )),
         }
     }
 
@@ -221,8 +259,8 @@ impl Hierarchies {
             return Ok(pick(h).clone());
         }
         let base = Self::base_of(handle).ok_or(TpmRc(rc::VALUE))?;
-        if !Self::is_limited(handle) {
-            return Err(TpmRc(rc::VALUE));
+        if !Self::limited_secret_available(handle) {
+            return Err(TpmRc(rc::SVN_LIMITED));
         }
         let (additional, additional_label) = self.additional_secret(handle)?;
         let mut context_v = additional_label.as_bytes().to_vec();

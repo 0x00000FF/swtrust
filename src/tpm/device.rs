@@ -192,6 +192,10 @@ impl Tpm {
         // reports, so it is kept rather than recomputed. A TPM2_SelfTest that
         // runs it again compares against the same file this one did.
         state.integrity_file = Some(expected_at);
+        // Part 1 clause 41.7 limits a firmware-limited object "to the current
+        // firmware image", so the code the integrity test measured is what the
+        // Firmware Secret is derived with.
+        state.hierarchies.firmware_code = integrity.clone();
         state.test_digest = integrity;
         state.self_test_done = true;
         state.test_failure = None;
@@ -395,6 +399,30 @@ impl Device for Tpm {
         self.powered.store(true, Ordering::SeqCst);
         {
             let mut state = self.locked();
+            // A write that failed left what the TPM holds and what the file
+            // holds apart, and Part 1 clause 36.2 wants an error to leave the
+            // TPM as though the command had not been received. _TPM_Init is
+            // where that can be done: the file is read again, and the volatile
+            // state this discards is the only thing the reload cannot carry.
+            if state.nv_write_failed {
+                match self.store.load() {
+                    Ok(Some(data)) => match TpmState::load(&data) {
+                        Ok(mut fresh) => {
+                            fresh.integrity_file = state.integrity_file.clone();
+                            fresh.hierarchies.firmware_code =
+                                state.hierarchies.firmware_code.clone();
+                            fresh.test_digest = state.test_digest.clone();
+                            *state = fresh;
+                            self.logger
+                                .line("the state was read again after a write that failed");
+                        }
+                        Err(e) => self
+                            .logger
+                            .line(&format!("cannot read the state again: {}", e.0)),
+                    },
+                    _ => self.logger.line("cannot read the state again"),
+                }
+            }
             state.started = false;
             // _TPM_Init is where a stored PCR allocation takes effect, before
             // an H-CRTM sequence could measure into a bank.

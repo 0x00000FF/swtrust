@@ -491,6 +491,31 @@ pub fn validate_creation_template(public: &TpmtPublic) -> TpmResult<()> {
     validate_action_attributes(public)
 }
 
+/// The two attributes that say an object belongs to a limited hierarchy.
+///
+/// Part 2 clauses 8.3.3.8 and 8.3.3.9 allow each to be SET at creation only
+/// when "fixedTPM is SET in template" and the same attribute "is SET in the
+/// object's parent", the note beside each adding that "for a Primary Object in
+/// a Firmware-limited hierarchy, the parent is considered to have
+/// firmwareLimited SET". Without the check an ordinary hierarchy could make an
+/// object whose public area claims a protection it does not have.
+pub fn validate_limited_attributes(
+    public: &TpmtPublic,
+    parent_firmware_limited: bool,
+    parent_svn_limited: bool,
+) -> TpmResult<()> {
+    let fixed_tpm = public.object_attributes.has(ObjectAttributes::FIXED_TPM);
+    for (bit, parent) in [
+        (ObjectAttributes::FIRMWARE_LIMITED, parent_firmware_limited),
+        (ObjectAttributes::SVN_LIMITED, parent_svn_limited),
+    ] {
+        if public.object_attributes.has(bit) && (!fixed_tpm || !parent) {
+            return Err(TpmRc(rc::ATTRIBUTES));
+        }
+    }
+    Ok(())
+}
+
 /// What an object is allowed to do, for the commands that say so.
 ///
 /// Part 3 states the first rule twice in the same words, in clause 12.1.1 for

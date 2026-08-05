@@ -956,7 +956,7 @@ impl TpmState {
         // Part 1 Table 43: the additional secret every firmware-limited and
         // SVN-limited hierarchy is derived from, which a TPM whose firmware is
         // latched by a bootloader is given rather than keeping.
-        w.sized16(&self.hierarchies.firmware_secret);
+        w.sized16(&self.hierarchies.bootloader_secret);
 
         self.lockout.marshal(&mut w);
         self.permanent.marshal(&mut w);
@@ -1154,7 +1154,7 @@ impl TpmState {
         }
         state.hierarchies.platform_nv_enabled = r.u8()? != 0;
         if version >= FIRST_WITH_FIRMWARE_SECRET {
-            state.hierarchies.firmware_secret = read_sized(&mut r)?;
+            state.hierarchies.bootloader_secret = read_sized(&mut r)?;
         }
 
         state.lockout = LockoutState::unmarshal(&mut r)?;
@@ -2125,7 +2125,7 @@ mod tests {
         let back = TpmState::load(&v10).expect("a version 10 record was refused");
         assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
         assert!(
-            !back.hierarchies.firmware_secret.is_empty(),
+            !back.hierarchies.bootloader_secret.is_empty(),
             "a record with no Firmware Secret had none drawn for it"
         );
 

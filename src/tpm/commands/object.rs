@@ -260,6 +260,12 @@ pub fn create_primary(state: &mut TpmState, request: &Request) -> TpmResult<Resp
     }
     let template = in_public.public_area;
     object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
+    object::validate_limited_attributes(
+        &template,
+        is_firmware_limited(primary_handle),
+        is_svn_limited(primary_handle),
+    )
+    .map_err(|e| e.with_parameter(2))?;
 
     let seed = state.hierarchies.seed_of(primary_handle)?;
     let context = primary_context(&template, &in_sensitive)?;
@@ -346,6 +352,10 @@ struct Parent {
     symmetric: crate::tpm::structures::schemes::SymDef,
     hierarchy: u32,
     qualified_name: Vec<u8>,
+    /// The two attributes of Part 2 clauses 8.3.3.8 and 8.3.3.9, which a child
+    /// may only claim when its parent has them.
+    firmware_limited: bool,
+    svn_limited: bool,
 }
 
 /// Resolve a parent handle to what protecting a child needs.
@@ -379,6 +389,14 @@ fn parent_of(state: &TpmState, handle: u32) -> TpmResult<Parent> {
         symmetric,
         hierarchy: object.hierarchy,
         qualified_name: object.qualified_name.clone(),
+        firmware_limited: object
+            .public
+            .object_attributes
+            .has(ObjectAttributes::FIRMWARE_LIMITED),
+        svn_limited: object
+            .public
+            .object_attributes
+            .has(ObjectAttributes::SVN_LIMITED),
     })
 }
 
@@ -396,6 +414,8 @@ pub fn create(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let parent = parent_of(state, parent_handle).map_err(|e| e.with_handle(1))?;
     let template = in_public.public_area;
     object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
+    object::validate_limited_attributes(&template, parent.firmware_limited, parent.svn_limited)
+        .map_err(|e| e.with_parameter(2))?;
     // A child that is fixedTPM must be created by the TPM it will live in.
     if template
         .object_attributes
@@ -1038,7 +1058,11 @@ pub fn load_external(state: &mut TpmState, request: &Request) -> TpmResult<Respo
         }
         None => None,
     };
-    if hierarchy != rh::NULL && !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(hierarchy)
+    // Part 3 Table 26 gives the parameter a TPMI_RH_HIERARCHY, which Part 2
+    // Table 59 fills with the four base hierarchies and the limited ones.
+    if hierarchy != rh::NULL
+        && !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(hierarchy)
+        && !crate::tpm::core::hierarchy::Hierarchies::is_limited(hierarchy)
     {
         return Err(TpmRc(rc::HIERARCHY).with_parameter(3));
     }
@@ -1081,6 +1105,21 @@ pub fn read_public(state: &TpmState, request: &Request) -> TpmResult<Response> {
         Tpm2bName::new(qualified_name)?.marshal(w);
         Ok(())
     })
+}
+
+/// Whether a handle names a firmware-limited hierarchy.
+///
+/// Part 2 clause 8.3.3.8: "for a Primary Object in a Firmware-limited
+/// hierarchy, the parent is considered to have firmwareLimited SET."
+fn is_firmware_limited(handle: u32) -> bool {
+    crate::tpm::core::hierarchy::Hierarchies::is_limited(handle)
+        && crate::tpm::core::hierarchy::Hierarchies::svn_of(handle).is_none()
+}
+
+/// Whether a handle names an SVN-limited hierarchy, clause 8.3.3.9.
+fn is_svn_limited(handle: u32) -> bool {
+    crate::tpm::core::hierarchy::Hierarchies::is_limited(handle)
+        && crate::tpm::core::hierarchy::Hierarchies::svn_of(handle).is_some()
 }
 
 /// A loaded object, transient or persistent.
