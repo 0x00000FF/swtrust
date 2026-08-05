@@ -27,6 +27,11 @@ use super::session::SessionSlots;
 /// it is still read rather than being thrown away: a TPM whose state a caller
 /// depends on should not lose it because this build learned a new field.
 ///
+/// Version 11 wrote the Firmware Secret that Part 1 clause 41.6 derives the
+/// firmware-limited and SVN-limited hierarchies from. A record without one has
+/// a fresh secret drawn for it, which makes the keys of those hierarchies
+/// unreproducible across the upgrade and nothing else.
+///
 /// Version 10 wrote the H-CRTM startup method of the last TPM2_Startup and the
 /// locality it came from, which Part 3 clause 9.3.3 and Part 1 clause 31.3
 /// compare a resume against.
@@ -56,7 +61,9 @@ use super::session::SessionSlots;
 /// It was never released, so version 1 means the layout that came before the
 /// byte and nothing else. A file of the other shape can only have been written
 /// by a developer running that build, and is not one this reads.
-const STATE_VERSION: u32 = 10;
+const STATE_VERSION: u32 = 11;
+/// Version 10 had no Firmware Secret, the limited hierarchies deriving from it.
+const STATE_VERSION_WITHOUT_FIRMWARE_SECRET: u32 = 10;
 /// Version 9 did not record which startup method the last TPM2_Startup used.
 const STATE_VERSION_WITHOUT_HCRTM_METHOD: u32 = 9;
 /// Version 8 named whole PCR banks where Part 1 clause 14.8 allocates per
@@ -85,6 +92,7 @@ const FIRST_WITH_COUNTER_FLOOR: u32 = 7;
 const FIRST_WITH_STARTUP_CLEAR: u32 = 8;
 const FIRST_WITH_PCR_BITS: u32 = 9;
 const FIRST_WITH_HCRTM_METHOD: u32 = 10;
+const FIRST_WITH_FIRMWARE_SECRET: u32 = 11;
 /// Version 3 did not record which session contexts had been saved.
 const STATE_VERSION_WITHOUT_SESSIONS: u32 = 3;
 /// Version 2 recorded the profile but not the clearCount of Part 1 Equation 52.
@@ -918,8 +926,8 @@ impl TpmState {
     }
 
     /// The proof value of the hierarchy an object belongs to.
-    pub fn hierarchy_proof(&self, handle: u32) -> TpmResult<&[u8]> {
-        Ok(&self.hierarchies.get(handle)?.proof)
+    pub fn hierarchy_proof(&self, handle: u32) -> TpmResult<Vec<u8>> {
+        self.hierarchies.proof_of(handle)
     }
 
     /// Marshal the non-volatile state.
@@ -945,6 +953,10 @@ impl TpmState {
             w.u8(u8::from(h.enabled));
         }
         w.u8(u8::from(self.hierarchies.platform_nv_enabled));
+        // Part 1 Table 43: the additional secret every firmware-limited and
+        // SVN-limited hierarchy is derived from, which a TPM whose firmware is
+        // latched by a bootloader is given rather than keeping.
+        w.sized16(&self.hierarchies.firmware_secret);
 
         self.lockout.marshal(&mut w);
         self.permanent.marshal(&mut w);
@@ -1084,6 +1096,7 @@ impl TpmState {
         if !matches!(
             version,
             STATE_VERSION
+                | STATE_VERSION_WITHOUT_FIRMWARE_SECRET
                 | STATE_VERSION_WITHOUT_HCRTM_METHOD
                 | STATE_VERSION_WITHOUT_PCR_BITS
                 | STATE_VERSION_WITHOUT_STARTUP_CLEAR
@@ -1140,6 +1153,9 @@ impl TpmState {
             target.enabled = enabled;
         }
         state.hierarchies.platform_nv_enabled = r.u8()? != 0;
+        if version >= FIRST_WITH_FIRMWARE_SECRET {
+            state.hierarchies.firmware_secret = read_sized(&mut r)?;
+        }
 
         state.lockout = LockoutState::unmarshal(&mut r)?;
         state.permanent = PermanentAttributes::unmarshal(&mut r)?;
@@ -2097,9 +2113,25 @@ mod tests {
         s.nv.set_counter_floor(0xaabb_ccdd_eeff_0011);
         let current = s.save().unwrap();
 
+        // Version 10 had no Firmware Secret, which is written as a sized block
+        // right after the phEnableNV byte.
+        let mut v10 = current.clone();
+        v10[..4].copy_from_slice(&10u32.to_be_bytes());
+        {
+            let at = position_of_firmware_secret(&v10);
+            let len = 2 + u16::from_be_bytes([v10[at], v10[at + 1]]) as usize;
+            v10.drain(at..at + len);
+        }
+        let back = TpmState::load(&v10).expect("a version 10 record was refused");
+        assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
+        assert!(
+            !back.hierarchies.firmware_secret.is_empty(),
+            "a record with no Firmware Secret had none drawn for it"
+        );
+
         // Version 9 did not write the H-CRTM startup method, which this build
         // puts between TPMA_STARTUP_CLEAR and the saved session block.
-        let mut v9 = current.clone();
+        let mut v9 = v10.clone();
         v9[..4].copy_from_slice(&9u32.to_be_bytes());
         let sessions_at = v9.len() - (4 + 8 + 8);
         v9.drain(sessions_at - 2..sessions_at);
@@ -2206,6 +2238,30 @@ mod tests {
         assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
     }
 
+    /// Where the Firmware Secret sits, found from the end of the record.
+    ///
+    /// It is written after the four hierarchies and the phEnableNV byte, and
+    /// the hierarchies carry blocks of their own, so it is located by walking
+    /// forward from the manufactured flag rather than by a fixed offset.
+    fn position_of_firmware_secret(saved: &[u8]) -> usize {
+        // version, profile, manufactured
+        let mut at = 4 + 1 + 1;
+        for _ in 0..4 {
+            for _ in 0..3 {
+                let n = 2 + u16::from_be_bytes([saved[at], saved[at + 1]]) as usize;
+                at += n;
+            }
+            // TPMT_HA: the algorithm and, when it is not TPM_ALG_NULL, a digest
+            let alg = u16::from_be_bytes([saved[at], saved[at + 1]]);
+            at += 2;
+            if alg != crate::tpm::constants::alg::NULL {
+                at += crate::tpm::crypto::hash::digest_size(alg).unwrap();
+            }
+            at += 1; // enabled
+        }
+        at + 1 // phEnableNV
+    }
+
     /// Where a distinctive block of octets sits in a record.
     fn position_of(saved: &[u8], needle: &[u8]) -> usize {
         saved
@@ -2277,9 +2333,14 @@ mod tests {
         s.nv.set_counter_floor(0x1234_5678_9abc_def0);
         s.startup_clear = crate::tpm::structures::attributes::StartupClearAttributes(0x0a0b_0c0d);
         let mut saved = s.save().unwrap();
-        // Version 5 wrote neither TPMA_STARTUP_CLEAR, the startup method beside
-        // it, nor the counter mark, and named whole PCR banks without the
-        // registers each has.
+        // Version 5 wrote none of the Firmware Secret, TPMA_STARTUP_CLEAR, the
+        // startup method beside it or the counter mark, and named whole PCR
+        // banks without the registers each has.
+        {
+            let at = position_of_firmware_secret(&saved);
+            let len = 2 + u16::from_be_bytes([saved[at], saved[at + 1]]) as usize;
+            saved.drain(at..at + len);
+        }
         let flags_at = position_of(&saved, &0x0a0b_0c0du32.to_be_bytes());
         saved.drain(flags_at..flags_at + 6);
         {
@@ -2486,8 +2547,14 @@ mod tests {
         s.on_startup_clear(3).unwrap();
         s.shutdown_type = crate::tpm::constants::su::STATE;
         let mut saved = s.save().unwrap();
-        // Version 9 is the same record without those two octets.
+        // Version 9 is the same record without the Firmware Secret and the two
+        // octets that carry the startup method and its locality.
         saved[..4].copy_from_slice(&9u32.to_be_bytes());
+        {
+            let at = position_of_firmware_secret(&saved);
+            let len = 2 + u16::from_be_bytes([saved[at], saved[at + 1]]) as usize;
+            saved.drain(at..at + len);
+        }
         let sessions_at = saved.len() - (4 + 8 + 8);
         saved.drain(sessions_at - 2..sessions_at);
 
@@ -2505,9 +2572,14 @@ mod tests {
         older.shutdown_type = crate::tpm::constants::su::STATE;
         let mut v7 = older.save().unwrap();
         v7[..4].copy_from_slice(&7u32.to_be_bytes());
+        // Version 7 wrote no Firmware Secret, no TPMA_STARTUP_CLEAR and none of
+        // the two octets after it, and named whole PCR banks.
+        {
+            let at = position_of_firmware_secret(&v7);
+            let len = 2 + u16::from_be_bytes([v7[at], v7[at + 1]]) as usize;
+            v7.drain(at..at + len);
+        }
         let sessions_at = v7.len() - (4 + 8 + 8);
-        // Version 7 wrote neither TPMA_STARTUP_CLEAR nor the two octets after
-        // it, and named whole PCR banks.
         v7.drain(sessions_at - 6..sessions_at);
         {
             let banks = config::DEFAULT_PCR_BANKS.len() as u32;

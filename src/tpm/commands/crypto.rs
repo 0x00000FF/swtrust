@@ -73,7 +73,7 @@ fn hash_ticket(
     if hierarchy == rh::NULL || !safe {
         return Ok(Ticket::null(st::HASHCHECK));
     }
-    let proof = state.hierarchy_proof(hierarchy)?.to_vec();
+    let proof = state.hierarchy_proof(hierarchy)?;
     let hmac = mac::hmac_parts(
         config::CONTEXT_INTEGRITY_HASH_ALG,
         &proof,
@@ -890,7 +890,7 @@ pub fn verify_signature(state: &TpmState, request: &Request) -> TpmResult<Respon
     let ticket = if hierarchy == rh::NULL {
         VerifiedTicket::null()
     } else {
-        let proof = state.hierarchy_proof(hierarchy)?.to_vec();
+        let proof = state.hierarchy_proof(hierarchy)?;
         let hmac = verified_ticket_hmac(
             &proof,
             st::VERIFIED,

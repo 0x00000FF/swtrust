@@ -233,8 +233,16 @@ impl Tpm {
     }
 
     /// Write the non-volatile state out, saying whether it reached the file.
+    /// A write that failed once stops the rest. Part 1 clause 36.2 has the TPM
+    /// "disable the NV so that the affected NV locations cannot be accessed"
+    /// when it cannot recover from a write failure: writing later would make
+    /// the change the caller was told had failed permanent after all, and
+    /// power off, an ACT rollover and the debug console all write too.
     pub fn persist(&self) -> bool {
         let state = self.locked();
+        if state.nv_write_failed {
+            return false;
+        }
         match state.save() {
             Ok(bytes) => match self.store.save(&bytes) {
                 Ok(()) => true,
@@ -360,6 +368,16 @@ impl Device for Tpm {
                 let mut state = self.locked();
                 state.nv_available = false;
                 state.nv_write_failed = true;
+                // What the command changed is in memory and not in the file,
+                // and clause 36.2 wants an error to leave the TPM as though the
+                // command had not been received. Undoing it in place is not
+                // possible here, so nothing is allowed to observe it: Part 1
+                // clause 12.3 leaves a TPM in failure mode answering nothing
+                // but the commands that report the failure, and the next
+                // _TPM_Init reads the file again.
+                state.failure_mode = true;
+                state.self_test_done = false;
+                state.test_failure = Some("nv write".to_string());
             }
             self.logger
                 .line("NV is no longer available: the state could not be written");

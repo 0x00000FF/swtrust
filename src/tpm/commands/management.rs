@@ -778,8 +778,8 @@ fn tpm_properties(state: &TpmState, property: u32) -> Vec<TaggedProperty> {
         TaggedProperty::new(pt::NV_BUFFER_MAX, config::MAX_NV_BUFFER_SIZE as u32),
         TaggedProperty::new(pt::MODES, ModesAttributes(0).0),
         TaggedProperty::new(pt::MAX_CAP_BUFFER, config::MAX_CAP_BUFFER as u32),
-        TaggedProperty::new(pt::FIRMWARE_SVN, 0),
-        TaggedProperty::new(pt::FIRMWARE_MAX_SVN, 0),
+        TaggedProperty::new(pt::FIRMWARE_SVN, config::FIRMWARE_SVN),
+        TaggedProperty::new(pt::FIRMWARE_MAX_SVN, config::FIRMWARE_MAX_SVN),
         TaggedProperty::new(pt::ML_PARAMETER_SETS, 0),
         // Variable properties.
         TaggedProperty::new(pt::PERMANENT, permanent_attributes(state).0),

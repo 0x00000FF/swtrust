@@ -82,7 +82,7 @@ fn obfuscated(
     };
     let value = crate::tpm::crypto::hmac::kdfa(
         name_alg,
-        state.hierarchy_proof(rh::OWNER)?,
+        &state.hierarchy_proof(rh::OWNER)?,
         "OBFUSCATE",
         qualified_name,
         &[],

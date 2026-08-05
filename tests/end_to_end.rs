@@ -6015,3 +6015,89 @@ fn a_command_that_writes_nv_is_refused_while_nv_is_away() {
     assert_eq!(extend(), rc::SUCCESS, "NV did not come back");
     assert_ne!(counter(), before);
 }
+
+
+/// Part 1 clause 41.6: "Firmware-limited and SVN-limited hierarchies are
+/// referred to by reserved permanent handles. Each such hierarchy has an
+/// associated base hierarchy (which specifies a primary seed and proof value)
+/// and additional secret entropy", and Equation 57 derives the seed and the
+/// proof from both.
+#[test]
+fn a_firmware_limited_hierarchy_makes_keys_of_its_own() {
+    let h = Harness::started("fwhierarchy");
+
+    let primary = |hierarchy: u32| -> Answer {
+        let template = storage_template();
+        let mut p = Writer::new();
+        p.u16(4);
+        p.u16(0);
+        p.u16(0);
+        p.u16(template.len() as u16);
+        p.bytes(&template);
+        p.u16(0);
+        p.u32(0);
+        h.send(&command(
+            st::SESSIONS,
+            cc::CreatePrimary,
+            &[hierarchy],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ))
+    };
+    let public_of = |r: &Answer| -> Vec<u8> {
+        let mut rd = Reader::new(&r.body);
+        let _handle = rd.u32().unwrap();
+        let _param_size = rd.u32().unwrap();
+        let n = rd.u16().unwrap() as usize;
+        rd.take(n).unwrap().to_vec()
+    };
+
+    // Part 2 Table 59 puts the firmware-limited handles in TPMI_RH_HIERARCHY,
+    // so TPM2_CreatePrimary takes one.
+    let owner = primary(rh::OWNER);
+    assert_eq!(owner.code, rc::SUCCESS, "CreatePrimary(owner) -> {:08x}", owner.code);
+    let fw = primary(rh::FW_OWNER);
+    assert_eq!(fw.code, rc::SUCCESS, "CreatePrimary(fw owner) -> {:08x}", fw.code);
+    let svn = primary(hc::SVN_OWNER_FIRST);
+    assert_eq!(svn.code, rc::SUCCESS, "CreatePrimary(svn owner) -> {:08x}", svn.code);
+
+    // Each hierarchy has a seed of its own, so the same template gives three
+    // different keys.
+    let (a, b, c) = (public_of(&owner), public_of(&fw), public_of(&svn));
+    assert_ne!(a, b, "the firmware-limited key repeats the owner key");
+    assert_ne!(a, c, "the SVN-limited key repeats the owner key");
+    assert_ne!(b, c, "the two limited keys are the same key");
+
+    // And the derivation is stable: the same handle gives the same key again.
+    assert_eq!(public_of(&primary(rh::FW_OWNER)), b, "the derivation is not stable");
+
+    // A version above the one this firmware reports names no hierarchy.
+    let above = primary(hc::SVN_OWNER_FIRST + 1);
+    assert_eq!(
+        above.code,
+        rc::VALUE | 0x080 | (1 << 8),
+        "an SVN above the firmware's own was accepted -> {:08x}",
+        above.code
+    );
+
+    // Part 1 clause 41.5: an object of such a hierarchy cannot be made
+    // persistent, because that "would remove the protection of its
+    // (firmware- or SVN-limited) object hierarchy in the case of a TPM
+    // firmware update".
+    let handle = Reader::new(&fw.body).u32().unwrap();
+    let mut p = Writer::new();
+    p.u32(0x8100_0020);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::EvictControl,
+        &[rh::OWNER, handle],
+        Some(&password_sessions(1)),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::ATTRIBUTES | 0x080 | (2 << 8),
+        "a firmware-limited object was made persistent -> {:08x}",
+        r.code
+    );
+}

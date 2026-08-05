@@ -247,7 +247,12 @@ pub fn create_primary(state: &mut TpmState, request: &Request) -> TpmResult<Resp
     let creation_pcr = TpmlPcrSelection::unmarshal(&mut r).map_err(|e| e.with_parameter(4))?;
     r.expect_end()?;
 
-    if !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(primary_handle) {
+    // Part 2 Table 59 gives TPMI_RH_HIERARCHY the four base hierarchies and the
+    // firmware-limited and SVN-limited ones of Part 1 clause 41, whose seeds
+    // are derived rather than stored.
+    if !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(primary_handle)
+        && !crate::tpm::core::hierarchy::Hierarchies::is_limited(primary_handle)
+    {
         return Err(TpmRc(rc::VALUE).with_handle(1));
     }
     if !state.hierarchies.is_enabled(primary_handle) {
@@ -256,7 +261,7 @@ pub fn create_primary(state: &mut TpmState, request: &Request) -> TpmResult<Resp
     let template = in_public.public_area;
     object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
 
-    let seed = state.hierarchies.get(primary_handle)?.seed.clone();
+    let seed = state.hierarchies.seed_of(primary_handle)?;
     let context = primary_context(&template, &in_sensitive)?;
     let name_alg = if template.name_alg == alg::NULL {
         alg::SHA256
@@ -810,12 +815,15 @@ pub fn create_loaded(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     object::validate_creation_template(&template).map_err(|e| e.with_parameter(2))?;
 
     // A hierarchy handle makes this a Primary Object; anything else makes it
-    // an ordinary child that is created and loaded in one step.
-    if crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(parent_handle) {
+    // an ordinary child that is created and loaded in one step. Part 2 Table 59
+    // counts the firmware-limited and SVN-limited hierarchies among the first.
+    if crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(parent_handle)
+        || crate::tpm::core::hierarchy::Hierarchies::is_limited(parent_handle)
+    {
         if !state.hierarchies.is_enabled(parent_handle) {
             return Err(TpmRc(rc::HIERARCHY).with_handle(1));
         }
-        let seed = state.hierarchies.get(parent_handle)?.seed.clone();
+        let seed = state.hierarchies.seed_of(parent_handle)?;
         let context = primary_context(&template, &in_sensitive)?;
         let name_alg = if template.name_alg == alg::NULL {
             alg::SHA256

@@ -85,6 +85,15 @@ pub const NV_CLOCK_UPDATE_INTERVAL: u32 = 1 << 17;
 /// nothing that uses Clock has to allow for it wrapping.
 pub const MAX_CLOCK: u64 = 0xFFFF_0000_0000_0000;
 
+/// The security version number this firmware reports, TPM_PT_FIRMWARE_SVN.
+///
+/// Part 1 clause 41.4 has a bootloader latch the version of the firmware it
+/// started, and an SVN-limited hierarchy above that version names a firmware
+/// this one is not. A build of this TPM is one firmware image at one version.
+pub const FIRMWARE_SVN: u32 = 0;
+/// The highest version this firmware could reach, TPM_PT_FIRMWARE_MAX_SVN.
+pub const FIRMWARE_MAX_SVN: u32 = 0;
+
 /// Size of a primary seed in octets.
 pub const PRIMARY_SEED_SIZE: usize = 32;
 /// Hash that protects a saved context, and the tickets built the same way.

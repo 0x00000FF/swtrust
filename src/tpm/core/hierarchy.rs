@@ -73,7 +73,8 @@ impl Hierarchy {
     }
 }
 
-/// The four hierarchies of Part 1 clause 9.
+/// The four hierarchies of Part 1 clause 9, and the limited ones clause 41
+/// derives from them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hierarchies {
     pub platform: Hierarchy,
@@ -84,6 +85,16 @@ pub struct Hierarchies {
     pub null: Hierarchy,
     /// phEnableNV, which gates NV Indices created by the platform.
     pub platform_nv_enabled: bool,
+    /// The Firmware Secret of Part 1 Table 43.
+    ///
+    /// Clause 41.6 gives every firmware-limited and SVN-limited hierarchy a
+    /// seed and a proof "derived from the base hierarchy's primary seed / proof
+    /// value, as well as the additional secret". On a TPM whose firmware is
+    /// measured and latched by a bootloader that secret comes from the
+    /// hardware; here it is drawn at manufacture and kept with the rest of the
+    /// state, so a firmware-limited key is reproducible for as long as this
+    /// build is the firmware and useless once the state is remade.
+    pub firmware_secret: Vec<u8>,
 }
 
 impl Hierarchies {
@@ -95,7 +106,135 @@ impl Hierarchies {
             endorsement: Hierarchy::new(rng)?,
             null: Hierarchy::new(rng)?,
             platform_nv_enabled: true,
+            firmware_secret: rng.bytes(config::PRIMARY_SEED_SIZE)?,
         })
+    }
+
+    /// The base hierarchy of a firmware-limited or SVN-limited handle.
+    ///
+    /// Part 1 Table 43 pairs each limited hierarchy with the one whose seed and
+    /// proof it is derived from.
+    pub fn base_of(handle: u32) -> Option<u32> {
+        use crate::tpm::constants::hc;
+
+        Some(match handle {
+            rh::FW_OWNER => rh::OWNER,
+            rh::FW_ENDORSEMENT => rh::ENDORSEMENT,
+            rh::FW_PLATFORM => rh::PLATFORM,
+            rh::FW_NULL => rh::NULL,
+            h if (hc::SVN_OWNER_FIRST..=hc::SVN_OWNER_LAST).contains(&h) => rh::OWNER,
+            h if (hc::SVN_ENDORSEMENT_FIRST..=hc::SVN_ENDORSEMENT_LAST).contains(&h) => {
+                rh::ENDORSEMENT
+            }
+            h if (hc::SVN_PLATFORM_FIRST..=hc::SVN_PLATFORM_LAST).contains(&h) => rh::PLATFORM,
+            h if (hc::SVN_NULL_FIRST..=hc::SVN_NULL_LAST).contains(&h) => rh::NULL,
+            _ => return None,
+        })
+    }
+
+    /// The security version number an SVN-limited handle names.
+    pub fn svn_of(handle: u32) -> Option<u32> {
+        use crate::tpm::constants::hc;
+
+        for first in [
+            hc::SVN_OWNER_FIRST,
+            hc::SVN_ENDORSEMENT_FIRST,
+            hc::SVN_PLATFORM_FIRST,
+            hc::SVN_NULL_FIRST,
+        ] {
+            if (first..=first + 0xFFFF).contains(&handle) {
+                return Some(handle - first);
+            }
+        }
+        None
+    }
+
+    /// True when `handle` names a firmware-limited or SVN-limited hierarchy
+    /// this TPM has.
+    ///
+    /// The example in clause 41.4 has the hardware "reject the request if
+    /// requestedSvn is > LATCHED_FW_SVN", so a version above the one this
+    /// firmware reports names no hierarchy.
+    pub fn is_limited(handle: u32) -> bool {
+        if Self::base_of(handle).is_none() {
+            return false;
+        }
+        match Self::svn_of(handle) {
+            Some(svn) => svn <= config::FIRMWARE_SVN,
+            None => true,
+        }
+    }
+
+    /// The additional secret of Table 43, and the label that tells the two
+    /// kinds of limited hierarchy apart.
+    fn additional_secret(&self, handle: u32) -> TpmResult<(Vec<u8>, &'static str)> {
+        match Self::svn_of(handle) {
+            // Clause 41.4: the bootloader derives an SVN secret from its own
+            // secret and hashes it down once for each version below the
+            // maximum, so a lower version can be reached from a higher one and
+            // not the other way about.
+            Some(svn) => {
+                let mut secret = crate::tpm::crypto::hmac::kdfa(
+                    config::CONTEXT_INTEGRITY_HASH_ALG,
+                    &self.firmware_secret,
+                    "SVN_SECRET",
+                    &[],
+                    &[],
+                    (config::PRIMARY_SEED_SIZE * 8) as u32,
+                )?;
+                for _ in svn..=config::FIRMWARE_MAX_SVN {
+                    secret = crate::tpm::crypto::hash::digest(
+                        config::CONTEXT_INTEGRITY_HASH_ALG,
+                        &secret,
+                    )?;
+                }
+                Ok((secret, "H_SVN_SECRET"))
+            }
+            None => Ok((self.firmware_secret.clone(), "H_FW_SECRET")),
+        }
+    }
+
+    /// The Primary Seed of a hierarchy, derived when the handle is a limited
+    /// one.
+    pub fn seed_of(&self, handle: u32) -> TpmResult<Vec<u8>> {
+        self.derive(handle, "H_SEED_SECRET", |h| &h.seed)
+    }
+
+    /// The proof value of a hierarchy, derived when the handle is a limited
+    /// one.
+    pub fn proof_of(&self, handle: u32) -> TpmResult<Vec<u8>> {
+        self.derive(handle, "H_PROOF_SECRET", |h| &h.proof)
+    }
+
+    /// Part 1 Equation 57: `value := KDFa(hashAlg, bSecret, bSecretLabel,
+    /// aSecret, aSecretLabel, bits)`, where bSecret is the seed or proof of the
+    /// base hierarchy and aSecret the Firmware or Firmware SVN Secret. The
+    /// labels are the ones the note beside the equation says the Reference Code
+    /// uses.
+    fn derive(
+        &self,
+        handle: u32,
+        base_label: &str,
+        pick: impl Fn(&Hierarchy) -> &Vec<u8>,
+    ) -> TpmResult<Vec<u8>> {
+        if let Ok(h) = self.get(handle) {
+            return Ok(pick(h).clone());
+        }
+        let base = Self::base_of(handle).ok_or(TpmRc(rc::VALUE))?;
+        if !Self::is_limited(handle) {
+            return Err(TpmRc(rc::VALUE));
+        }
+        let (additional, additional_label) = self.additional_secret(handle)?;
+        let mut context_v = additional_label.as_bytes().to_vec();
+        context_v.push(0);
+        crate::tpm::crypto::hmac::kdfa(
+            config::CONTEXT_INTEGRITY_HASH_ALG,
+            pick(self.get(base)?),
+            base_label,
+            &additional,
+            &context_v,
+            (config::PRIMARY_SEED_SIZE * 8) as u32,
+        )
     }
 
     /// The hierarchy a permanent handle names.
@@ -130,7 +269,13 @@ impl Hierarchies {
             rh::PLATFORM | rh::OWNER | rh::ENDORSEMENT => {
                 self.get(handle).map(|h| h.enabled).unwrap_or(false)
             }
-            _ => false,
+            // A limited hierarchy is a derivation of its base, so it is there
+            // exactly while the base is: Part 1 Table 43 pairs each one with
+            // the hierarchy its seed and proof come from.
+            h => match Self::base_of(h) {
+                Some(base) if Self::is_limited(h) => self.is_enabled(base),
+                _ => false,
+            },
         }
     }
 

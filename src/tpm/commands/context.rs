@@ -33,7 +33,7 @@ fn context_encryption(
     sequence: u64,
     saved_handle: u32,
 ) -> TpmResult<(Vec<u8>, Vec<u8>)> {
-    let proof = state.hierarchy_proof(hierarchy)?.to_vec();
+    let proof = state.hierarchy_proof(hierarchy)?;
     let key_octets = config::CONTEXT_ENCRYPT_KEY_BITS as usize / 8;
     let iv_octets = sym::block_size(config::CONTEXT_ENCRYPT_ALG)?;
     let material = mac::kdfa(
@@ -93,7 +93,7 @@ fn seal_context(
     // the hierarchy is already what the key is.
     let integrity = mac::hmac_parts(
         config::CONTEXT_INTEGRITY_HASH_ALG,
-        state.hierarchy_proof(hierarchy)?,
+        &state.hierarchy_proof(hierarchy)?,
         &[
             &context_counters(state, saved_handle),
             &sequence.to_be_bytes(),
@@ -118,7 +118,7 @@ fn open_context(state: &mut TpmState, context: &Context) -> TpmResult<Vec<u8>> {
         .map_err(|_| TpmRc(rc::BAD_CONTEXT).with_parameter(1))?;
     let expected = mac::hmac_parts(
         config::CONTEXT_INTEGRITY_HASH_ALG,
-        state.hierarchy_proof(context.hierarchy)?,
+        &state.hierarchy_proof(context.hierarchy)?,
         &[
             &context_counters(state, context.saved_handle),
             &context.sequence.to_be_bytes(),
@@ -543,7 +543,13 @@ pub fn evict_control(state: &mut TpmState, request: &Request) -> TpmResult<Respo
     // when only the public portion of the object was loaded (for NV space
     // efficiency). Support for persisting public-only objects was added in
     // version 185."
-    if object.hierarchy == rh::NULL {
+    if object.hierarchy == rh::NULL
+        || crate::tpm::core::hierarchy::Hierarchies::is_limited(object.hierarchy)
+    {
+        // Part 1 clause 41.5 gives the reason for the second: "persisting a
+        // firmware-limited (or SVN-limited) object would remove the protection
+        // of its (firmware- or SVN-limited) object hierarchy in the case of a
+        // TPM firmware update."
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
     }
     // Rule 2: "the TPM shall return TPM_RC_HIERARCHY if the object is not in

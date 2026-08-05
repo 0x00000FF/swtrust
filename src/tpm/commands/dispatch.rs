@@ -261,8 +261,16 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
     // Part 1 clause 16.8.1 leaves every permanent entity other than
     // TPM_RH_LOCKOUT out of dictionary attack protection, because their
     // authorization values are expected to be high entropy or well known.
-    if crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(handle) {
-        let h = state.hierarchies.get(handle)?;
+    // A firmware-limited or SVN-limited hierarchy has no authorization of its
+    // own: Part 2 Table 61 keeps TPMI_RH_HIERARCHY_AUTH to the base
+    // hierarchies and lockout, so what authorizes the base authorizes the
+    // derivation of it.
+    let authorizing = crate::tpm::core::hierarchy::Hierarchies::is_limited(handle)
+        .then(|| crate::tpm::core::hierarchy::Hierarchies::base_of(handle))
+        .flatten()
+        .unwrap_or(handle);
+    if crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(authorizing) {
+        let h = state.hierarchies.get(authorizing)?;
         return Ok(Entity {
             name,
             auth: h.auth.clone(),

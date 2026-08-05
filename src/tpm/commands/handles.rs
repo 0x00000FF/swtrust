@@ -328,7 +328,16 @@ pub fn allows(handle_spec: Handle, handle: u32) -> bool {
         Kind::Provision => handle == rh::OWNER || handle == rh::PLATFORM,
         Kind::Clear => handle == rh::LOCKOUT || handle == rh::PLATFORM,
         Kind::Lockout => handle == rh::LOCKOUT,
-        Kind::Hierarchy => hierarchy(handle) || handle == rh::NULL,
+        // Part 2 Table 59 gives TPMI_RH_HIERARCHY the four base hierarchies and
+        // the firmware-limited and SVN-limited ones of Part 1 clause 41, which
+        // TPM2_CreatePrimary and TPM2_CreateLoaded name to make an object no
+        // other firmware can reproduce. TPMI_RH_BASE_HIERARCHY, which Part 2
+        // Table 60 keeps to the first three, is the type that does not.
+        Kind::Hierarchy => {
+            hierarchy(handle)
+                || handle == rh::NULL
+                || crate::tpm::core::hierarchy::Hierarchies::is_limited(handle)
+        }
         Kind::HierarchyAuth => hierarchy(handle) || handle == rh::LOCKOUT,
         // Part 2 Table 62 puts the ACT handles in TPMI_RH_HIERARCHY_POLICY, so
         // TPM2_SetPrimaryPolicy can give a timer the policy of its own that
