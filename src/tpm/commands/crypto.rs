@@ -457,6 +457,11 @@ pub fn sequence_complete(state: &mut TpmState, request: &Request) -> TpmResult<R
         return Err(TpmRc(rc::MODE).with_handle(1));
     }
     let mut data = sequence.buffer.clone();
+    // The buffer this command carries is the first one when no
+    // TPM2_SequenceUpdate came before it, and clause 17.8.1 judges the first
+    // buffer whichever command delivered it.
+    let short_first_buffer =
+        sequence.short_first_buffer || (sequence.buffer.is_empty() && buffer.len() < 4);
     data.extend_from_slice(buffer.as_slice());
 
     let (digest, ticket) = match &sequence.kind {
@@ -465,7 +470,7 @@ pub fn sequence_complete(state: &mut TpmState, request: &Request) -> TpmResult<R
             // Part 3 clause 17.8.1 makes a sequence whose first buffer was
             // shorter than sizeof(TPM_GENERATED) unsafe to sign whatever the
             // message turned out to begin with.
-            let t = if sequence.may_be_safe_to_sign() {
+            let t = if !short_first_buffer {
                 hash_ticket(state, hierarchy, *hash_alg, &data, &d)?
             } else {
                 Ticket::null(st::HASHCHECK)

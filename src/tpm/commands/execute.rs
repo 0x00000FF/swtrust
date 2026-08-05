@@ -51,8 +51,16 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     // command need it only "when the handle associated with the authorization
     // is TPM_RH_PLATFORM", so a command that several hierarchies may authorize
     // is gated on the one the caller named.
+    // The platform handle is not always the first: TPM2_NV_UndefineSpaceSpecial
+    // names the Index first and the platform second, and both carry
+    // authorization.
+    let auth_handles = request.info.auth_handles as usize;
     let listed = state.pp_commands.contains(&request.code)
-        && request.handles.first() == Some(&crate::tpm::constants::rh::PLATFORM);
+        && request
+            .handles
+            .iter()
+            .take(auth_handles)
+            .any(|h| *h == crate::tpm::constants::rh::PLATFORM);
     if (request.code == cc::PP_Commands || listed) && !state.physical_presence {
         return Err(TpmRc(rc::PP));
     }
@@ -764,25 +772,34 @@ mod tests {
     }
 
     #[test]
-    fn only_the_handle_types_the_clause_names_may_be_gated() {
-        // "Only commands with handle types of TPMI_RH_PLATFORM,
-        // TPMI_RH_PROVISION, TPMI_RH_CLEAR, or TPMI_RH_HIERARCHY can be gated
-        // with Physical Presence. If any other command is in either list, it
-        // is discarded."
+    fn only_the_commands_the_schematics_mark_may_be_gated() {
+        // Part 3 clause 4.2.5: TPM_RH_PLATFORM+{PP} says "Physical Presence
+        // may be required when platformAuth/platformPolicy is provided. The
+        // commands with this notation may be in the setList or clearList of
+        // TPM2_PP_Commands()."
         use crate::tpm::commands::management::is_pp_eligible;
 
-        assert!(is_pp_eligible(cc::PP_Commands), "TPMI_RH_PLATFORM");
-        assert!(is_pp_eligible(cc::ChangePPS), "TPMI_RH_PLATFORM");
-        assert!(is_pp_eligible(cc::NV_DefineSpace), "TPMI_RH_PROVISION");
-        assert!(is_pp_eligible(cc::Clear), "TPMI_RH_CLEAR");
-        assert!(is_pp_eligible(cc::ClearControl), "TPMI_RH_CLEAR");
-        assert!(is_pp_eligible(cc::CreatePrimary), "TPMI_RH_HIERARCHY");
+        for code in [
+            cc::PP_Commands,
+            cc::ChangePPS,
+            cc::NV_DefineSpace,
+            cc::Clear,
+            cc::ClearControl,
+            cc::CreatePrimary,
+            cc::CreateLoaded,
+            cc::HierarchyChangeAuth,
+            cc::SetPrimaryPolicy,
+            cc::NV_UndefineSpaceSpecial,
+            cc::SetCommandCodeAuditStatus,
+            cc::PCR_Allocate,
+            cc::ClockSet,
+        ] {
+            assert!(is_pp_eligible(code), "{code:#010x} carries +{{PP}}");
+        }
 
-        // TPMI_RH_HIERARCHY_AUTH and TPMI_RH_HIERARCHY_POLICY are types of
-        // their own, which the clause does not name.
-        assert!(!is_pp_eligible(cc::HierarchyChangeAuth));
-        assert!(!is_pp_eligible(cc::SetPrimaryPolicy));
-        // A command with no handle at all, and one this TPM does not have.
+        // A command whose schematic has no such notation, one with no handle
+        // at all, and one this TPM does not have.
+        assert!(!is_pp_eligible(cc::NV_Read));
         assert!(!is_pp_eligible(cc::GetRandom));
         assert!(!is_pp_eligible(0x2000_0000));
     }

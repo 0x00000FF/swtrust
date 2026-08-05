@@ -569,8 +569,10 @@ mod tests {
         };
 
         // Wait for both listeners to come up, then ask the TPM to stop.
+        // Two seconds is not always enough on a loaded machine, and the point
+        // of the test is what serve() does once the listener is up.
         let mut client = None;
-        for _ in 0..200 {
+        for _ in 0..3000 {
             if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
                 client = Some(s);
                 break;

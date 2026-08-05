@@ -612,7 +612,15 @@ fn handles_in_range(state: &TpmState, property: u32) -> Vec<u32> {
         // TPM_HT_SAVED_SESSION, the saved contexts "for which the TPM is
         // maintaining tracking information".
         ht::HMAC_SESSION => state.sessions.loaded_handles(),
-        ht::POLICY_SESSION => state.sessions.saved_handles(),
+        // "If saved sessions are requested, all returned values will have the
+        // TPM_HT_HMAC_SESSION handle type because the TPM does not track the
+        // session type of saved sessions."
+        ht::POLICY_SESSION => state
+            .sessions
+            .saved_handles()
+            .into_iter()
+            .map(|h| (h & 0x00FF_FFFF) | ((ht::HMAC_SESSION as u32) << hc::HR_SHIFT))
+            .collect(),
         ht::PERMANENT => permanent_handles(),
         ht::TRANSIENT => state.objects.handles(),
         ht::PERSISTENT => state.persistent.keys().copied().collect(),
@@ -865,24 +873,46 @@ pub fn is_implemented_command(code: u32) -> bool {
 
 /// Commands that may be given physical presence, used by TPM2_PP_Commands.
 ///
-/// Part 3 clause 26.2.1: "Only commands with handle types of
-/// TPMI_RH_PLATFORM, TPMI_RH_PROVISION, TPMI_RH_CLEAR, or TPMI_RH_HIERARCHY
-/// can be gated with Physical Presence. If any other command is in either
-/// list, it is discarded." The handle table is the authority on which those
-/// are, so a command added to this TPM is covered without a second list to
-/// keep in step. A command this TPM does not implement cannot be selected.
+/// Part 3 clause 4.2.5 defines the notation that says so: "This modifier may
+/// follow TPM_RH_PLATFORM to indicate that Physical Presence may be required
+/// when platformAuth/platformPolicy is provided. The commands with this
+/// notation may be in the setList or clearList of TPM2_PP_Commands()." The
+/// list below is every command whose schematic carries TPM_RH_PLATFORM+{PP},
+/// which is narrower than the handle types clause 26.2.1 names and is the
+/// authority where the two disagree. A command this TPM does not implement
+/// cannot be selected.
 pub fn is_pp_eligible(code: u32) -> bool {
-    use crate::tpm::commands::handles::Kind;
+    use crate::tpm::constants::cc;
 
     if !is_implemented_command(code) {
         return false;
     }
-    let Some(handle) = crate::tpm::commands::handles::kind(code, 0) else {
-        return false;
-    };
     matches!(
-        handle.kind,
-        Kind::Platform | Kind::Provision | Kind::Clear | Kind::Hierarchy
+        code,
+        cc::CreateLoaded
+            | cc::SetCommandCodeAuditStatus
+            | cc::PCR_Allocate
+            | cc::PCR_SetAuthPolicy
+            | cc::CreatePrimary
+            | cc::HierarchyControl
+            | cc::SetPrimaryPolicy
+            | cc::ChangePPS
+            | cc::ChangeEPS
+            | cc::Clear
+            | cc::ClearControl
+            | cc::HierarchyChangeAuth
+            | cc::ReadOnlyControl
+            | cc::FieldUpgradeStart
+            | cc::EvictControl
+            | cc::ClockSet
+            | cc::ClockRateAdjust
+            | cc::SetCapability
+            | cc::NV_DefineSpace
+            | cc::NV_DefineSpace2
+            | cc::NV_UndefineSpace
+            | cc::NV_UndefineSpaceSpecial
+            | cc::NV_GlobalWriteLock
+            | cc::PP_Commands
     )
 }
 

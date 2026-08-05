@@ -372,6 +372,12 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
         if !state.hierarchies.is_enabled(object.hierarchy) {
             return Err(TpmRc(rc::HIERARCHY));
         }
+        // The same rule as for a transient object: clause 5.6.1 needs both
+        // halves to authorize, because the authValue lives in the sensitive
+        // area. TPM2_EvictControl can make a public area persistent.
+        if object.is_public_only() {
+            return Err(TpmRc(rc::AUTH_UNAVAILABLE));
+        }
         return Ok(Entity {
             name,
             auth: object.auth_value().to_vec(),
@@ -1552,6 +1558,13 @@ pub fn close_sessions(state: &mut TpmState, request: &Request) {
         }
         if !input.attributes.has(SessionAttributes::CONTINUE_SESSION) {
             let _ = state.sessions.remove(input.handle);
+            // Part 1 clause 17.7: a session "is no longer the current
+            // exclusive audit session if it is flushed", and clause 19.6 has a
+            // session with continueSession CLEAR closed at the end of the
+            // command just as TPM2_FlushContext would.
+            if state.audit.exclusive_session == input.handle {
+                state.audit.exclusive_session = rh::UNASSIGNED;
+            }
             continue;
         }
         // Part 1 clause 17.1 drops the binding of a session that audits, from

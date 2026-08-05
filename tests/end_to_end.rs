@@ -5565,3 +5565,89 @@ fn a_tpm_in_failure_mode_answers_only_a_command_without_sessions() {
     let r = h.send(&command(st::NO_SESSIONS, cc::GetRandom, &[], None, &[0, 8]));
     assert_eq!(r.code, rc::FAILURE);
 }
+
+
+/// Part 3 clause 17.8.1: "Regardless of the contents of the first octets of the
+/// hashed message, if the first buffer sent to the TPM had fewer than
+/// sizeof(TPM_GENERATED) octets, then the TPM will operate as if digest is not
+/// safe to sign."
+#[test]
+fn a_sequence_whose_first_buffer_was_short_gets_no_ticket() {
+    let h = Harness::started("shortfirst");
+
+    let start = || -> u32 {
+        let mut p = Writer::new();
+        p.u16(0); // auth
+        p.u16(alg::SHA256);
+        // The command names no handle, so it carries no authorization.
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::HashSequenceStart,
+            &[],
+            None,
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "HashSequenceStart -> {:08x}", r.code);
+        Reader::new(&r.body).u32().unwrap()
+    };
+    let update = |handle: u32, data: &[u8]| {
+        let mut p = Writer::new();
+        p.u16(data.len() as u16);
+        p.bytes(data);
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::SequenceUpdate,
+            &[handle],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "SequenceUpdate -> {:08x}", r.code);
+    };
+    // The ticket is the second response parameter, after the digest.
+    let complete = |handle: u32, data: &[u8]| -> Vec<u8> {
+        let mut p = Writer::new();
+        p.u16(data.len() as u16);
+        p.bytes(data);
+        p.u32(rh::OWNER);
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::SequenceComplete,
+            &[handle],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "SequenceComplete -> {:08x}", r.code);
+        let mut rd = Reader::new(&r.body);
+        let _param_size = rd.u32().unwrap();
+        let n = rd.u16().unwrap() as usize;
+        rd.take(n).unwrap();
+        rd.rest().to_vec()
+    };
+
+    // A long first buffer that does not begin with TPM_GENERATED_VALUE: the
+    // digest is safe to sign and the ticket carries a digest of its own.
+    let s = start();
+    update(s, b"a long enough first buffer");
+    let ticket = complete(s, b"the rest");
+    let hmac = u16::from_be_bytes([ticket[6], ticket[7]]);
+    assert_ne!(hmac, 0, "a safe digest was given a null ticket");
+
+    // The same message, delivered with a short first buffer.
+    let s = start();
+    update(s, b"a l");
+    let ticket = complete(s, b"ong enough first bufferthe rest");
+    assert_eq!(
+        u16::from_be_bytes([ticket[6], ticket[7]]),
+        0,
+        "a short first buffer was still called safe to sign"
+    );
+
+    // And when the completion carries the only buffer there was.
+    let s = start();
+    let ticket = complete(s, b"abc");
+    assert_eq!(
+        u16::from_be_bytes([ticket[6], ticket[7]]),
+        0,
+        "a sequence with one short buffer was called safe to sign"
+    );
+}
