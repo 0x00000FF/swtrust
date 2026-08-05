@@ -259,6 +259,14 @@ impl Device for Tpm {
         let elapsed = self.elapsed();
         let (response, clock_rolled_over) = {
             let mut state = self.locked();
+            // Part 1 clause 31.1: "During an H-CRTM sequence, if any indication
+            // other the _TPM_Hash_Data occurs between the _TPM_Hash_Start and
+            // _TPM_Hash_End indications (including receipt of a command), then
+            // the H-CRTM Event Sequence is abandoned, the H-CRTM Event Sequence
+            // context is flushed, and no change to any PCR occurs." Dropping
+            // the buffer here is what makes the _TPM_Hash_End that may still
+            // arrive measure nothing.
+            state.hcrtm_buffer = None;
             // The time that passed since the last command is credited before
             // the command runs, so a command that reports the clock or reads
             // the countdown timer sees the value it should.
@@ -361,6 +369,9 @@ impl Device for Tpm {
     fn hash_start(&self) {
         self.established.store(true, Ordering::SeqCst);
         let mut state = self.locked();
+        // "There is only one _TPM_Hash_Start per H-CRTM Event Sequence", and
+        // clause 31.1 abandons a sequence on any other indication, so a second
+        // one starts over rather than adding to what came before.
         state.hcrtm_buffer = Some(Vec::new());
     }
 

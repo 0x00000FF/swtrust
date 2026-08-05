@@ -1696,6 +1696,46 @@ fn an_rsa_exponent_is_odd_and_greater_than_two() {
 }
 
 #[test]
+fn a_resume_brings_back_the_pcr_the_platform_preserves() {
+    // Part 3 clause 9.4.1 has TPM2_Shutdown(TPM_SU_STATE) save the PCR the
+    // platform marks preserved along with pcrUpdateCounter, and clause 9.3.3
+    // has the resume put them back. The PC Client profile marks PCR 0 to 15.
+    let h = Harness::started("resumepcr");
+    let mut body = 1u32.to_be_bytes().to_vec();
+    body.extend_from_slice(&alg::SHA256.to_be_bytes());
+    body.extend_from_slice(&[0xab; 32]);
+    let mut p = Writer::new();
+    p.bytes(&body);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::PCR_Extend,
+        &[hc::PCR_FIRST + 8],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "PCR_Extend -> {:08x}", r.code);
+
+    let read = selection(&[(alg::SHA256, &[8])]);
+    let r = h.send(&command(st::NO_SESSIONS, cc::PCR_Read, &[], None, &read));
+    assert_eq!(r.code, rc::SUCCESS);
+    let before = r.body.clone();
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS, "Startup(STATE) -> {:08x}", r.code);
+
+    let r = h.send(&command(st::NO_SESSIONS, cc::PCR_Read, &[], None, &read));
+    assert_eq!(r.code, rc::SUCCESS);
+    assert_eq!(
+        r.body, before,
+        "the resume did not bring the register back"
+    );
+}
+
+#[test]
 fn a_context_of_a_disabled_hierarchy_does_not_load() {
     // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
     // context is associated with a hierarchy that is disabled."
@@ -4671,3 +4711,255 @@ fn load_refuses_an_object_that_can_neither_sign_nor_decrypt() {
     );
 }
 
+
+
+/// Part 3 clause 23.23.1: TPM2_PolicyCapability is an immediate assertion. "The
+/// TPM will use the parameters of this command to fetch the indicated property
+/// that is used by the TPM in the requested logical operation... If the
+/// operands do not have the desired relationship, then the TPM returns
+/// TPM_RC_POLICY."
+#[test]
+fn a_capability_assertion_is_held_to_the_property_the_tpm_reports() {
+    use swtrust::tpm::constants::eo;
+
+    let h = Harness::started("policycap");
+
+    let session = |trial: bool| -> u32 {
+        let mut p = Writer::new();
+        p.u16(16);
+        p.bytes(&[0u8; 16]);
+        p.u16(0);
+        p.u8(if trial { se::TRIAL } else { se::POLICY });
+        p.u16(alg::NULL);
+        p.u16(alg::SHA256);
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::StartAuthSession,
+            &[rh::NULL, rh::NULL],
+            None,
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+        u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]])
+    };
+
+    let assert_capability =
+        |handle: u32, operand: &[u8], offset: u16, operation: u16, capability: u32, property: u32| {
+            let mut p = Writer::new();
+            p.u16(operand.len() as u16);
+            p.bytes(operand);
+            p.u16(offset);
+            p.u16(operation);
+            p.u32(capability);
+            p.u32(property);
+            h.send(&command(
+                st::NO_SESSIONS,
+                cc::PolicyCapability,
+                &[handle],
+                None,
+                &p.finish().unwrap(),
+            ))
+        };
+
+    // The manufacturer this TPM reports, read the way the example beside
+    // Table 184 reads TPM_PT_REVISION: TPMS_TAGGED_PROPERTY is the property and
+    // then the value, so an offset of 4 reaches the value.
+    let s = session(false);
+    let r = assert_capability(s, b"SWT ", 4, eo::EQ, cap::TPM_PROPERTIES, pt::MANUFACTURER);
+    assert_eq!(r.code, rc::SUCCESS, "the manufacturer did not match -> {:08x}", r.code);
+
+    // The same property with a value the TPM does not have.
+    let r = assert_capability(s, b"XXXX", 4, eo::EQ, cap::TPM_PROPERTIES, pt::MANUFACTURER);
+    assert_eq!(r.code, rc::POLICY, "an assertion that is false was allowed");
+
+    // And the tag of the structure itself, which sits at offset zero.
+    let r = assert_capability(
+        s,
+        &pt::MANUFACTURER.to_be_bytes(),
+        0,
+        eo::EQ,
+        cap::TPM_PROPERTIES,
+        pt::MANUFACTURER,
+    );
+    assert_eq!(r.code, rc::SUCCESS, "the property tag did not match -> {:08x}", r.code);
+
+    // A property the TPM does not have: refused, "unless the operation is
+    // TPM_EO_NEQ".
+    let absent = 0x0000_7fffu32;
+    let r = assert_capability(s, &[0, 0, 0, 0], 0, eo::EQ, cap::TPM_PROPERTIES, absent);
+    assert_eq!(r.code, rc::POLICY, "a property that does not exist was compared");
+    let r = assert_capability(s, &[0, 0, 0, 0], 0, eo::NEQ, cap::TPM_PROPERTIES, absent);
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "TPM_EO_NEQ was refused a property that does not exist -> {:08x}",
+        r.code
+    );
+
+    // "If property is other than a value listed above, then the TPM returns
+    // TPM_RC_VALUE", and the example names TPM_CAP_PCRS.
+    let r = assert_capability(s, &[0, 0, 0, 0], 0, eo::EQ, cap::PCRS, 0);
+    assert_eq!(
+        r.code,
+        rc::VALUE | 0x080 | 0x040 | (4 << 8),
+        "TPM_CAP_PCRS was accepted -> {:08x}",
+        r.code
+    );
+
+    // An offset that reaches past the property structure has no operandA.
+    let r = assert_capability(s, &[0, 0, 0, 0], 6, eo::EQ, cap::TPM_PROPERTIES, pt::MANUFACTURER);
+    assert_eq!(
+        r.code,
+        rc::VALUE | 0x080 | 0x040 | (2 << 8),
+        "an offset past the structure was accepted -> {:08x}",
+        r.code
+    );
+
+    // "This command may be used with a trial policy", which computes the digest
+    // without holding the assertion to this TPM.
+    let t = session(true);
+    let r = assert_capability(t, b"XXXX", 4, eo::EQ, cap::TPM_PROPERTIES, pt::MANUFACTURER);
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "a trial policy was held to the assertion -> {:08x}",
+        r.code
+    );
+
+    // The digest a trial session reaches is the one the real session has, so a
+    // policy built with a trial can be satisfied by the assertion itself.
+    let digest = |handle: u32| -> Vec<u8> {
+        let r = h.send(&command(st::NO_SESSIONS, cc::PolicyGetDigest, &[handle], None, &[]));
+        assert_eq!(r.code, rc::SUCCESS);
+        r.body[2..].to_vec()
+    };
+    let t2 = session(true);
+    let r = assert_capability(t2, b"SWT ", 4, eo::EQ, cap::TPM_PROPERTIES, pt::MANUFACTURER);
+    assert_eq!(r.code, rc::SUCCESS);
+    let s2 = session(false);
+    let r = assert_capability(s2, b"SWT ", 4, eo::EQ, cap::TPM_PROPERTIES, pt::MANUFACTURER);
+    assert_eq!(r.code, rc::SUCCESS);
+    assert_eq!(
+        digest(t2),
+        digest(s2),
+        "a trial policy and a real one reached different digests"
+    );
+}
+
+
+/// Part 3 clauses 23.13.1, 23.14.1, 23.21.1 and 23.24.1: only one of a bound
+/// session, TPM2_PolicyCpHash, TPM2_PolicyNameHash, TPM2_PolicyParameters and
+/// TPM2_PolicyTemplate "can be used for a policy session. Because they are
+/// mutually exclusive, they can share policySession->cpHash."
+#[test]
+fn the_assertions_that_share_the_cp_hash_exclude_one_another() {
+    let h = Harness::started("cphashslot");
+
+    let session = || -> u32 {
+        let mut p = Writer::new();
+        p.u16(16);
+        p.bytes(&[0u8; 16]);
+        p.u16(0);
+        p.u8(se::TRIAL);
+        p.u16(alg::NULL);
+        p.u16(alg::SHA256);
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::StartAuthSession,
+            &[rh::NULL, rh::NULL],
+            None,
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+        u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]])
+    };
+
+    let digest = |code: u32, handle: u32, value: &[u8]| -> u32 {
+        let mut p = Writer::new();
+        p.u16(value.len() as u16);
+        p.bytes(value);
+        h.send(&command(
+            st::NO_SESSIONS,
+            code,
+            &[handle],
+            None,
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+
+    let a = [0xaau8; 32];
+    let b = [0xbbu8; 32];
+    let sharing = [
+        cc::PolicyCpHash,
+        cc::PolicyNameHash,
+        cc::PolicyParameters,
+        cc::PolicyTemplate,
+    ];
+    for first in sharing {
+        for second in sharing {
+            let s = session();
+            assert_eq!(digest(first, s, &a), rc::SUCCESS, "{first:08x} was refused");
+            let expected = if first == second && first == cc::PolicyTemplate {
+                // Clause 23.21.1 answers a second templateHash that differs
+                // with TPM_RC_VALUE rather than TPM_RC_CPHASH.
+                rc::VALUE | 0x080 | 0x040 | (1 << 8)
+            } else {
+                rc::CPHASH
+            };
+            assert_eq!(
+                digest(second, s, &b),
+                expected,
+                "{first:08x} then {second:08x} shared the slot"
+            );
+        }
+    }
+
+    // Repeating TPM2_PolicyCpHash with the same value is allowed, which the
+    // note in clause 23.13.1 calls a policy expression that is probably
+    // improperly formed rather than an error.
+    let s = session();
+    assert_eq!(digest(cc::PolicyCpHash, s, &a), rc::SUCCESS);
+    assert_eq!(
+        digest(cc::PolicyCpHash, s, &a),
+        rc::SUCCESS,
+        "the same cpHashA twice was refused"
+    );
+    assert_eq!(
+        digest(cc::PolicyCpHash, s, &b),
+        rc::CPHASH,
+        "a second cpHashA replaced the first"
+    );
+
+    // The same for TPM2_PolicyTemplate, which the clause reads the same way.
+    let s = session();
+    assert_eq!(digest(cc::PolicyTemplate, s, &a), rc::SUCCESS);
+    assert_eq!(
+        digest(cc::PolicyTemplate, s, &a),
+        rc::SUCCESS,
+        "the same templateHash twice was refused"
+    );
+
+    // A session bound to an entity has already used the slot.
+    let mut p = Writer::new();
+    p.u16(16);
+    p.bytes(&[0u8; 16]);
+    p.u16(0);
+    p.u8(se::TRIAL);
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::OWNER],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+    let bound = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+    assert_eq!(
+        digest(cc::PolicyCpHash, bound, &a),
+        rc::CPHASH,
+        "a bound policy session took a cpHash as well"
+    );
+}

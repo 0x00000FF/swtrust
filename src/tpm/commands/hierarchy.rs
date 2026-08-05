@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn a_maximum_of_zero_tries_puts_the_tpm_in_lockout() {
         let mut state = TpmState::manufacture().unwrap();
-        state.on_startup_clear().unwrap();
+        state.on_startup_clear(0).unwrap();
 
         // Part 3 clause 25.3.1 accepts zero and reads it as lockout, rather
         // than refusing it.
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn physical_presence_discards_a_command_it_cannot_gate() {
         let mut state = TpmState::manufacture().unwrap();
-        state.on_startup_clear().unwrap();
+        state.on_startup_clear(0).unwrap();
         state.physical_presence = true;
 
         // TPM2_Clear can be gated, TPM2_GetRandom cannot. Part 3 clause

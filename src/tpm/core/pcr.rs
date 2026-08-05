@@ -357,17 +357,21 @@ impl PcrBanks {
 
     /// Set every register in every bank to its reset value.
     ///
-    /// This is what TPM2_Startup(CLEAR) does.
+    /// This is what TPM2_Startup(CLEAR) from locality zero does.
     pub fn reset_all(&mut self) {
-        self.reset_all_but(None);
+        self.reset_all_but(None, 0);
     }
 
     /// Reset every register but the one an H-CRTM sequence has already set.
     ///
     /// Part 1 clause 31.3: "if PCR[0] is initialized by an H-CRTM event before
     /// TPM2_Startup(), then TPM2_Startup(TPM_SU_CLEAR) will not change the
-    /// value of PCR[0]."
-    pub fn reset_all_but(&mut self, keep: Option<u16>) {
+    /// value of PCR[0]. Otherwise, TPM2_Startup(TPM_SU_CLEAR) will set PCR[0]
+    /// to the locality of the TPM2_Startup() command."
+    ///
+    /// The note in Part 3 clause 9.3.2 leaves pcrUpdateCounter alone here, so
+    /// the registers are written rather than extended or set by command.
+    pub fn reset_all_but(&mut self, keep: Option<u16>, startup_locality: u8) {
         for (alg, bank) in self.banks.iter_mut() {
             let size = digest_size(*alg).unwrap_or(0);
             for (index, reg) in bank.iter_mut().enumerate() {
@@ -379,7 +383,13 @@ impl PcrBanks {
                 } else {
                     0x00
                 };
-                *reg = vec![fill; size];
+                let mut value = vec![fill; size];
+                if index as u16 == config::HCRTM_PCR {
+                    if let Some(last) = value.last_mut() {
+                        *last = startup_locality;
+                    }
+                }
+                *reg = value;
             }
         }
     }
@@ -394,13 +404,29 @@ impl PcrBanks {
     /// registers that start at ones are exactly those, so no locality is
     /// checked here: the sequence itself is the authority.
     pub fn drtm_reset(&mut self) {
+        let mut changed = false;
         for (alg, bank) in self.banks.iter_mut() {
             let size = digest_size(*alg).unwrap_or(0);
             for (index, reg) in bank.iter_mut().enumerate() {
-                if attributes(index as u16).starts_at_ones {
-                    *reg = vec![0u8; size];
+                if !attributes(index as u16).starts_at_ones {
+                    continue;
+                }
+                let zero = vec![0u8; size];
+                if *reg != zero {
+                    *reg = zero;
+                    if !no_increment(index as u16) {
+                        changed = true;
+                    }
                 }
             }
+        }
+        // Part 2 clause 10.10.3 has pcrUpdateCounter "incremented each time a
+        // PCR is modified", and this event modifies them. A change made outside
+        // a startup has to move the counter, or a policy that was bound to the
+        // registers as they were would still be satisfied by what the sequence
+        // put there.
+        if changed {
+            self.update_counter = self.update_counter.wrapping_add(1);
         }
     }
 

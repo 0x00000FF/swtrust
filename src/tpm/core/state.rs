@@ -27,6 +27,10 @@ use super::session::SessionSlots;
 /// it is still read rather than being thrown away: a TPM whose state a caller
 /// depends on should not lose it because this build learned a new field.
 ///
+/// Version 10 wrote the H-CRTM startup method of the last TPM2_Startup and the
+/// locality it came from, which Part 3 clause 9.3.3 and Part 1 clause 31.3
+/// compare a resume against.
+///
 /// Version 9 wrote which registers of each bank are allocated, which Part 1
 /// clause 14.8 chooses per register rather than per bank.
 ///
@@ -52,7 +56,9 @@ use super::session::SessionSlots;
 /// It was never released, so version 1 means the layout that came before the
 /// byte and nothing else. A file of the other shape can only have been written
 /// by a developer running that build, and is not one this reads.
-const STATE_VERSION: u32 = 9;
+const STATE_VERSION: u32 = 10;
+/// Version 9 did not record which startup method the last TPM2_Startup used.
+const STATE_VERSION_WITHOUT_HCRTM_METHOD: u32 = 9;
 /// Version 8 named whole PCR banks where Part 1 clause 14.8 allocates per
 /// register.
 const STATE_VERSION_WITHOUT_PCR_BITS: u32 = 8;
@@ -78,6 +84,7 @@ const FIRST_WITH_OBJECT_COUNTER: u32 = 6;
 const FIRST_WITH_COUNTER_FLOOR: u32 = 7;
 const FIRST_WITH_STARTUP_CLEAR: u32 = 8;
 const FIRST_WITH_PCR_BITS: u32 = 9;
+const FIRST_WITH_HCRTM_METHOD: u32 = 10;
 /// Version 3 did not record which session contexts had been saved.
 const STATE_VERSION_WITHOUT_SESSIONS: u32 = 3;
 /// Version 2 recorded the profile but not the clearCount of Part 1 Equation 52.
@@ -441,6 +448,19 @@ pub struct TpmState {
     /// Part 1 clause 31.3 leaves that register alone at the startup which
     /// follows, and sets it to the locality of the command otherwise.
     pub hcrtm_before_startup: bool,
+    /// Whether the previous TPM2_Startup followed an H-CRTM sequence.
+    ///
+    /// Part 3 clause 9.3.3 requires of a TPM Resume that "the H-CRTM startup
+    /// method is the same for this TPM2_Startup() as for the previous
+    /// TPM2_Startup()", answering TPM_RC_LOCALITY otherwise, so the method the
+    /// last one used goes with the saved state.
+    pub hcrtm_at_last_startup: bool,
+    /// The locality the last TPM2_Startup came from.
+    ///
+    /// Part 1 clause 31.3 sets PCR 0 from it when no H-CRTM sequence ran, and
+    /// holds a TPM Resume to the locality the TPM2_Startup(TPM_SU_CLEAR) before
+    /// it used.
+    pub startup_locality: u8,
     /// Set by the running command to keep itself out of the command audit.
     ///
     /// Part 3 clause 21.1 audits TPM2_SetCommandCodeAuditStatus except when it
@@ -508,6 +528,8 @@ impl TpmState {
             rng,
             hcrtm_buffer: None,
             hcrtm_before_startup: false,
+            hcrtm_at_last_startup: false,
+            startup_locality: 0,
             command_audit_suppressed: false,
         })
     }
@@ -519,7 +541,7 @@ impl TpmState {
     /// the same volatile state; they differ in which of the two reset counters
     /// moves, and a Reset that followed no shutdown at all also has to repair
     /// the NV data that only lived in RAM.
-    pub fn on_startup_clear(&mut self) -> TpmResult<()> {
+    pub fn on_startup_clear(&mut self, locality: u8) -> TpmResult<()> {
         let restart = self.shutdown_type == su::STATE;
         let disorderly = self.shutdown_type == su::NONE;
         // Taken before the counters below are raised, because it asks what the
@@ -533,7 +555,13 @@ impl TpmState {
         // Part 1 clause 31.3 keeps PCR 0 when an H-CRTM sequence set it before
         // this startup, and puts every other register back to its reset value.
         let keep = self.hcrtm_before_startup.then_some(config::HCRTM_PCR);
-        self.pcr.reset_all_but(keep);
+        // The same clause: "Otherwise, TPM2_Startup(TPM_SU_CLEAR) will set
+        // PCR[0] to the locality of the TPM2_Startup() command." A platform
+        // that starts from locality 3 leaves PCR 0 saying so, which is what the
+        // TCG log records beside it as a startup locality event.
+        self.pcr.reset_all_but(keep, locality);
+        self.hcrtm_at_last_startup = self.hcrtm_before_startup;
+        self.startup_locality = locality;
         self.hcrtm_before_startup = false;
         // The allocation is put in place at _TPM_Init, which Part 3 clause
         // 22.5.1 names as the moment a stored request takes effect, and which
@@ -646,8 +674,17 @@ impl TpmState {
     /// Clause 22.9.1 lets an H-CRTM sequence measure into PCR 0 before
     /// TPM2_Startup arrives, so the banks have to be the new ones by then.
     pub fn on_init(&mut self) -> TpmResult<()> {
-        self.pcr.allocate(&self.pcr_allocation.clone())?;
+        // Only a request that differs from what the banks hold is applied.
+        // Rebuilding them resets every register, and Part 3 clause 9.4.1 has
+        // TPM2_Shutdown(TPM_SU_STATE) save the PCR the platform preserves so
+        // that the resume which follows can put them back.
+        if self.pcr.allocation() != self.pcr_allocation {
+            self.pcr.allocate(&self.pcr_allocation.clone())?;
+        }
         self.hcrtm_before_startup = false;
+        // _TPM_Init is an indication too, and Part 1 clause 31.1 abandons a
+        // sequence that any of them interrupts.
+        self.hcrtm_buffer = None;
         self.pcr_allocation_pending = false;
         Ok(())
     }
@@ -656,7 +693,21 @@ impl TpmState {
     ///
     /// The saved state is already loaded, so only the volatile pieces that a
     /// Resume still discards are cleared.
-    pub fn on_startup_state(&mut self) -> TpmResult<()> {
+    pub fn on_startup_state(&mut self, locality: u8) -> TpmResult<()> {
+        // Clause 9.3.3 of the same part requires of a resume that "the H-CRTM
+        // startup method is the same for this TPM2_Startup() as for the
+        // previous TPM2_Startup()", and answers TPM_RC_LOCALITY when it is not.
+        if self.hcrtm_before_startup != self.hcrtm_at_last_startup {
+            return Err(TpmRc(rc::LOCALITY));
+        }
+        // Part 1 clause 31.3 adds that without one "the
+        // TPM2_Startup(TPM_SU_STATE) must have the same locality as the
+        // previous TPM2_Startup(TPM_SU_CLEAR)", while with one the two
+        // localities are not compared.
+        if !self.hcrtm_before_startup && locality != self.startup_locality {
+            return Err(TpmRc(rc::LOCALITY));
+        }
+        self.hcrtm_before_startup = false;
         // Part 3 clause 9.3.3: on any TPM2_Startup "all transient contexts
         // (objects, sessions, and sequences) shall be flushed from TPM
         // memory". A resume restores what was saved, not what was loaded, and
@@ -899,6 +950,10 @@ impl TpmState {
         // Part 1 clause 42.2 keeps Read-Only mode across a TPM Resume, which
         // goes through this file, so the attributes go with it.
         w.u32(self.startup_clear.0);
+        // Part 3 clause 9.3.3 compares the startup method of a resume with the
+        // one before it, and a resume passes through this file.
+        w.u8(u8::from(self.hcrtm_at_last_startup));
+        w.u8(self.startup_locality);
 
         // Part 1 clause 27.5 keeps a saved session context across a TPM Restart
         // and a TPM Resume, and both of those go through a power cycle, so the
@@ -924,6 +979,7 @@ impl TpmState {
         if !matches!(
             version,
             STATE_VERSION
+                | STATE_VERSION_WITHOUT_HCRTM_METHOD
                 | STATE_VERSION_WITHOUT_PCR_BITS
                 | STATE_VERSION_WITHOUT_STARTUP_CLEAR
                 | STATE_VERSION_WITHOUT_COUNTER_FLOOR
@@ -1204,6 +1260,10 @@ impl TpmState {
         if version >= FIRST_WITH_STARTUP_CLEAR && !r.is_empty() {
             state.startup_clear =
                 crate::tpm::structures::attributes::StartupClearAttributes(r.u32()?);
+            if version >= FIRST_WITH_HCRTM_METHOD {
+                state.hcrtm_at_last_startup = r.u8()? != 0;
+                state.startup_locality = r.u8()?;
+            }
         }
 
         // Part 1 clause 27.5 keeps a saved session context across a TPM Restart
@@ -1348,7 +1408,7 @@ mod tests {
         s.lockout.recovery_time = 10;
         s.lockout.failed_tries = 1;
         s.lockout.next_recovery = 900_000; // far into the epoch that just ended
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert_eq!(s.lockout.next_recovery, 10_000, "the deadline was not rebased");
         s.advance_time(10_000);
         assert_eq!(s.lockout.failed_tries, 0);
@@ -1362,7 +1422,7 @@ mod tests {
         // state file, so the mode has to be in it.
         use crate::tpm::structures::attributes::StartupClearAttributes;
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.startup_clear = StartupClearAttributes(
             s.startup_clear.0 | StartupClearAttributes::READ_ONLY,
         );
@@ -1374,14 +1434,14 @@ mod tests {
             back.startup_clear.has(StartupClearAttributes::READ_ONLY),
             "the record did not carry the mode"
         );
-        back.on_startup_state().unwrap();
+        back.on_startup_state(0).unwrap();
         assert!(
             back.startup_clear.has(StartupClearAttributes::READ_ONLY),
             "a resume left the mode"
         );
 
         let mut back = TpmState::load(&saved).unwrap();
-        back.on_startup_clear().unwrap();
+        back.on_startup_clear(0).unwrap();
         assert!(
             !back.startup_clear.has(StartupClearAttributes::READ_ONLY),
             "a restart kept the mode"
@@ -1402,7 +1462,7 @@ mod tests {
 
         let mut back = TpmState::load(&saved).unwrap();
         assert!(back.lockout.in_lockout, "the record did not carry it");
-        back.on_startup_clear().unwrap();
+        back.on_startup_clear(0).unwrap();
         assert!(back.lockout.in_lockout, "the startup ended it too soon");
         assert_eq!(back.lockout.lockout_until, 5_000, "it was left without a deadline");
         back.advance_time(5_000);
@@ -1416,14 +1476,14 @@ mod tests {
         let mut s = TpmState::manufacture().unwrap();
         s.lockout.lockout_recovery = 0;
         s.lockout.in_lockout = true;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(!s.lockout.in_lockout, "a startup did not end it");
 
         // With an interval it starts again against the new Time instead.
         let mut s = TpmState::manufacture().unwrap();
         s.lockout.lockout_recovery = 5;
         s.lockout.in_lockout = true;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(s.lockout.in_lockout, "a startup ended it too soon");
         assert_eq!(s.lockout.lockout_until, 5_000);
     }
@@ -1468,7 +1528,7 @@ mod tests {
     #[test]
     fn startup_clear_enables_every_hierarchy_and_advances_the_reset_count() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(s.started);
         assert_eq!(s.clock.reset_count, 1);
         assert_eq!(s.clock.total_reset_count, 1);
@@ -1482,10 +1542,10 @@ mod tests {
     #[test]
     fn startup_state_advances_the_restart_count_only() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         let resets = s.clock.reset_count;
         s.shutdown_type = su::STATE;
-        s.on_startup_state().unwrap();
+        s.on_startup_state(0).unwrap();
         assert_eq!(s.clock.reset_count, resets);
         assert_eq!(s.clock.restart_count, 1);
     }
@@ -1493,19 +1553,19 @@ mod tests {
     #[test]
     fn a_startup_clear_after_a_state_shutdown_is_a_restart() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert_eq!(s.clock.reset_count, 1);
 
         // TPM Restart keeps the reset count and moves the restart count.
         s.shutdown_type = su::STATE;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert_eq!(s.clock.reset_count, 1);
         assert_eq!(s.clock.total_reset_count, 1);
         assert_eq!(s.clock.restart_count, 1);
 
         // TPM Reset moves the reset count and puts the restart count back.
         s.shutdown_type = su::CLEAR;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert_eq!(s.clock.reset_count, 2);
         assert_eq!(s.clock.total_reset_count, 2);
         assert_eq!(s.clock.restart_count, 0);
@@ -1515,12 +1575,12 @@ mod tests {
     fn the_orderly_bit_follows_the_previous_shutdown() {
         let mut s = TpmState::manufacture().unwrap();
         // A fresh TPM has seen no shutdown at all.
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(!s.startup_clear.has(StartupClearAttributes::ORDERLY));
         assert_eq!(s.shutdown_type, su::NONE);
 
         s.shutdown_type = su::CLEAR;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(s.startup_clear.has(StartupClearAttributes::ORDERLY));
 
         // A write to RAM backed NV data puts the bit back down.
@@ -1531,7 +1591,7 @@ mod tests {
     #[test]
     fn a_resume_keeps_the_resume_pcr_and_resets_the_rest() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.pcr
             .extend(0, 0, &[(alg::SHA256, vec![1u8; 32])])
             .unwrap();
@@ -1542,7 +1602,7 @@ mod tests {
         assert!(s.pcr.read(alg::SHA256, 23).unwrap().iter().any(|v| *v != 0));
 
         s.shutdown_type = su::STATE;
-        s.on_startup_state().unwrap();
+        s.on_startup_state(0).unwrap();
         // PCR 0 is a Resume PCR, so it keeps its value.
         assert_eq!(s.pcr.read(alg::SHA256, 0).unwrap(), saved);
         // PCR 23 is not, so it goes back to its initial value.
@@ -1559,7 +1619,7 @@ mod tests {
     #[test]
     fn a_resume_keeps_the_nv_locks_that_a_reset_would_drop() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
 
         let mut public = crate::tpm::structures::nv::NvPublic {
             nv_index: hc::NV_INDEX_FIRST,
@@ -1590,34 +1650,34 @@ mod tests {
 
         // A TPM Resume leaves the lock alone.
         s.shutdown_type = su::STATE;
-        s.on_startup_state().unwrap();
+        s.on_startup_state(0).unwrap();
         assert!(s.nv.get(hc::NV_INDEX_FIRST).unwrap().read_locked);
 
         // A TPM Reset drops it.
         s.shutdown_type = su::CLEAR;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(!s.nv.get(hc::NV_INDEX_FIRST).unwrap().read_locked);
     }
 
     #[test]
     fn the_command_audit_digest_survives_a_restart_but_not_a_reset() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.audit.digest = vec![7u8; 32];
 
         s.shutdown_type = su::STATE;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert_eq!(s.audit.digest, vec![7u8; 32], "a TPM Restart keeps it");
 
         s.shutdown_type = su::CLEAR;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(s.audit.digest.is_empty(), "a TPM Reset drops it");
     }
 
     #[test]
     fn the_pcr_values_survive_a_save_and_load() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.pcr
             .extend(0, 0, &[(alg::SHA256, vec![3u8; 32])])
             .unwrap();
@@ -1633,7 +1693,7 @@ mod tests {
     #[test]
     fn the_shutdown_type_survives_a_save_and_load() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.shutdown_type = su::STATE;
         let saved = s.save().unwrap();
         let loaded = TpmState::load(&saved).unwrap();
@@ -1643,7 +1703,7 @@ mod tests {
     #[test]
     fn a_startup_updates_the_pcr_counter_only_when_the_registers_change() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.pcr
             .extend(0, 0, &[(alg::SHA256, vec![1u8; 32])])
             .unwrap();
@@ -1651,12 +1711,12 @@ mod tests {
 
         // A TPM Resume keeps the registers, so the counter carries over.
         s.shutdown_type = su::STATE;
-        s.on_startup_state().unwrap();
+        s.on_startup_state(0).unwrap();
         assert_eq!(s.pcr.update_counter(), 1);
 
         // A TPM Reset puts the registers back, so the counter starts again.
         s.shutdown_type = su::CLEAR;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert_eq!(s.pcr.update_counter(), 0);
     }
 
@@ -1742,14 +1802,14 @@ mod tests {
 
         // The first startup of a TPM that has never been powered reported no
         // Clock at all, so it cannot be behind one and stays safe.
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(s.clock.safe, "the first startup has nothing to be behind");
 
         // Time passes and the TPM loses power without a shutdown.
         s.advance_time(5_000);
         let before = s.clock.clock;
         s.shutdown_type = su::NONE;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(!s.clock.safe, "a startup that was not orderly is not safe");
         // Clause 33.3.1 says Clock is not moved on: "power outages would cause
         // the clock to be advanced to a time in the future and it could not be
@@ -1769,7 +1829,7 @@ mod tests {
     #[test]
     fn a_record_with_a_timer_but_no_started_flag_still_loads() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.act.set_timeout(90);
         let saved = s.save().unwrap();
 
@@ -1788,11 +1848,11 @@ mod tests {
     #[test]
     fn an_orderly_shutdown_leaves_the_clock_safe() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.advance_time(5_000);
         s.shutdown_type = su::CLEAR;
         s.clock.safe = true;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert!(s.clock.safe);
     }
 
@@ -1800,9 +1860,9 @@ mod tests {
     /// timeout, the signal, the policy algorithm and an empty digest.
     const ACT_BLOCK: usize = 4 + 1 + 2 + 2 + 1;
     /// A saved session block with nothing in it: the count and the two
-    /// counters Part 1 clause 27.2.2 keeps apart, with TPMA_STARTUP_CLEAR
-    /// ahead of it.
-    const SESSION_BLOCK: usize = 4 + (4 + 8 + 8);
+    /// counters Part 1 clause 27.2.2 keeps apart, with TPMA_STARTUP_CLEAR and
+    /// the H-CRTM startup method and its locality ahead of it.
+    const SESSION_BLOCK: usize = 4 + 2 + (4 + 8 + 8);
 
     #[test]
     fn a_state_file_without_the_commit_values_still_loads() {
@@ -1928,8 +1988,17 @@ mod tests {
         s.nv.set_counter_floor(0xaabb_ccdd_eeff_0011);
         let current = s.save().unwrap();
 
+        // Version 9 did not write the H-CRTM startup method, which this build
+        // puts between TPMA_STARTUP_CLEAR and the saved session block.
+        let mut v9 = current.clone();
+        v9[..4].copy_from_slice(&9u32.to_be_bytes());
+        let sessions_at = v9.len() - (4 + 8 + 8);
+        v9.drain(sessions_at - 2..sessions_at);
+        let back = TpmState::load(&v9).expect("a version 9 record was refused");
+        assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
+
         // Version 8 named whole banks, without the registers each has.
-        let mut v8 = current.clone();
+        let mut v8 = v9.clone();
         v8[..4].copy_from_slice(&8u32.to_be_bytes());
         {
             // Each entry loses the octet count and the three octets after it.
@@ -2099,10 +2168,11 @@ mod tests {
         s.nv.set_counter_floor(0x1234_5678_9abc_def0);
         s.startup_clear = crate::tpm::structures::attributes::StartupClearAttributes(0x0a0b_0c0d);
         let mut saved = s.save().unwrap();
-        // Version 5 wrote neither TPMA_STARTUP_CLEAR nor the counter mark, and
-        // named whole PCR banks without the registers each has.
+        // Version 5 wrote neither TPMA_STARTUP_CLEAR, the startup method beside
+        // it, nor the counter mark, and named whole PCR banks without the
+        // registers each has.
         let flags_at = position_of(&saved, &0x0a0b_0c0du32.to_be_bytes());
-        saved.drain(flags_at..flags_at + 4);
+        saved.drain(flags_at..flags_at + 6);
         {
             let count_at =
                 position_of(&saved, &(config::DEFAULT_PCR_BANKS.len() as u32).to_be_bytes());
@@ -2151,7 +2221,7 @@ mod tests {
         // measure into PCR 0 before TPM2_Startup arrives. Reallocating at the
         // startup instead would throw that measurement away.
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.pcr_allocation = vec![(alg::SHA256, vec![true; 24])];
 
         // Nothing has happened yet: the banks are the ones in place.
@@ -2167,7 +2237,7 @@ mod tests {
         let measured = s.pcr.read(alg::SHA256, 0).unwrap().to_vec();
         let other = s.pcr.read(alg::SHA256, 8).unwrap().to_vec();
         s.hcrtm_before_startup = true;
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert_eq!(
             s.pcr.read(alg::SHA256, 0).unwrap(),
             &measured[..],
@@ -2182,12 +2252,116 @@ mod tests {
         // Without an H-CRTM sequence the startup resets PCR 0 as well.
         s.pcr.extend_one(alg::SHA256, 0, &[0xab; 32]).unwrap();
         let measured = s.pcr.read(alg::SHA256, 0).unwrap().to_vec();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         assert_ne!(
             s.pcr.read(alg::SHA256, 0).unwrap(),
             &measured[..],
             "PCR 0 was kept without an H-CRTM sequence"
         );
+    }
+
+    #[test]
+    fn a_resume_answers_a_startup_method_that_changed() {
+        // Part 3 clause 9.3.3 requires of a TPM Resume that "the H-CRTM startup
+        // method is the same for this TPM2_Startup() as for the previous
+        // TPM2_Startup(); (TPM_RC_LOCALITY)". A platform that measured into
+        // PCR 0 before the shutdown and not before the resume would otherwise
+        // leave the register holding a measurement of a boot that is over.
+        let mut s = TpmState::manufacture().unwrap();
+        s.hcrtm_before_startup = true;
+        s.on_startup_clear(0).unwrap();
+        let saved = s.save().unwrap();
+
+        // The same method: the resume goes through.
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        back.hcrtm_before_startup = true;
+        back.on_startup_state(0).expect("the same method was refused");
+
+        // A resume with no H-CRTM sequence after one that had it.
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        assert_eq!(
+            back.on_startup_state(0).unwrap_err(),
+            TpmRc(rc::LOCALITY),
+            "a resume took a startup method that differs from the one before it"
+        );
+
+        // And the other way round, from a state saved without one.
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear(0).unwrap();
+        let saved = s.save().unwrap();
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        back.hcrtm_before_startup = true;
+        assert_eq!(
+            back.on_startup_state(0).unwrap_err(),
+            TpmRc(rc::LOCALITY),
+            "a resume took an H-CRTM sequence the shutdown did not have"
+        );
+    }
+
+    #[test]
+    fn a_startup_leaves_its_locality_in_the_first_register() {
+        // Part 1 clause 31.3: "Otherwise, TPM2_Startup(TPM_SU_CLEAR) will set
+        // PCR[0] to the locality of the TPM2_Startup() command." A platform
+        // that runs its startup from locality 3 is saying which root of trust
+        // measured it, and the value in the register is what an attestation
+        // carries out of the TPM.
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear(3).unwrap();
+        let value = s.pcr.read(alg::SHA256, config::HCRTM_PCR).unwrap();
+        assert_eq!(value.last(), Some(&3u8), "the locality did not reach PCR 0");
+        assert!(
+            value[..value.len() - 1].iter().all(|v| *v == 0),
+            "PCR 0 holds more than the locality"
+        );
+
+        // The ordinary case is locality zero, which leaves the register at the
+        // value every other one starts from.
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear(0).unwrap();
+        assert!(
+            s.pcr
+                .read(alg::SHA256, config::HCRTM_PCR)
+                .unwrap()
+                .iter()
+                .all(|v| *v == 0),
+            "a startup from locality zero left something in PCR 0"
+        );
+
+        // Part 3 clause 9.3.2 leaves pcrUpdateCounter alone across a startup,
+        // so writing the locality into the register does not move it.
+        assert_eq!(
+            s.pcr.update_counter(),
+            0,
+            "the startup moved the PCR update counter"
+        );
+
+        // The clause holds a resume to the locality of the startup before it,
+        // when no H-CRTM sequence ran.
+        let saved = s.save().unwrap();
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        assert_eq!(
+            back.on_startup_state(3).unwrap_err(),
+            TpmRc(rc::LOCALITY),
+            "a resume from another locality was allowed"
+        );
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        back.on_startup_state(0).expect("the same locality was refused");
+
+        // With an H-CRTM sequence the two localities are not compared.
+        let mut s = TpmState::manufacture().unwrap();
+        s.hcrtm_before_startup = true;
+        s.on_startup_clear(3).unwrap();
+        let saved = s.save().unwrap();
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        back.hcrtm_before_startup = true;
+        back.on_startup_state(0)
+            .expect("a resume after an H-CRTM sequence was held to the locality");
     }
 
     #[test]
@@ -2357,7 +2531,7 @@ mod tests {
     #[test]
     fn volatile_state_is_not_saved() {
         let mut s = TpmState::manufacture().unwrap();
-        s.on_startup_clear().unwrap();
+        s.on_startup_clear(0).unwrap();
         s.locality = 3;
         s.physical_presence = true;
         let back = TpmState::load(&s.save().unwrap()).unwrap();

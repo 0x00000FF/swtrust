@@ -39,7 +39,7 @@ pub fn startup(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
         return Err(TpmRc(rc::LOCALITY));
     }
     match startup_type {
-        su::CLEAR => state.on_startup_clear()?,
+        su::CLEAR => state.on_startup_clear(request.locality)?,
         su::STATE => {
             // A Startup(STATE) that was not preceded by Shutdown(STATE) has
             // no state to resume, which Part 3 clause 9.3.3 reports as
@@ -47,7 +47,7 @@ pub fn startup(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
             if state.shutdown_type != su::STATE {
                 return Err(TpmRc(rc::VALUE).with_parameter(1));
             }
-            state.on_startup_state()?
+            state.on_startup_state(request.locality)?
         }
         _ => return Err(TpmRc(rc::VALUE).with_parameter(1)),
     }
@@ -360,6 +360,70 @@ pub fn get_capability(state: &TpmState, request: &Request) -> TpmResult<Response
         CapabilityData { data }.marshal(w);
         Ok(())
     })
+}
+
+/// The property structure that TPM2_PolicyCapability compares against.
+///
+/// Part 3 clause 23.23.1 has the TPM "fetch the indicated property that is used
+/// by the TPM in the requested logical operation", takes it as operandA, and
+/// answers TPM_RC_VALUE when the capability is not one of those Table 184
+/// lists. None here is the clause's "the requested TPM property does not
+/// exist", which the caller answers for.
+pub fn capability_property(
+    state: &TpmState,
+    capability: u32,
+    property: u32,
+) -> TpmResult<Option<Vec<u8>>> {
+    // Every capability Table 184 gives a property type. TPM_CAP_PCRS is absent
+    // from it, and the example beside the table says so in as many words.
+    const LISTED: &[u32] = &[
+        cap::ALGS,
+        cap::HANDLES,
+        cap::COMMANDS,
+        cap::PP_COMMANDS,
+        cap::AUDIT_COMMANDS,
+        cap::TPM_PROPERTIES,
+        cap::PCR_PROPERTIES,
+        cap::ECC_CURVES,
+        cap::AUTH_POLICIES,
+        cap::ACT,
+        cap::PUB_KEYS,
+        cap::SPDM_SESSION_INFO,
+        cap::VENDOR_PROPERTY,
+    ];
+    if !LISTED.contains(&capability) {
+        return Err(TpmRc(rc::VALUE).with_parameter(4));
+    }
+
+    // The same collection TPM2_GetCapability answers with, asked for the one
+    // property. Each of those starts at the property named and returns what
+    // follows it, so the first item is the one asked for only when it carries
+    // the same value back.
+    let (_, data) = build_capability(state, capability, property, 1)?;
+    let found = match &data {
+        Capabilities::Algorithms(l) => l.items.first().map(|i| u32::from(i.alg)),
+        Capabilities::Handles(l) => l.items.first().copied(),
+        Capabilities::Command(l) => l.items.first().map(|i| u32::from(i.command_index())),
+        Capabilities::PpCommands(l) => l.items.first().copied(),
+        Capabilities::AuditCommands(l) => l.items.first().copied(),
+        Capabilities::TpmProperties(l) => l.items.first().map(|i| i.property),
+        Capabilities::PcrProperties(l) => l.items.first().map(|i| i.tag),
+        Capabilities::EccCurves(l) => l.items.first().map(|i| u32::from(*i)),
+        Capabilities::AuthPolicies(l) => l.items.first().map(|i| i.handle),
+        Capabilities::Act(l) => l.items.first().map(|i| i.handle),
+        // This TPM has none of these, so no property of theirs exists.
+        _ => None,
+    };
+    if found != Some(property) {
+        return Ok(None);
+    }
+
+    // A list marshals as its count and then its items, and the count is not
+    // part of the property structure the offset reaches into.
+    let mut w = crate::tpm::marshal::Writer::new();
+    data.marshal(&mut w);
+    let octets = w.into_vec();
+    Ok(Some(octets.get(4..).unwrap_or_default().to_vec()))
 }
 
 /// Collect one capability, returning whether more values follow.

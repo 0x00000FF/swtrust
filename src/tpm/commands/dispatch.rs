@@ -2071,7 +2071,7 @@ mod tests {
         // sequence in which the TPM processes authorizations would enable a
         // hammering attack on the Index."
         let mut state = TpmState::manufacture().unwrap();
-        state.on_startup_clear().unwrap();
+        state.on_startup_clear(0).unwrap();
         state.nv.define(pin_index(nt::PIN_PASS, 0, 5)).unwrap();
 
         let mut p = Writer::new();

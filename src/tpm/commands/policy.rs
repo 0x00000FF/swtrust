@@ -816,6 +816,22 @@ pub fn policy_physical_presence(state: &mut TpmState, request: &Request) -> TpmR
     respond(|_| Ok(()))
 }
 
+/// Whether the one slot the mutually exclusive assertions share is taken.
+///
+/// Part 3 clauses 23.13.1, 23.14.1, 23.21.1 and 23.24.1 each say that only one
+/// of a bound session, TPM2_PolicyCpHash, TPM2_PolicyNameHash,
+/// TPM2_PolicyParameters and TPM2_PolicyTemplate "can be used for a policy
+/// session. Because they are mutually exclusive, they can share
+/// policySession->cpHash." This TPM keeps them apart so that each is checked
+/// against what it means, and this is the shared slot they would have used.
+fn shared_cp_hash_taken(s: &Session) -> bool {
+    s.bind != crate::tpm::constants::rh::NULL
+        || s.policy.cp_hash.is_some()
+        || s.policy.name_hash.is_some()
+        || s.policy.parameters_hash.is_some()
+        || s.policy.template_hash.is_some()
+}
+
 /// TPM2_PolicyCpHash, Part 3 clause 23.13.
 pub fn policy_cp_hash(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
@@ -827,10 +843,13 @@ pub fn policy_cp_hash(state: &mut TpmState, request: &Request) -> TpmResult<Resp
     if cp_hash_a.len() != hash::digest_size(s.auth_hash)? {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
-    if let Some(existing) = &s.policy.cp_hash {
-        if existing != cp_hash_a.as_slice() {
-            return Err(TpmRc(rc::CPHASH));
-        }
+    // Clause 23.13.1: "If policySession->cpHash is already set and not the
+    // same as cpHashA, then the TPM shall return TPM_RC_CPHASH", and the note
+    // below it explains that repeating the same value is allowed rather than
+    // being an error the TPM has to report.
+    let same_again = s.policy.cp_hash.as_deref() == Some(cp_hash_a.as_slice());
+    if shared_cp_hash_taken(s) && !same_again {
+        return Err(TpmRc(rc::CPHASH));
     }
     s.extend_policy(cc::PolicyCpHash, cp_hash_a.as_slice())?;
     s.policy.cp_hash = Some(cp_hash_a.as_slice().to_vec());
@@ -848,7 +867,9 @@ pub fn policy_name_hash(state: &mut TpmState, request: &Request) -> TpmResult<Re
     if name_hash.len() != hash::digest_size(s.auth_hash)? {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
-    if s.policy.cp_hash.is_some() {
+    // Clause 23.14.1: "If policySession->cpHash is already set, the TPM shall
+    // return TPM_RC_CPHASH."
+    if shared_cp_hash_taken(s) {
         return Err(TpmRc(rc::CPHASH));
     }
     s.extend_policy(cc::PolicyNameHash, name_hash.as_slice())?;
@@ -921,7 +942,15 @@ pub fn policy_template(state: &mut TpmState, request: &Request) -> TpmResult<Res
     if template_hash.len() != hash::digest_size(s.auth_hash)? {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
-    if s.policy.cp_hash.is_some() {
+    // Clause 23.21.1: "If policySession->isTemplateSet is SET and
+    // policySession->cpHash is not equal to templateHash, the TPM shall return
+    // TPM_RC_VALUE... Otherwise, if policySession->cpHash is already set, the
+    // TPM shall return TPM_RC_CPHASH."
+    if let Some(existing) = &s.policy.template_hash {
+        if existing != template_hash.as_slice() {
+            return Err(TpmRc(rc::VALUE).with_parameter(1));
+        }
+    } else if shared_cp_hash_taken(s) {
         return Err(TpmRc(rc::CPHASH));
     }
     s.extend_policy(cc::PolicyTemplate, template_hash.as_slice())?;
@@ -1126,7 +1155,10 @@ pub fn policy_duplication_select(
         hash::digest_parts(auth_hash, &[object_name.as_slice(), new_parent_name.as_slice()])?;
 
     let s = policy_session(state, handle)?;
-    if s.policy.cp_hash.is_some() {
+    // Clause 23.15.1: "If either policySession->cpHash or
+    // policySession->nameHash has been previously set, the TPM shall return
+    // TPM_RC_CPHASH", and the note below it puts the two in the same memory.
+    if s.policy.cp_hash.is_some() || s.policy.name_hash.is_some() {
         return Err(TpmRc(rc::CPHASH));
     }
     let mut data = Vec::new();
@@ -1219,6 +1251,43 @@ pub fn policy_capability(state: &mut TpmState, request: &Request) -> TpmResult<R
     let property = r.u32().map_err(|e| e.with_parameter(5))?;
     r.expect_end()?;
 
+    // Part 3 clause 23.23.1: "The TPM will use the parameters of this command
+    // to fetch the indicated property that is used by the TPM in the requested
+    // logical operation." The capability that names no property structure is
+    // answered inside the fetch, with TPM_RC_VALUE.
+    let fetched =
+        crate::tpm::commands::management::capability_property(state, capability, property)?;
+    let satisfied = match &fetched {
+        Some(structure) => {
+            // "The TPM will perform the indicated logical operation (operation)
+            // using the property structure as operandA", starting at offset.
+            let end = (offset as usize).saturating_add(operand_b.len());
+            let Some(operand_a) = structure.get(offset as usize..end) else {
+                return Err(TpmRc(rc::VALUE).with_parameter(2));
+            };
+            compare(operand_a, operand_b.as_slice(), operation)
+                .ok_or(TpmRc(rc::VALUE).with_parameter(3))?
+        }
+        // "If the requested TPM property does not exist, the TPM will return
+        // TPM_RC_POLICY unless the operation is TPM_EO_NEQ." A property that is
+        // not there differs from every value it could be asked about.
+        None => {
+            // An operation that is not one of the TPM_EO is still refused,
+            // whether or not the property it would have been applied to is
+            // there. Two operands of the same length settle that on their own.
+            if compare(&[], &[], operation).is_none() {
+                return Err(TpmRc(rc::VALUE).with_parameter(3));
+            }
+            operation == crate::tpm::constants::eo::NEQ
+        }
+    };
+    // "If the operands do not have the desired relationship, then the TPM
+    // returns TPM_RC_POLICY." A trial session computes the digest a real one
+    // would reach without holding the assertion to the TPM it is running on.
+    if !satisfied && !policy_session(state, handle)?.is_trial() {
+        return Err(TpmRc(rc::POLICY));
+    }
+
     let auth_hash = policy_session(state, handle)?.auth_hash;
     let args = hash::digest_parts(
         auth_hash,
@@ -1245,6 +1314,11 @@ pub fn policy_parameters(state: &mut TpmState, request: &Request) -> TpmResult<R
     let s = policy_session(state, handle)?;
     if p_hash.len() != hash::digest_size(s.auth_hash)? {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
+    }
+    // Clause 23.24.1: "If policySession->cpHash is already set, the TPM shall
+    // return TPM_RC_CPHASH."
+    if shared_cp_hash_taken(s) {
+        return Err(TpmRc(rc::CPHASH));
     }
     s.extend_policy(cc::PolicyParameters, p_hash.as_slice())?;
     s.policy.parameters_hash = Some(p_hash.as_slice().to_vec());
@@ -1504,12 +1578,12 @@ mod tests {
     fn every_startup_begins_a_new_time_epoch() {
         let mut state = TpmState::manufacture().unwrap();
         let start = state.clock.time_epoch;
-        state.on_startup_clear().unwrap();
+        state.on_startup_clear(0).unwrap();
         let after_reset = state.clock.time_epoch;
         assert_ne!(after_reset, start);
 
         state.shutdown_type = crate::tpm::constants::su::CLEAR;
-        state.on_startup_clear().unwrap();
+        state.on_startup_clear(0).unwrap();
         assert_ne!(state.clock.time_epoch, after_reset);
 
         // A ticket made in one epoch cannot be recomputed in the next.
@@ -1527,14 +1601,14 @@ mod tests {
             .unwrap()
         };
         let before = hmac(&state);
-        state.on_startup_clear().unwrap();
+        state.on_startup_clear(0).unwrap();
         assert_ne!(hmac(&state), before);
     }
 
     #[test]
     fn a_ticket_leaves_out_the_counters_it_should() {
         let mut state = TpmState::manufacture().unwrap();
-        state.on_startup_clear().unwrap();
+        state.on_startup_clear(0).unwrap();
         state.clock.time = 1000;
 
         let hmac = |timeout: &[u8], with_nonce: bool| {

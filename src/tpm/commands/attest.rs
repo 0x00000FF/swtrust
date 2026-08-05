@@ -641,7 +641,7 @@ mod privacy_tests {
         // the Endorsement or Platform hierarchies", and a null signing key is
         // obfuscated too.
         let mut state = TpmState::manufacture().unwrap();
-        state.on_startup_clear().unwrap();
+        state.on_startup_clear(0).unwrap();
         let plain = clock_info(&state);
 
         let (hidden, firmware) = obfuscated(&state, rh::NULL, &rh::NULL.to_be_bytes()).unwrap();

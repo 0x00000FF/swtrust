@@ -600,3 +600,60 @@ fn the_drtm_and_hcrtm_registers_are_the_ones_the_profile_names() {
     assert_eq!(config::DRTM_PCR, 17);
     assert_eq!(config::HCRTM_PCR, 0);
 }
+
+/// Part 1 clause 31.1: "During an H-CRTM sequence, if any indication other the
+/// _TPM_Hash_Data occurs between the _TPM_Hash_Start and _TPM_Hash_End
+/// indications (including receipt of a command), then the H-CRTM Event Sequence
+/// is abandoned, the H-CRTM Event Sequence context is flushed, and no change to
+/// any PCR occurs."
+#[test]
+fn a_command_between_the_start_and_the_end_abandons_the_sequence() {
+    let h = Harness::new("hcrtm-interrupted");
+
+    let read = |index: u16| -> Vec<u8> {
+        h.tpm
+            .with_state(|s| s.pcr.read(alg::SHA256, index).unwrap().to_vec())
+    };
+    let before = read(17);
+    let restarts_before = h.tpm.with_state(|s| s.clock.restart_count);
+
+    h.tpm.hash_start();
+    h.tpm.hash_data(b"a measurement");
+    // Any command at all, and this one changes nothing on its own.
+    h.send(cc::GetRandom, &8u16.to_be_bytes());
+    h.tpm.hash_end();
+
+    assert_eq!(
+        read(17),
+        before,
+        "a sequence a command interrupted still changed a PCR"
+    );
+    assert_eq!(
+        h.tpm.with_state(|s| s.clock.restart_count),
+        restarts_before,
+        "an abandoned sequence counted as a restart"
+    );
+
+    // The end of an abandoned sequence measures nothing, and the next one
+    // starts from empty rather than from what the first one held.
+    h.tpm.hash_start();
+    h.tpm.hash_data(b"a measurement");
+    h.tpm.hash_end();
+    let measured = read(17);
+    assert_ne!(measured, before, "the sequence after it did not measure");
+
+    // The same data measured by one uninterrupted sequence, from the same
+    // starting point, reaches the same value: nothing of the abandoned one was
+    // carried into it.
+    let again = Harness::new("hcrtm-clean");
+    again.tpm.hash_start();
+    again.tpm.hash_data(b"a measurement");
+    again.tpm.hash_end();
+    assert_eq!(
+        again
+            .tpm
+            .with_state(|s| s.pcr.read(alg::SHA256, 17).unwrap().to_vec()),
+        measured,
+        "the abandoned data was carried into the sequence that followed"
+    );
+}
