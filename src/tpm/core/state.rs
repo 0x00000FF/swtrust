@@ -27,6 +27,9 @@ use super::session::SessionSlots;
 /// it is still read rather than being thrown away: a TPM whose state a caller
 /// depends on should not lose it because this build learned a new field.
 ///
+/// Version 7 wrote the highest value a counter Index has held, which Part 3
+/// clause 31.2 keeps for the lifetime of the TPM.
+///
 /// Version 6 wrote the object context counter beside the session one, which
 /// Part 1 clause 27.2.2 keeps apart.
 ///
@@ -43,7 +46,10 @@ use super::session::SessionSlots;
 /// It was never released, so version 1 means the layout that came before the
 /// byte and nothing else. A file of the other shape can only have been written
 /// by a developer running that build, and is not one this reads.
-const STATE_VERSION: u32 = 6;
+const STATE_VERSION: u32 = 7;
+/// Version 6 did not record how far a counter Index had come before it was
+/// undefined.
+const STATE_VERSION_WITHOUT_COUNTER_FLOOR: u32 = 6;
 /// Version 5 kept one context counter where Part 1 clause 27.2.2 has two.
 const STATE_VERSION_WITHOUT_OBJECT_COUNTER: u32 = 5;
 /// Version 4 counted TPM Resets rather than drawing a value for each one.
@@ -57,6 +63,7 @@ const FIRST_WITH_SESSIONS: u32 = 4;
 const FIRST_WITH_PERSISTENT_STATE_CLEAR: u32 = 4;
 const FIRST_WITH_RESET_VALUE: u32 = 5;
 const FIRST_WITH_OBJECT_COUNTER: u32 = 6;
+const FIRST_WITH_COUNTER_FLOOR: u32 = 7;
 /// Version 3 did not record which session contexts had been saved.
 const STATE_VERSION_WITHOUT_SESSIONS: u32 = 3;
 /// Version 2 recorded the profile but not the clearCount of Part 1 Equation 52.
@@ -718,6 +725,10 @@ impl TpmState {
             w.u32(*c);
         }
 
+        // Part 3 clause 31.2 wants a counter to start past every value an
+        // Index of that Name has held "over the lifetime of the TPM", so the
+        // high water mark outlives the power as well as the Index.
+        w.u64(self.nv.counter_floor());
         w.u32(self.nv.len() as u32);
         for (_, index) in self.nv.iter() {
             index.public.marshal(&mut w);
@@ -799,6 +810,7 @@ impl TpmState {
         if !matches!(
             version,
             STATE_VERSION
+                | STATE_VERSION_WITHOUT_COUNTER_FLOOR
                 | STATE_VERSION_WITHOUT_OBJECT_COUNTER
                 | STATE_VERSION_WITHOUT_RESET_VALUE
                 | STATE_VERSION_WITHOUT_SESSIONS
@@ -912,6 +924,13 @@ impl TpmState {
         let count = bounded_count(&mut r, 512)?;
         state.audit.commands = (0..count).map(|_| r.u32()).collect::<TpmResult<_>>()?;
 
+        // A record from before this was written down knows only the counters
+        // it still holds, which the store works out for itself as they load.
+        let counter_floor = if version >= FIRST_WITH_COUNTER_FLOOR {
+            r.u64()?
+        } else {
+            0
+        };
         let count = bounded_count(&mut r, 4096)?;
         let mut nv = NvStore::new();
         for _ in 0..count {
@@ -928,6 +947,7 @@ impl TpmState {
                 write_locked,
             })?;
         }
+        nv.set_counter_floor(counter_floor);
         state.nv = nv;
 
         let count = bounded_count(&mut r, config::MIN_EVICT_OBJECTS as usize * 64)?;
@@ -1656,10 +1676,24 @@ mod tests {
         s.clock.reset_count = 0x1122_3344;
         s.clock.restart_count = 0x5566_7788;
         s.clock.clear_count = 0x99aa_bbcc;
+        s.nv.set_counter_floor(0xaabb_ccdd_eeff_0011);
         let current = s.save().unwrap();
 
+        // Version 6 did not write the counter high water mark.
+        let mut v6 = current.clone();
+        v6[..4].copy_from_slice(&6u32.to_be_bytes());
+        let floor_at = position_of(&v6, &0xaabb_ccdd_eeff_0011u64.to_be_bytes());
+        v6.drain(floor_at..floor_at + 8);
+        let back = TpmState::load(&v6).expect("a version 6 record was refused");
+        assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
+        assert_eq!(
+            back.nv.counter_floor(),
+            0,
+            "a record with no mark starts without one"
+        );
+
         // Version 5 kept one context counter where there are now two.
-        let mut v5 = current.clone();
+        let mut v5 = v6.clone();
         v5[..4].copy_from_slice(&5u32.to_be_bytes());
         v5.truncate(v5.len() - 8);
         let back = TpmState::load(&v5).expect("a version 5 record was refused");
@@ -1711,6 +1745,14 @@ mod tests {
         v1.remove(4); // the profile byte
         let back = TpmState::load(&v1).expect("a version 1 record was refused");
         assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
+    }
+
+    /// Where a distinctive block of octets sits in a record.
+    fn position_of(saved: &[u8], needle: &[u8]) -> usize {
+        saved
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("the block was not found")
     }
 
     /// Where the clearCount of the clock sits, found by the two counters that
@@ -1773,13 +1815,16 @@ mod tests {
         for _ in 0..100_000 {
             s.sessions.next_object_id();
         }
+        s.nv.set_counter_floor(0x1234_5678_9abc_def0);
         let saved = s.save().unwrap();
 
-        // A version 5 record carried one counter, the one this build keeps for
-        // objects, and nothing else.
+        // A version 5 record carried one context counter, the one this build
+        // keeps for objects, and no counter high water mark.
         let mut v5 = saved.clone();
         v5[..4].copy_from_slice(&5u32.to_be_bytes());
         let counter = s.sessions.object_counter();
+        let floor_at = position_of(&v5, &0x1234_5678_9abc_def0u64.to_be_bytes());
+        v5.drain(floor_at..floor_at + 8);
         v5.truncate(v5.len() - 8);
         let at = v5.len() - 8;
         v5[at..].copy_from_slice(&counter.to_be_bytes());

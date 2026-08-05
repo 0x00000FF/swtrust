@@ -310,7 +310,11 @@ pub fn nv_write(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
 
     writable(state, request, nv_handle, auth_handle)?;
     let index = state.nv.get_mut(nv_handle)?;
-    if index.index_type() != nt::ORDINARY {
+    // Part 3 clause 31.7.1 names the three that may not be written here: "if
+    // nvIndexType is TPM_NT_COUNTER, TPM_NT_BITS or TPM_NT_EXTEND, then the TPM
+    // shall return TPM_RC_ATTRIBUTES." A PIN Index is written like an ordinary
+    // one, which is how Part 1 clause 34.2.8 has its pinCount and pinLimit set.
+    if matches!(index.index_type(), nt::COUNTER | nt::BITS | nt::EXTEND) {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(2));
     }
     index
@@ -325,7 +329,7 @@ pub fn nv_increment(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let auth_handle = request.handle(0)?;
     let nv_handle = request.handle(1)?;
     writable(state, request, nv_handle, auth_handle)?;
-    state.nv.get_mut(nv_handle)?.increment()?;
+    state.nv.increment(nv_handle)?;
     note_orderly_write(state, nv_handle);
     respond(|_| Ok(()))
 }

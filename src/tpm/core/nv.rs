@@ -122,14 +122,16 @@ impl NvIndex {
     /// Advance a counter Index by one.
     ///
     /// The first increment of an unwritten counter sets it to one.
-    pub fn increment(&mut self) -> TpmResult<u64> {
+    pub fn increment(&mut self, floor: u64) -> TpmResult<u64> {
         if self.index_type() != nt::COUNTER {
             return Err(TpmRc(rc::ATTRIBUTES));
         }
         let next = if self.written() {
             self.counter_value()?.wrapping_add(1)
         } else {
-            1
+            // Clause 31.2 starts a counter past every value an Index of this
+            // Name has held.
+            floor.saturating_add(1)
         };
         self.data = next.to_be_bytes().to_vec();
         self.set_written();
@@ -201,6 +203,19 @@ impl NvIndex {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NvStore {
     indices: BTreeMap<u32, NvIndex>,
+    /// The largest value any counter Index has held, kept past the Index that
+    /// held it.
+    ///
+    /// Part 3 clause 31.2: "when an NV counter is incremented for the first
+    /// time, the TPM shall initialize the 8-octet counter value with a number
+    /// that is greater than any value that a counter Index with the same Name
+    /// has had over the lifetime of the TPM." An Index that is undefined and
+    /// defined again has the same Name, so without this its counter would start
+    /// again at one and a caller watching for rollback would not see it. The
+    /// note beside the clause describes the same remedy: "the Reference Code
+    /// implements this by tracking and using the largest count of any deleted
+    /// NV Counter."
+    highest_counter: u64,
 }
 
 impl NvStore {
@@ -237,6 +252,13 @@ impl NvStore {
 
     /// Define a new Index.
     pub fn define(&mut self, index: NvIndex) -> TpmResult<()> {
+        // A counter that is already at some value keeps the mark up with it,
+        // which is what makes a record written before the mark existed safe.
+        if index.index_type() == nt::COUNTER && index.written() {
+            if let Ok(value) = index.counter_value() {
+                self.highest_counter = self.highest_counter.max(value);
+            }
+        }
         let handle = index.public.nv_index;
         if !Self::is_nv_handle(handle) {
             return Err(TpmRc(rc::HANDLE));
@@ -251,9 +273,35 @@ impl NvStore {
         Ok(())
     }
 
-    /// Remove an Index.
+    /// The highest value any counter Index has held.
+    pub fn counter_floor(&self) -> u64 {
+        self.highest_counter
+    }
+
+    /// Put back a mark that came from the state file, never lowering the one
+    /// the defined Indices already imply.
+    pub fn set_counter_floor(&mut self, floor: u64) {
+        self.highest_counter = self.highest_counter.max(floor);
+    }
+
+    /// Remove an Index, remembering how far a counter in it had come.
     pub fn undefine(&mut self, handle: u32) -> TpmResult<NvIndex> {
-        self.indices.remove(&handle).ok_or(TpmRc(rc::HANDLE))
+        let index = self.indices.remove(&handle).ok_or(TpmRc(rc::HANDLE))?;
+        if index.index_type() == nt::COUNTER && index.written() {
+            if let Ok(value) = index.counter_value() {
+                self.highest_counter = self.highest_counter.max(value);
+            }
+        }
+        Ok(index)
+    }
+
+    /// Increment the counter at `handle`, starting it past every value a
+    /// counter Index of that Name has held.
+    pub fn increment(&mut self, handle: u32) -> TpmResult<u64> {
+        let floor = self.highest_counter;
+        let value = self.get_mut(handle)?.increment(floor)?;
+        self.highest_counter = self.highest_counter.max(value);
+        Ok(value)
     }
 
     pub fn get(&self, handle: u32) -> TpmResult<&NvIndex> {
@@ -415,13 +463,13 @@ mod tests {
     #[test]
     fn a_counter_starts_at_one_and_advances() {
         let mut i = index(nt::COUNTER, 8, 0);
-        assert_eq!(i.increment().unwrap(), 1);
-        assert_eq!(i.increment().unwrap(), 2);
+        assert_eq!(i.increment(0).unwrap(), 1);
+        assert_eq!(i.increment(0).unwrap(), 2);
         assert_eq!(i.counter_value().unwrap(), 2);
         assert_eq!(i.read(0, 8).unwrap(), 2u64.to_be_bytes());
         // The wrong type is refused.
         let mut o = index(nt::ORDINARY, 8, 0);
-        assert_eq!(o.increment().unwrap_err(), TpmRc(rc::ATTRIBUTES));
+        assert_eq!(o.increment(0).unwrap_err(), TpmRc(rc::ATTRIBUTES));
     }
 
     #[test]
@@ -595,7 +643,7 @@ mod tests {
         let mut c = index(nt::COUNTER, 8, NvAttributes::ORDERLY);
         c.public.nv_index = hc::NV_INDEX_FIRST;
         store.define(c).unwrap();
-        store.get_mut(hc::NV_INDEX_FIRST).unwrap().increment().unwrap();
+        store.increment(hc::NV_INDEX_FIRST).unwrap();
 
         // An orderly shutdown saved the value, so it stays where it was.
         store.on_startup_clear();
@@ -611,7 +659,7 @@ mod tests {
             store.get(hc::NV_INDEX_FIRST).unwrap().counter_value().unwrap(),
             config::MAX_ORDERLY_COUNT
         );
-        store.get_mut(hc::NV_INDEX_FIRST).unwrap().increment().unwrap();
+        store.increment(hc::NV_INDEX_FIRST).unwrap();
         assert_eq!(
             store.get(hc::NV_INDEX_FIRST).unwrap().counter_value().unwrap(),
             config::MAX_ORDERLY_COUNT + 1
@@ -662,5 +710,67 @@ mod tests {
         store.define(c).unwrap();
         store.define(o).unwrap();
         assert_eq!(store.counter_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+    use crate::tpm::constants::hc;
+
+    fn counter(handle: u32) -> NvIndex {
+        NvIndex {
+            public: crate::tpm::structures::nv::NvPublic {
+                nv_index: handle,
+                name_alg: crate::tpm::constants::alg::SHA256,
+                attributes: NvAttributes(NvAttributes::AUTHREAD | NvAttributes::AUTHWRITE)
+                    .with_index_type(nt::COUNTER),
+                auth_policy: crate::tpm::structures::base::Tpm2bDigest::empty(),
+                data_size: 8,
+            },
+            auth: Vec::new(),
+            data: Vec::new(),
+            read_locked: false,
+            write_locked: false,
+        }
+    }
+
+    #[test]
+    fn a_counter_defined_again_does_not_repeat_a_value_it_has_had() {
+        // Part 3 clause 31.2: "when an NV counter is incremented for the first
+        // time, the TPM shall initialize the 8-octet counter value with a
+        // number that is greater than any value that a counter Index with the
+        // same Name has had over the lifetime of the TPM." An Index that is
+        // undefined and defined again has the same Name.
+        let mut store = NvStore::new();
+        store.define(counter(hc::NV_INDEX_FIRST)).unwrap();
+        for _ in 0..5 {
+            store.increment(hc::NV_INDEX_FIRST).unwrap();
+        }
+        assert_eq!(store.get(hc::NV_INDEX_FIRST).unwrap().counter_value().unwrap(), 5);
+
+        store.undefine(hc::NV_INDEX_FIRST).unwrap();
+        store.define(counter(hc::NV_INDEX_FIRST)).unwrap();
+        let first = store.increment(hc::NV_INDEX_FIRST).unwrap();
+        assert!(
+            first > 5,
+            "a recreated counter started at {first}, which it has already been"
+        );
+    }
+
+    #[test]
+    fn the_mark_outlives_the_index_and_the_record() {
+        let mut store = NvStore::new();
+        store.define(counter(hc::NV_INDEX_FIRST)).unwrap();
+        store.increment(hc::NV_INDEX_FIRST).unwrap();
+        store.increment(hc::NV_INDEX_FIRST).unwrap();
+        store.undefine(hc::NV_INDEX_FIRST).unwrap();
+        assert_eq!(store.counter_floor(), 2);
+
+        // A store built from a record takes the mark the record carried.
+        let mut back = NvStore::new();
+        back.set_counter_floor(store.counter_floor());
+        back.define(counter(hc::NV_INDEX_FIRST)).unwrap();
+        assert_eq!(back.increment(hc::NV_INDEX_FIRST).unwrap(), 3);
     }
 }
