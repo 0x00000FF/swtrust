@@ -135,7 +135,13 @@ impl Tpm {
         // pass before the module puts anything out. A failure here is fatal
         // rather than a TPM in failure mode, because there is no TPM yet to be
         // in that mode and nothing has been written.
-        let integrity = crate::tpm::fips::integrity()
+        // The value the test compares against lives beside the state, which is
+        // the only place this module is given to keep anything.
+        let expected_at = state_dir.as_ref().join("integrity.hex");
+        if let Some(parent) = expected_at.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let integrity = crate::tpm::fips::integrity_test(&expected_at)
             .map_err(|e| io::Error::other(format!("integrity test failed: {}", e.0)))?;
         crate::tpm::fips::known_answer_tests()
             .map_err(|e| io::Error::other(format!("self test failed: {}", e.0)))?;
@@ -168,7 +174,9 @@ impl Tpm {
 
         let mut state = state;
         // The digest the integrity test produced is what TPM2_GetTestResult
-        // reports, so it is kept rather than recomputed.
+        // reports, so it is kept rather than recomputed. A TPM2_SelfTest that
+        // runs it again compares against the same file this one did.
+        state.integrity_file = Some(expected_at);
         state.test_digest = integrity;
         state.self_test_done = true;
         state.test_failure = None;

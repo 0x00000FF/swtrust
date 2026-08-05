@@ -112,6 +112,15 @@ fn password(pw: &[u8]) -> Vec<u8> {
     w.finish().unwrap()
 }
 
+/// Two password authorization areas, for a command with two auth handles.
+fn password_sessions(n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..n {
+        out.extend_from_slice(&password(b""));
+    }
+    out
+}
+
 #[test]
 fn a_command_before_startup_is_refused() {
     let h = Harness::new("prestartup");
@@ -5649,5 +5658,119 @@ fn a_sequence_whose_first_buffer_was_short_gets_no_ticket() {
         u16::from_be_bytes([ticket[6], ticket[7]]),
         0,
         "a sequence with one short buffer was called safe to sign"
+    );
+}
+
+
+/// Part 3 clause 31.16.1: "If size and offset are both zero (0), then
+/// certifyInfo in the response will contain a TPMS_NV_DIGEST_CERTIFY_INFO,
+/// otherwise, it will contain a TPMS_NV_CERTIFY_INFO. The digest in the
+/// TPMS_NV_DIGEST_CERTIFY_INFO is created using the hash algorithm of the
+/// selected signing scheme."
+#[test]
+fn nv_certify_with_no_range_certifies_a_digest() {
+    let h = Harness::started("nvdigest");
+
+    // An ordinary Index the owner may read and write.
+    let index = 0x0150_0020u32;
+    let mut p = Writer::new();
+    p.u16(0); // auth
+    let public = {
+        let mut w = Writer::new();
+        w.u32(index);
+        w.u16(alg::SHA256);
+        // AUTHWRITE (bit 2), AUTHREAD (bit 18), NO_DA (bit 25)
+        w.u32((1 << 2) | (1 << 18) | (1 << 25));
+        w.u16(0); // authPolicy
+        w.u16(32); // dataSize
+        w.finish().unwrap()
+    };
+    p.u16(public.len() as u16);
+    p.bytes(&public);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_DefineSpace,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "NV_DefineSpace -> {:08x}", r.code);
+
+    let contents = [0x5au8; 32];
+    let mut p = Writer::new();
+    p.u16(contents.len() as u16);
+    p.bytes(&contents);
+    p.u16(0); // offset
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Write,
+        &[index, index],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "NV_Write -> {:08x}", r.code);
+
+    // Certify with no signing key, naming the hash in the scheme.
+    let certify = |size: u16, offset: u16, scheme: Option<u16>| -> Answer {
+        let mut p = Writer::new();
+        p.u16(0); // qualifyingData
+        match scheme {
+            Some(hash) => {
+                p.u16(alg::HMAC);
+                p.u16(hash);
+            }
+            None => p.u16(alg::NULL),
+        }
+        p.u16(size);
+        p.u16(offset);
+        h.send(&command(
+            st::SESSIONS,
+            cc::NV_Certify,
+            &[rh::NULL, index, index],
+            Some(&password_sessions(2)),
+            &p.finish().unwrap(),
+        ))
+    };
+
+    let r = certify(0, 0, Some(alg::SHA256));
+    assert_eq!(r.code, rc::SUCCESS, "NV_Certify -> {:08x}", r.code);
+    // The attest structure is TPM_GENERATED, then the type: the digest form.
+    let mut rd = Reader::new(&r.body);
+    let _param_size = rd.u32().unwrap();
+    let n = rd.u16().unwrap() as usize;
+    let attest = rd.take(n).unwrap();
+    assert_eq!(
+        u16::from_be_bytes([attest[4], attest[5]]),
+        0x801c,
+        "the attestation was not TPM_ST_ATTEST_NV_DIGEST"
+    );
+    // The digest of the whole Index is at the end, after the Name.
+    let expected = swtrust::tpm::crypto::hash::digest(alg::SHA256, &contents).unwrap();
+    assert!(
+        attest.ends_with(&expected),
+        "the digest is not of the contents of the Index"
+    );
+
+    // A range gives the ordinary form.
+    let r = certify(32, 0, Some(alg::SHA256));
+    assert_eq!(r.code, rc::SUCCESS);
+    let mut rd = Reader::new(&r.body);
+    let _param_size = rd.u32().unwrap();
+    let n = rd.u16().unwrap() as usize;
+    let attest = rd.take(n).unwrap();
+    assert_eq!(
+        u16::from_be_bytes([attest[4], attest[5]]),
+        0x8014,
+        "the attestation was not TPM_ST_ATTEST_NV"
+    );
+
+    // "unless the scheme or hash algorithm is TPM_ALG_NULL, in which case the
+    // TPM shall return TPM_RC_SCHEME."
+    let r = certify(0, 0, None);
+    assert_eq!(
+        r.code,
+        rc::SCHEME | 0x080 | 0x040 | (2 << 8),
+        "a null scheme was accepted for a digest certification -> {:08x}",
+        r.code
     );
 }

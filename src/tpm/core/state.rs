@@ -441,6 +441,13 @@ pub struct TpmState {
     /// The PC Client Platform TPM Profile 1.07 clause 5.1.2 asks a TPM that
     /// implements TPM2_ACT_SetTimeout for one instance, so there is one.
     pub act: crate::tpm::core::act::Act,
+    /// Where the value the software integrity test compares against is kept.
+    ///
+    /// FIPS 140-3 clause 10.3.1 has the module decide whether the test passed,
+    /// so TPM2_SelfTest has to reach the same file the pre-operational test
+    /// used. A state that was never opened from a directory has none, and the
+    /// test then only computes the code.
+    pub integrity_file: Option<std::path::PathBuf>,
     /// The H-CRTM Event Sequence context, one hash per PCR bank.
     ///
     /// Part 3 clause 22.10.1: the _TPM_Hash_Data indication carries "one or
@@ -541,6 +548,7 @@ impl TpmState {
             test_digest: Vec::new(),
             test_failure: None,
             rng,
+            integrity_file: None,
             hcrtm_sequence: None,
             hcrtm_before_startup: false,
             hcrtm_at_last_startup: false,
@@ -2090,7 +2098,7 @@ mod tests {
         assert_eq!(back.persistent.len(), 1, "the persistent object was lost");
         assert_eq!(
             back.clock.reset_value.len(),
-            32,
+            crate::tpm::crypto::hash::digest_size(config::CONTEXT_INTEGRITY_HASH_ALG).unwrap(),
             "a record with no reset value has one drawn for it"
         );
         assert_eq!(

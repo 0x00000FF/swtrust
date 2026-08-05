@@ -132,7 +132,11 @@ pub fn run_self_tests(state: &mut TpmState) -> TpmResult<()> {
             return Err(TpmRc(rc::FAILURE));
         }
     }
-    match fips::integrity() {
+    let integrity = match &state.integrity_file {
+        Some(at) => fips::integrity_test(at),
+        None => fips::integrity(),
+    };
+    match integrity {
         Ok(digest) => state.test_digest = digest,
         Err(fips::Failure(which)) => {
             state.failure_mode = true;
@@ -879,7 +883,10 @@ pub fn is_implemented_command(code: u32) -> bool {
 /// notation may be in the setList or clearList of TPM2_PP_Commands()." The
 /// list below is every command whose schematic carries TPM_RH_PLATFORM+{PP},
 /// which is narrower than the handle types clause 26.2.1 names and is the
-/// authority where the two disagree. A command this TPM does not implement
+/// authority where the two disagree. TPM2_PP_Commands is not among them: its
+/// schematic has the unconditional +PP of clause 4.2.4, and clause 26.2.1 says
+/// it "always requires assertion of Physical Presence", so there is nothing
+/// for either list to say about it. A command this TPM does not implement
 /// cannot be selected.
 pub fn is_pp_eligible(code: u32) -> bool {
     use crate::tpm::constants::cc;
@@ -912,7 +919,6 @@ pub fn is_pp_eligible(code: u32) -> bool {
             | cc::NV_UndefineSpace
             | cc::NV_UndefineSpaceSpecial
             | cc::NV_GlobalWriteLock
-            | cc::PP_Commands
     )
 }
 

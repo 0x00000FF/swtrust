@@ -603,7 +603,10 @@ mod tests {
 
         state.audit.commands.push(cc::GetRandom);
         run(&mut state, 0, &get_random(8));
-        assert_eq!(state.audit.digest.len(), 32);
+        assert_eq!(
+            state.audit.digest.len(),
+            crate::tpm::crypto::hash::digest_size(state.audit.alg).unwrap()
+        );
         // Part 1 clause 32 counts the log that just started.
         assert_eq!(state.audit.counter, 1);
 
@@ -780,7 +783,6 @@ mod tests {
         use crate::tpm::commands::management::is_pp_eligible;
 
         for code in [
-            cc::PP_Commands,
             cc::ChangePPS,
             cc::NV_DefineSpace,
             cc::Clear,
@@ -798,7 +800,10 @@ mod tests {
         }
 
         // A command whose schematic has no such notation, one with no handle
-        // at all, and one this TPM does not have.
+        // at all, and one this TPM does not have. TPM2_PP_Commands carries the
+        // unconditional +PP of clause 4.2.4 instead, so neither list may hold
+        // it.
+        assert!(!is_pp_eligible(cc::PP_Commands));
         assert!(!is_pp_eligible(cc::NV_Read));
         assert!(!is_pp_eligible(cc::GetRandom));
         assert!(!is_pp_eligible(0x2000_0000));

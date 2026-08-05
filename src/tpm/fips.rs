@@ -420,16 +420,11 @@ pub fn known_answer_tests() -> TestResult {
     Ok(())
 }
 
-/// The pre-operational software integrity test.
+/// The message authentication code over the executable this process runs.
 ///
-/// The executable this process was started from is hashed with HMAC-SHA-256
-/// under a key compiled into the module, which is the message authentication
-/// code form 140-3 clause 10.3.1 allows. The digest is returned so a caller can
-/// record it; there is no stored value to compare it with, for the reason given
-/// in the module documentation.
-///
-/// A build that cannot be read is a failure, because an integrity test that
-/// cannot see its subject has not passed.
+/// HMAC-SHA-256 under a key compiled into the module, which is the form 140-3
+/// clause 10.3.1 allows. A build that cannot be read is a failure, because an
+/// integrity test that cannot see its subject has not passed.
 pub fn integrity() -> Result<Vec<u8>, Failure> {
     const INTEGRITY_KEY: &[u8] = b"swtrust pre-operational integrity";
     let path = std::env::current_exe().map_err(|_| Failure("integrity"))?;
@@ -438,6 +433,50 @@ pub fn integrity() -> Result<Vec<u8>, Failure> {
         return Err(Failure("integrity"));
     }
     hmac::hmac(alg::SHA256, INTEGRITY_KEY, &image).map_err(|_| Failure("integrity"))
+}
+
+/// The pre-operational software integrity test, 140-3 clause 10.3.1.
+///
+/// The clause requires the module itself to decide whether the test passes,
+/// which means comparing the code above with a value the module already holds.
+/// A module submitted for validation is given that value when it is built, by
+/// a step that writes it into the image after linking. This one is built by
+/// cargo, which has no such step, so the value is written beside the state the
+/// first time the module runs and compared on every run after that. What that
+/// detects is a change to the executable made since it was installed here,
+/// which is what the test is for; what it cannot detect is an executable that
+/// was already modified when it first ran.
+///
+/// `expected_at` is the file that holds the value. A file that cannot be read
+/// or written is not a failed test, because a module that has never recorded
+/// its own code has nothing to compare with; a file that holds a different
+/// value is.
+pub fn integrity_test(expected_at: &std::path::Path) -> Result<Vec<u8>, Failure> {
+    let mac = integrity()?;
+    let recorded = std::fs::read(expected_at).ok().and_then(|raw| {
+        let text = String::from_utf8(raw).ok()?;
+        let hex = text.trim();
+        (hex.len() == mac.len() * 2)
+            .then(|| {
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .collect::<Option<Vec<u8>>>()
+            })
+            .flatten()
+    });
+    match recorded {
+        Some(value) => {
+            if !crate::tpm::core::protect::constant_time_eq(&value, &mac) {
+                return Err(Failure("integrity"));
+            }
+        }
+        None => {
+            let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+            let _ = std::fs::write(expected_at, hex);
+        }
+    }
+    Ok(mac)
 }
 
 /// Pair-wise consistency test for a generated RSA key, 140-3 Table 40.
@@ -843,6 +882,41 @@ mod tests {
         assert_eq!(a.len(), 32);
         // It is a keyed digest of the file, not of nothing.
         assert_ne!(a, hmac::hmac(alg::SHA256, b"", b"").unwrap());
+    }
+
+    #[test]
+    fn the_integrity_test_compares_against_what_it_recorded() {
+        // FIPS 140-3 clause 10.3.1 has the module decide whether the test
+        // passed, which means comparing the code against a value it holds.
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "swtrust-integrity-{}-{}",
+            std::process::id(),
+            crate::util::time::unix_millis_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = dir.join("integrity.hex");
+
+        // The first run has nothing to compare with and records the value.
+        let first = integrity_test(&at).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&at).unwrap().trim().len(),
+            first.len() * 2
+        );
+        // The next run compares and agrees.
+        assert_eq!(integrity_test(&at).unwrap(), first);
+
+        // A recorded value that does not match the image is a failed test.
+        let mut wrong: String = first.iter().map(|b| format!("{b:02x}")).collect();
+        wrong.replace_range(0..1, if wrong.starts_with('0') { "1" } else { "0" });
+        std::fs::write(&at, &wrong).unwrap();
+        assert_eq!(integrity_test(&at), Err(Failure("integrity")));
+
+        // A value of the wrong shape is treated as none at all, and recorded.
+        std::fs::write(&at, "not a digest").unwrap();
+        assert_eq!(integrity_test(&at).unwrap(), first);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -87,8 +87,15 @@ pub const MAX_CLOCK: u64 = 0xFFFF_0000_0000_0000;
 
 /// Size of a primary seed in octets.
 pub const PRIMARY_SEED_SIZE: usize = 32;
-/// Size of the context encryption and integrity key seed.
-pub const CONTEXT_INTEGRITY_HASH_ALG: u16 = alg::SHA256;
+/// Hash that protects a saved context, and the tickets built the same way.
+///
+/// Part 1 clause 27.3.2: "The integrity of a saved context is protected by an
+/// HMAC using a hash algorithm selected by the TPM vendor. The hash algorithm
+/// chosen is required to have the highest security strength of any hash
+/// algorithm implemented on the TPM (see Part 2 for the description of
+/// TPM_PT_CONTEXT_HASH)." Clause 27.1 asks the same of every algorithm a
+/// context is protected with. SHA-512 is the strongest this TPM has.
+pub const CONTEXT_INTEGRITY_HASH_ALG: u16 = alg::SHA512;
 /// Symmetric algorithm used to protect saved contexts.
 pub const CONTEXT_ENCRYPT_ALG: u16 = alg::AES;
 /// Key size, in bits, used to protect saved contexts.

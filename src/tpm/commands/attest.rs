@@ -391,13 +391,43 @@ pub fn nv_certify(state: &mut TpmState, request: &Request) -> TpmResult<Response
     if index.read_locked {
         return Err(TpmRc(rc::NV_LOCKED));
     }
-    let data = index.read(offset, size)?;
     let index_name = index.name()?;
 
-    let attested = Attested::Nv {
-        index_name: Tpm2bName::from_slice(&index_name)?,
-        offset,
-        nv_contents: Tpm2bMaxNvBuffer::new(data)?,
+    // Part 3 clause 31.16.1: "If size and offset are both zero (0), then
+    // certifyInfo in the response will contain a TPMS_NV_DIGEST_CERTIFY_INFO,
+    // otherwise, it will contain a TPMS_NV_CERTIFY_INFO. The digest in the
+    // TPMS_NV_DIGEST_CERTIFY_INFO is created using the hash algorithm of the
+    // selected signing scheme. If size and offset are both zero and signHandle
+    // is TPM_RH_NULL, the digest is computed using the hash algorithm provided
+    // in inScheme, unless the scheme or hash algorithm is TPM_ALG_NULL, in
+    // which case the TPM shall return TPM_RC_SCHEME." The note beside it gives
+    // the reason: this form "permits TPM2_NV_Certify() to certify NV Index
+    // contents that are larger than MAX_NV_BUFFER_SIZE".
+    let attested = if size == 0 && offset == 0 {
+        if !index.written() {
+            return Err(TpmRc(rc::NV_UNINITIALIZED));
+        }
+        let contents = index.data.clone();
+        let hash_alg = if sign_handle == rh::NULL {
+            in_scheme
+                .hash_alg()
+                .ok_or(TpmRc(rc::SCHEME).with_parameter(2))?
+        } else {
+            let object = signing_object(state, sign_handle).map_err(|e| e.with_handle(1))?;
+            let scheme = super::crypto::signing_scheme_at(&object, &in_scheme, 2)?;
+            scheme.hash_alg().ok_or(TpmRc(rc::SCHEME).with_parameter(2))?
+        };
+        Attested::NvDigest {
+            index_name: Tpm2bName::from_slice(&index_name)?,
+            nv_digest: Tpm2bDigest::new(crate::tpm::crypto::hash::digest(hash_alg, &contents)?)?,
+        }
+    } else {
+        let data = index.read(offset, size)?;
+        Attested::Nv {
+            index_name: Tpm2bName::from_slice(&index_name)?,
+            offset,
+            nv_contents: Tpm2bMaxNvBuffer::new(data)?,
+        }
     };
     let (info, signature) =
         attest_and_sign(state, sign_handle, 1, &in_scheme, &qualifying_data, attested, 2)?;
