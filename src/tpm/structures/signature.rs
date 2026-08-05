@@ -236,7 +236,12 @@ impl Unmarshal for VerifiedTicket {
     fn unmarshal(r: &mut Reader<'_>) -> TpmResult<Self> {
         use crate::tpm::constants::st;
         let tag = r.u16()?;
+        // Part 2 Table 108 gives a TPMT_TK_VERIFIED a TPMI_RH_HIERARCHY+
+        // hierarchy, the same type the TPMT_TK_AUTH above carries.
         let hierarchy = r.u32()?;
+        if !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy_selector(hierarchy) {
+            return Err(TpmRc(rc::VALUE));
+        }
         let digest_alg = match tag {
             st::VERIFIED | st::MESSAGE_VERIFIED => None,
             st::DIGEST_VERIFIED => {

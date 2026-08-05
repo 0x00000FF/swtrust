@@ -226,6 +226,9 @@ pub fn sign_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
         kind: SequenceKind::Hash { hash_alg },
         auth: auth.as_slice().to_vec(),
         buffer,
+        // These sequences carry a header of their own, so the first buffer a
+        // caller sends is never the first octets of the message.
+        short_first_buffer: false,
     })))?;
     respond_with_handle(handle, |_| Ok(()))
 }
@@ -363,6 +366,9 @@ pub fn verify_sequence_start(state: &mut TpmState, request: &Request) -> TpmResu
         kind: SequenceKind::Hash { hash_alg },
         auth: auth.as_slice().to_vec(),
         buffer,
+        // These sequences carry a header of their own, so the first buffer a
+        // caller sends is never the first octets of the message.
+        short_first_buffer: false,
     })))?;
     respond_with_handle(handle, |_| Ok(()))
 }
@@ -955,6 +961,7 @@ mod tests {
                 hash_alg: alg::SHA256,
             },
             auth: Vec::new(),
+            short_first_buffer: false,
             buffer: {
                 let mut b = 0x8000_0000u32.to_be_bytes().to_vec();
                 b.extend_from_slice(&alg::SHA256.to_be_bytes());
@@ -979,6 +986,7 @@ mod tests {
                 hash_alg: alg::SHA256,
             },
             auth: Vec::new(),
+            short_first_buffer: false,
             buffer: {
                 let mut b = 0x8000_0001u32.to_be_bytes().to_vec();
                 b.extend_from_slice(&alg::SHA256.to_be_bytes());
@@ -999,6 +1007,7 @@ mod tests {
             kind: SequenceKind::Event,
             auth: Vec::new(),
             buffer: vec![0u8; 4],
+            short_first_buffer: false,
         };
         assert_eq!(sequence_binding(&sequence).unwrap_err(), TpmRc(rc::SEQUENCE));
     }

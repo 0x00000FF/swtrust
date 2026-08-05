@@ -132,6 +132,14 @@ pub struct Sequence {
     /// sequence can be saved and reloaded by TPM2_ContextSave, which needs the
     /// state to be serialisable.
     pub buffer: Vec<u8>,
+    /// Whether the first buffer given to the sequence was a short one.
+    ///
+    /// Part 3 clause 17.8.1: "Regardless of the contents of the first octets of
+    /// the hashed message, if the first buffer sent to the TPM had fewer than
+    /// sizeof(TPM_GENERATED) octets, then the TPM will operate as if digest is
+    /// not safe to sign." The whole message may begin with something else, so
+    /// what the first buffer held has to be remembered as it arrives.
+    pub short_first_buffer: bool,
 }
 
 /// The three kinds of sequence Part 3 clause 17 defines.
@@ -169,8 +177,20 @@ impl Sequence {
         if self.buffer.len().saturating_add(data.len()) > MAX_SEQUENCE_BYTES {
             return Err(TpmRc(rc::MEMORY));
         }
+        if self.buffer.is_empty() && data.len() < 4 {
+            self.short_first_buffer = true;
+        }
         self.buffer.extend_from_slice(data);
         Ok(())
+    }
+
+    /// Whether a ticket may say the digest is safe to sign.
+    ///
+    /// The first buffer decides it as well as the first octets, so a sequence
+    /// that was fed fewer than sizeof(TPM_GENERATED) octets to begin with is
+    /// never safe.
+    pub fn may_be_safe_to_sign(&self) -> bool {
+        !self.short_first_buffer
     }
 
     /// The hash algorithm of a hash or HMAC sequence.
@@ -718,6 +738,7 @@ mod tests {
             },
             auth: b"auth".to_vec(),
             buffer: Vec::new(),
+            short_first_buffer: false,
         }))
     }
 
@@ -855,6 +876,7 @@ mod tests {
             },
             auth: Vec::new(),
             buffer: Vec::new(),
+            short_first_buffer: false,
         };
         s.update(b"abc").unwrap();
         s.update(b"def").unwrap();
@@ -866,6 +888,7 @@ mod tests {
             kind: SequenceKind::Event,
             auth: Vec::new(),
             buffer: Vec::new(),
+            short_first_buffer: false,
         };
         assert!(e.is_event());
         assert_eq!(e.hash_alg(), None);
@@ -877,6 +900,7 @@ mod tests {
             kind: SequenceKind::Event,
             auth: Vec::new(),
             buffer: vec![0u8; MAX_SEQUENCE_BYTES],
+            short_first_buffer: false,
         };
         assert_eq!(s.update(b"x").unwrap_err(), TpmRc(rc::MEMORY));
     }

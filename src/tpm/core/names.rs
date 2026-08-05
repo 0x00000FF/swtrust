@@ -96,11 +96,14 @@ pub fn is_well_formed(name: &[u8]) -> bool {
     }
     // The clause names a TPM_ALG_ID, which is any hash the TCG registry
     // assigns, not only one this TPM implements: the Name may be of an entity
-    // on the TPM a policy or a credential is being built for.
+    // on the TPM a policy or a credential is being built for. A hash whose
+    // digest size this build does not tabulate is taken at face value, because
+    // there is no way to tell it from one the registry has and this table does
+    // not; a size that disagrees with a hash the table does have is refused.
     let alg = u16::from_be_bytes([name[0], name[1]]);
     match crate::tpm::structures::base::digest_size(alg) {
         Some(size) => name.len() == 2 + size,
-        None => false,
+        None => name.len() > 2,
     }
 }
 

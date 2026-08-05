@@ -3,7 +3,7 @@
 //! These are the commands of Part 3 clauses 9, 10, 16, 30 and 36.
 
 use crate::tpm::config;
-use crate::tpm::constants::{alg, cap, cc, curve, pt, pt_pcr, rc, su};
+use crate::tpm::constants::{alg, cap, curve, pt, pt_pcr, rc, su};
 use crate::tpm::core::pcr;
 use crate::tpm::core::state::TpmState;
 use crate::tpm::crypto::{ecc, hash, rand::Rng, sym};
@@ -505,8 +505,13 @@ fn build_capability(
             Ok((more, Capabilities::AuditCommands(TpmlCc { items })))
         }
         cap::PCRS => {
-            // Part 3 clause 30.2 returns "the current allocation of PCR in a
-            // TPM", which Part 1 clause 14.8 chooses per register, so a bank
+            // Part 3 clause 30.2: "TPM_CAP_PCRS - Returns the current
+            // allocation of PCR in a TPML_PCR_SELECTION. The property
+            // parameter shall be zero."
+            if property != 0 {
+                return Err(TpmRc(rc::VALUE).with_parameter(2));
+            }
+            // Part 1 clause 14.8 chooses the allocation per register, so a bank
             // that was given some of them says so.
             let mut items = Vec::new();
             for (a, bits) in state.pcr.allocation() {
@@ -600,18 +605,14 @@ fn handles_in_range(state: &TpmState, property: u32) -> Vec<u32> {
             .map(|i| hc::PCR_FIRST + i)
             .collect(),
         ht::NV_INDEX => state.nv.handles(),
-        ht::HMAC_SESSION => state
-            .sessions
-            .active_handles()
-            .into_iter()
-            .filter(|h| (hc::HMAC_SESSION_FIRST..=hc::HMAC_SESSION_LAST).contains(h))
-            .collect(),
-        ht::POLICY_SESSION => state
-            .sessions
-            .active_handles()
-            .into_iter()
-            .filter(|h| (hc::POLICY_SESSION_FIRST..=hc::POLICY_SESSION_LAST).contains(h))
-            .collect(),
+        // Part 2 Table 33 gives two of these a different meaning here, which
+        // the note under Part 3 Table 236 points at: 0x02 is
+        // TPM_HT_LOADED_SESSION, "loaded sessions of type
+        // TPM_HT_HMAC_SESSION or TPM_HT_POLICY_SESSION", and 0x03 is
+        // TPM_HT_SAVED_SESSION, the saved contexts "for which the TPM is
+        // maintaining tracking information".
+        ht::HMAC_SESSION => state.sessions.loaded_handles(),
+        ht::POLICY_SESSION => state.sessions.saved_handles(),
         ht::PERMANENT => permanent_handles(),
         ht::TRANSIENT => state.objects.handles(),
         ht::PERSISTENT => state.persistent.keys().copied().collect(),
@@ -754,7 +755,12 @@ fn tpm_properties(state: &TpmState, property: u32) -> Vec<TaggedProperty> {
         TaggedProperty::new(pt::AUDIT_COUNTER_0, (state.audit.counter >> 32) as u32),
         TaggedProperty::new(pt::AUDIT_COUNTER_1, state.audit.counter as u32),
     ];
-    all.retain(|p| p.property >= property);
+    // Part 3 clause 30.2: "The properties are returned in groups. Each property
+    // group is on a 256-value boundary (that is, the boundary occurs when the
+    // TPM_PT is evenly divisible by 256). The TPM will only return values in
+    // the same group as the property parameter in the command."
+    let group = property & !0xFF;
+    all.retain(|p| p.property >= property && (p.property & !0xFF) == group);
     all.sort_by_key(|p| p.property);
     all
 }
@@ -859,21 +865,24 @@ pub fn is_implemented_command(code: u32) -> bool {
 
 /// Commands that may be given physical presence, used by TPM2_PP_Commands.
 ///
-/// TPM2_FieldUpgradeStart belongs to this set in Part 2 but is not implemented
-/// here, and a command this TPM does not implement cannot be selected.
+/// Part 3 clause 26.2.1: "Only commands with handle types of
+/// TPMI_RH_PLATFORM, TPMI_RH_PROVISION, TPMI_RH_CLEAR, or TPMI_RH_HIERARCHY
+/// can be gated with Physical Presence. If any other command is in either
+/// list, it is discarded." The handle table is the authority on which those
+/// are, so a command added to this TPM is covered without a second list to
+/// keep in step. A command this TPM does not implement cannot be selected.
 pub fn is_pp_eligible(code: u32) -> bool {
+    use crate::tpm::commands::handles::Kind;
+
+    if !is_implemented_command(code) {
+        return false;
+    }
+    let Some(handle) = crate::tpm::commands::handles::kind(code, 0) else {
+        return false;
+    };
     matches!(
-        code,
-        cc::Clear
-            | cc::ClearControl
-            | cc::HierarchyChangeAuth
-            | cc::HierarchyControl
-            | cc::ChangeEPS
-            | cc::ChangePPS
-            | cc::PP_Commands
-            | cc::SetPrimaryPolicy
-            | cc::NV_DefineSpace
-            | cc::NV_UndefineSpace
+        handle.kind,
+        Kind::Platform | Kind::Provision | Kind::Clear | Kind::Hierarchy
     )
 }
 
@@ -884,7 +893,9 @@ mod tests {
     #[test]
     fn tpm_properties_report_the_vendor_identity() {
         let state = TpmState::manufacture().unwrap();
-        let props = tpm_properties(&state, 0);
+        // Part 3 clause 30.2 answers within the 256-value group the property
+        // names, and the fixed properties are the group TPM_PT_FIXED begins.
+        let props = tpm_properties(&state, pt::PT_FIXED);
         let find = |p: u32| props.iter().find(|t| t.property == p).map(|t| t.value);
         assert_eq!(find(pt::MANUFACTURER), Some(0x5357_5400));
         assert_eq!(find(pt::FIRMWARE_VERSION_1), Some(0x0001_0000));
@@ -963,14 +974,14 @@ mod tests {
     #[test]
     fn capability_lists_report_more_when_truncated() {
         let state = TpmState::manufacture().unwrap();
-        let (more, data) = build_capability(&state, cap::TPM_PROPERTIES, 0, 3).unwrap();
+        let (more, data) = build_capability(&state, cap::TPM_PROPERTIES, pt::PT_FIXED, 3).unwrap();
         assert!(more);
         if let Capabilities::TpmProperties(l) = data {
             assert_eq!(l.len(), 3);
         } else {
             panic!("wrong capability");
         }
-        let (more, _) = build_capability(&state, cap::TPM_PROPERTIES, 0, 1000).unwrap();
+        let (more, _) = build_capability(&state, cap::TPM_PROPERTIES, pt::PT_FIXED, 1000).unwrap();
         assert!(!more);
     }
 

@@ -22,22 +22,22 @@ pub fn run(state: &mut TpmState, locality: u8, command: &[u8]) -> Vec<u8> {
 }
 
 fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<u8>> {
+    // Part 1 clause 12.3: in failure mode only the two commands that report
+    // the failure are accepted, and Part 3 clause 10.4.1 adds that "if the TPM
+    // is in Failure mode, then tag is required to be TPM_ST_NO_SESSIONS or the
+    // TPM shall return TPM_RC_FAILURE". Both are settled from the header
+    // alone, before the session area is parsed: a TPM in failure mode has no
+    // working session logic, so it must not answer for one.
+    if state.failure_mode {
+        let header = crate::tpm::device::parse_header(command)?;
+        if !dispatch::allowed_in_failure_mode(header.code)
+            || header.tag != crate::tpm::constants::st::NO_SESSIONS
+        {
+            return Err(TpmRc(rc::FAILURE));
+        }
+    }
     let mut request = dispatch::parse(state, command, locality)?;
 
-    // Part 1 clause 12.3: before TPM2_Startup only TPM2_Startup is accepted,
-    // and in failure mode only the two commands that report the failure are.
-    if state.failure_mode && !dispatch::allowed_in_failure_mode(request.code) {
-        return Err(TpmRc(rc::FAILURE));
-    }
-    // Part 3 clause 10.4.1 adds a rule for the command that reports the test
-    // results: "This command will operate when the TPM is in Failure mode so
-    // that software can determine the test status of the TPM... If the TPM is
-    // in Failure mode, then tag is required to be TPM_ST_NO_SESSIONS or the TPM
-    // shall return TPM_RC_FAILURE." A TPM in failure mode has no working
-    // session logic to answer an authorization with.
-    if state.failure_mode && request.tag != crate::tpm::constants::st::NO_SESSIONS {
-        return Err(TpmRc(rc::FAILURE));
-    }
     if !state.started && !dispatch::allowed_before_startup(request.code) {
         return Err(TpmRc(rc::INITIALIZE));
     }
@@ -47,10 +47,13 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
 
     // A command that needs physical presence must have it asserted. Part 3
     // clause 26.2.1 says TPM2_PP_Commands always does, whatever the list that
-    // command itself maintains happens to hold.
-    let needs_pp =
-        request.code == cc::PP_Commands || state.pp_commands.contains(&request.code);
-    if needs_pp && !state.physical_presence {
+    // command itself maintains happens to hold. For the rest, the list makes a
+    // command need it only "when the handle associated with the authorization
+    // is TPM_RH_PLATFORM", so a command that several hierarchies may authorize
+    // is gated on the one the caller named.
+    let listed = state.pp_commands.contains(&request.code)
+        && request.handles.first() == Some(&crate::tpm::constants::rh::PLATFORM);
+    if (request.code == cc::PP_Commands || listed) && !state.physical_presence {
         return Err(TpmRc(rc::PP));
     }
 
@@ -716,13 +719,71 @@ mod tests {
 
     #[test]
     fn a_command_needing_physical_presence_is_gated() {
+        // Part 3 clause 26.2.1 makes a listed command require physical
+        // presence "when the handle associated with the authorization is
+        // TPM_RH_PLATFORM", so the same command authorized by another
+        // hierarchy is not gated.
         let mut state = TpmState::manufacture().unwrap();
         run(&mut state, 0, &startup(su::CLEAR));
-        state.pp_commands.push(cc::GetRandom);
-        let r = run(&mut state, 0, &get_random(8));
+        state.pp_commands.push(cc::ClearControl);
+
+        let clear_control = |handle: u32| -> Vec<u8> {
+            let mut auth = Writer::new();
+            auth.u32(rh::RS_PW);
+            auth.u16(0);
+            auth.u8(0x01);
+            auth.u16(0);
+            let auth = auth.finish().unwrap();
+
+            let mut body = Writer::new();
+            body.u32(handle);
+            body.u32(auth.len() as u32);
+            body.bytes(&auth);
+            body.u8(0); // disable
+            let body = body.finish().unwrap();
+
+            let mut w = Writer::new();
+            w.u16(st::SESSIONS);
+            w.u32((HEADER_SIZE + body.len()) as u32);
+            w.u32(cc::ClearControl);
+            w.bytes(&body);
+            w.finish().unwrap()
+        };
+
+        let r = run(&mut state, 0, &clear_control(rh::PLATFORM));
         assert_eq!(response_code(&r), rc::PP);
+        // TPM_RH_LOCKOUT also authorizes this command, and the list does not
+        // reach it. Whatever else that authorization has to satisfy, physical
+        // presence is not part of it.
+        let r = run(&mut state, 0, &clear_control(rh::LOCKOUT));
+        assert_ne!(response_code(&r), rc::PP);
+
         state.physical_presence = true;
-        let r = run(&mut state, 0, &get_random(8));
+        let r = run(&mut state, 0, &clear_control(rh::PLATFORM));
         assert_eq!(response_code(&r), rc::SUCCESS);
+    }
+
+    #[test]
+    fn only_the_handle_types_the_clause_names_may_be_gated() {
+        // "Only commands with handle types of TPMI_RH_PLATFORM,
+        // TPMI_RH_PROVISION, TPMI_RH_CLEAR, or TPMI_RH_HIERARCHY can be gated
+        // with Physical Presence. If any other command is in either list, it
+        // is discarded."
+        use crate::tpm::commands::management::is_pp_eligible;
+
+        assert!(is_pp_eligible(cc::PP_Commands), "TPMI_RH_PLATFORM");
+        assert!(is_pp_eligible(cc::ChangePPS), "TPMI_RH_PLATFORM");
+        assert!(is_pp_eligible(cc::NV_DefineSpace), "TPMI_RH_PROVISION");
+        assert!(is_pp_eligible(cc::Clear), "TPMI_RH_CLEAR");
+        assert!(is_pp_eligible(cc::ClearControl), "TPMI_RH_CLEAR");
+        assert!(is_pp_eligible(cc::CreatePrimary), "TPMI_RH_HIERARCHY");
+
+        // TPMI_RH_HIERARCHY_AUTH and TPMI_RH_HIERARCHY_POLICY are types of
+        // their own, which the clause does not name.
+        assert!(!is_pp_eligible(cc::HierarchyChangeAuth));
+        assert!(!is_pp_eligible(cc::SetPrimaryPolicy));
+        // A command with no handle at all, and one this TPM does not have.
+        assert!(!is_pp_eligible(cc::GetRandom));
+        assert!(!is_pp_eligible(0x2000_0000));
     }
 }

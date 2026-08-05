@@ -224,6 +224,9 @@ fn marshal_sequence(sequence: &Sequence) -> TpmResult<Vec<u8>> {
     w.sized16(&sequence.auth);
     w.u32(sequence.buffer.len() as u32);
     w.bytes(&sequence.buffer);
+    // What the first buffer said travels with the sequence, so a reload cannot
+    // turn a digest that is not safe to sign into one that is.
+    w.u8(u8::from(sequence.short_first_buffer));
     w.finish()
 }
 
@@ -252,10 +255,14 @@ fn unmarshal_sequence(body: &[u8]) -> TpmResult<Sequence> {
         return Err(TpmRc(rc::BAD_CONTEXT));
     }
     let buffer = r.take(len)?.to_vec();
+    // A reloaded sequence keeps what its first buffer said, which the octet
+    // after the data carries.
+    let short_first_buffer = r.u8()? != 0;
     Ok(Sequence {
         kind,
         auth,
         buffer,
+        short_first_buffer,
     })
 }
 
@@ -659,10 +666,15 @@ mod tests {
                 kind: kind.clone(),
                 auth: b"auth".to_vec(),
                 buffer: b"buffered data".to_vec(),
+                short_first_buffer: true,
             };
             let back = unmarshal_sequence(&marshal_sequence(&s).unwrap()).unwrap();
             assert_eq!(back.kind, kind);
             assert_eq!(back.auth, b"auth");
+            assert!(
+                back.short_first_buffer,
+                "a reloaded sequence forgot that its first buffer was short"
+            );
             assert_eq!(back.buffer, b"buffered data");
         }
     }

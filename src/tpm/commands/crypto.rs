@@ -400,6 +400,7 @@ pub fn hash_sequence_start(state: &mut TpmState, request: &Request) -> TpmResult
         kind,
         auth: auth.as_slice().to_vec(),
         buffer: Vec::new(),
+        short_first_buffer: false,
     })))?;
     respond_with_handle(handle, |_| Ok(()))
 }
@@ -417,6 +418,7 @@ pub fn hmac_start(state: &mut TpmState, request: &Request) -> TpmResult<Response
         kind: SequenceKind::Hmac { hash_alg, key },
         auth: auth.as_slice().to_vec(),
         buffer: Vec::new(),
+        short_first_buffer: false,
     })))?;
     respond_with_handle(handle, |_| Ok(()))
 }
@@ -460,7 +462,14 @@ pub fn sequence_complete(state: &mut TpmState, request: &Request) -> TpmResult<R
     let (digest, ticket) = match &sequence.kind {
         SequenceKind::Hash { hash_alg } => {
             let d = hash::digest(*hash_alg, &data)?;
-            let t = hash_ticket(state, hierarchy, *hash_alg, &data, &d)?;
+            // Part 3 clause 17.8.1 makes a sequence whose first buffer was
+            // shorter than sizeof(TPM_GENERATED) unsafe to sign whatever the
+            // message turned out to begin with.
+            let t = if sequence.may_be_safe_to_sign() {
+                hash_ticket(state, hierarchy, *hash_alg, &data, &d)?
+            } else {
+                Ticket::null(st::HASHCHECK)
+            };
             (d, t)
         }
         SequenceKind::Hmac { hash_alg, key } => {
@@ -497,16 +506,18 @@ pub fn event_sequence_complete(state: &mut TpmState, request: &Request) -> TpmRe
     let mut data = sequence.buffer.clone();
     data.extend_from_slice(buffer.as_slice());
 
-    let digests = if pcr_handle == rh::NULL {
-        let mut out = Vec::new();
-        for a in state.pcr.algorithms() {
-            out.push((a, hash::digest(a, &data)?));
-        }
-        out
-    } else {
+    // Part 3 clause 17.9.1, the note beside it: "Unlike TPM2_PCR_Event(), a
+    // digest is always returned for each implemented hash algorithm. There is
+    // no option to only return digests for which pcrHandle is allocated." What
+    // the registers are extended with is still what the banks hold.
+    if pcr_handle != rh::NULL {
         let index = (pcr_handle - crate::tpm::constants::hc::PCR_FIRST) as u16;
-        state.pcr.event(index, request.locality, &data)?
-    };
+        state.pcr.event(index, request.locality, &data)?;
+    }
+    let mut digests = Vec::new();
+    for a in config::implemented_hashes().iter().copied() {
+        digests.push((a, hash::digest(a, &data)?));
+    }
 
     respond(move |w| {
         let items = digests
@@ -556,6 +567,43 @@ pub fn signing_scheme_at(
         }
         Ok(object_scheme)
     }
+}
+
+/// The padding scheme TPM2_RSA_Encrypt and TPM2_RSA_Decrypt use.
+///
+/// Part 3 clause 14.2.1: "If the scheme of keyHandle is TPM_ALG_NULL, then the
+/// caller may use inScheme to specify the padding scheme. If scheme of
+/// keyHandle is not TPM_ALG_NULL, then inScheme shall either be TPM_ALG_NULL or
+/// be the same as scheme (TPM_RC_SCHEME)." Both null is the third padding of
+/// Table 42, where "data is not padded by the TPM".
+fn rsa_padding_scheme(object: &Object, supplied: &Scheme, parameter: usize) -> TpmResult<Scheme> {
+    let object_scheme = object.public.scheme().copied().unwrap_or_default();
+    if object_scheme.is_null() {
+        return Ok(*supplied);
+    }
+    if supplied.is_null() {
+        return Ok(object_scheme);
+    }
+    if supplied.scheme != object_scheme.scheme {
+        return Err(TpmRc(rc::SCHEME).with_parameter(parameter));
+    }
+    Ok(object_scheme)
+}
+
+/// The label a padding scheme takes, which Part 1 clause 11.2.4.4 terminates.
+///
+/// Part 3 clauses 14.2.1 and 14.3.1: "If label is present (label.size != 0), it
+/// shall be a byte stream whose last byte is zero or the TPM will return
+/// TPM_RC_VALUE", and the second adds that a scheme which takes no label still
+/// has the field checked.
+fn rsa_label(label: &[u8], parameter: usize) -> TpmResult<Vec<u8>> {
+    if label.is_empty() {
+        return Ok(Vec::new());
+    }
+    if label.last() != Some(&0) {
+        return Err(TpmRc(rc::VALUE).with_parameter(parameter));
+    }
+    Ok(label.to_vec())
 }
 
 /// Sign `digest` with `object` using `scheme`.
@@ -853,33 +901,29 @@ pub fn rsa_encrypt(state: &mut TpmState, request: &Request) -> TpmResult<Respons
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
         .clone();
+    // Part 3 clause 14.2.1: "The key referenced by keyHandle is required to be
+    // an RSA key (TPM_RC_KEY)", and the note beside it: "Because only the
+    // public portion of the key needs to be loaded for this command, the caller
+    // can manipulate the attributes of the key in any way desired. As a result,
+    // the TPM shall not check the consistency of the attributes. The only
+    // property checking is that the key is an RSA key and that the padding
+    // scheme is supported."
     if object.public.object_type != alg::RSA {
-        return Err(TpmRc(rc::TYPE).with_handle(1));
-    }
-    if !object
-        .public
-        .object_attributes
-        .has(ObjectAttributes::DECRYPT)
-    {
-        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
+        return Err(TpmRc(rc::KEY).with_handle(1));
     }
     let PublicParms::Rsa { exponent, .. } = object.public.parameters else {
-        return Err(TpmRc(rc::TYPE));
+        return Err(TpmRc(rc::KEY).with_handle(1));
     };
     let PublicId::Rsa(modulus) = &object.public.unique else {
-        return Err(TpmRc(rc::TYPE));
+        return Err(TpmRc(rc::KEY).with_handle(1));
     };
     let public = rsa::RsaPublic::new(modulus.as_slice(), exponent)?;
-    let scheme = signing_scheme(&object, &in_scheme).unwrap_or(in_scheme);
+    let scheme = rsa_padding_scheme(&object, &in_scheme, 2)?;
+    let l = rsa_label(label.as_slice(), 3)?;
 
     let block = match scheme.scheme {
         alg::OAEP => {
             let hash_alg = scheme.hash_alg().unwrap_or(object.public.name_alg);
-            let mut l = label.as_slice().to_vec();
-            // Part 1 clause 11.2.4.4 terminates the label with a zero octet.
-            if !l.last().is_some_and(|b| *b == 0) {
-                l.push(0);
-            }
             rsa::oaep_encode(hash_alg, public.size(), message.as_slice(), &l, &mut state.rng)?
         }
         alg::RSAES => {
@@ -943,16 +987,13 @@ pub fn rsa_decrypt(state: &TpmState, request: &Request) -> TpmResult<Response> {
         exponent,
         sensitive.sensitive.as_slice(),
     )?;
-    let scheme = signing_scheme(object, &in_scheme).unwrap_or(in_scheme);
+    let scheme = rsa_padding_scheme(object, &in_scheme, 2)?;
+    let l = rsa_label(label.as_slice(), 3)?;
 
     let plain = rsa::private_op(&key, cipher.as_slice())?;
     let message = match scheme.scheme {
         alg::OAEP => {
             let hash_alg = scheme.hash_alg().unwrap_or(object.public.name_alg);
-            let mut l = label.as_slice().to_vec();
-            if !l.last().is_some_and(|b| *b == 0) {
-                l.push(0);
-            }
             rsa::oaep_decode(hash_alg, &plain, &l)?
         }
         alg::RSAES => rsa::pkcs1v15_encrypt_unpad(&plain)?,

@@ -869,6 +869,11 @@ impl SessionSlots {
         self.sessions.keys().copied().collect()
     }
 
+    /// Every session handle whose context the TPM has saved.
+    pub fn saved_handles(&self) -> Vec<u32> {
+        self.saved.keys().copied().collect()
+    }
+
     /// Every handle the TPM is tracking, loaded or saved.
     pub fn active_handles(&self) -> Vec<u32> {
         let mut out: Vec<u32> = self.sessions.keys().copied().collect();
