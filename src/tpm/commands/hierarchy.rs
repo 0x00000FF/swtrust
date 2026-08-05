@@ -146,16 +146,21 @@ pub fn change_eps(state: &mut TpmState, _request: &Request) -> TpmResult<Respons
     // endorsementPolicy are both set to the Empty Buffer".
     state.hierarchies.endorsement.clear_authorization();
     state.hierarchies.endorsement.enabled = true;
+    // Part 2 Table 45 reports the same enable in TPMA_STARTUP_CLEAR, which
+    // TPM_PT_STARTUP_CLEAR gives back, so the two say the same thing.
+    state.startup_clear = crate::tpm::structures::attributes::StartupClearAttributes(
+        state.startup_clear.0 | crate::tpm::structures::attributes::StartupClearAttributes::EH_ENABLE,
+    );
     // "It will flush any resident objects (transient or persistent) in the
     // Endorsement hierarchy."
     state.objects.flush_hierarchy(rh::ENDORSEMENT);
     state
         .persistent
         .retain(|_, o| o.hierarchy != rh::ENDORSEMENT);
-    // The seed is no longer the one the manufacturer put in.
-    state.permanent = state
-        .permanent
-        .without(PermanentAttributes::TPM_GENERATED_EPS);
+    // Part 2 Table 46 has tpmGeneratedEPS SET when "the EPS was created by the
+    // TPM", which is where the replacement came from, so the attribute stays
+    // rather than being cleared for a seed the TPM itself drew.
+    state.permanent = state.permanent.with(PermanentAttributes::TPM_GENERATED_EPS);
     respond(|_| Ok(()))
 }
 

@@ -971,11 +971,13 @@ pub fn ecdh_key_gen(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     let object = object_of(state, key_handle)
         .map_err(|e| e.with_handle(1))?
         .clone();
+    // Part 3 clause 14.4.1: "keyHandle shall refer to a loaded, ECC key
+    // (TPM_RC_KEY)."
     let PublicParms::Ecc { curve_id, .. } = object.public.parameters else {
-        return Err(TpmRc(rc::TYPE).with_handle(1));
+        return Err(TpmRc(rc::KEY).with_handle(1));
     };
     let PublicId::Ecc(point) = &object.public.unique else {
-        return Err(TpmRc(rc::TYPE).with_handle(1));
+        return Err(TpmRc(rc::KEY).with_handle(1));
     };
 
     let ephemeral = ecc::generate(curve_id, &mut state.rng)?;

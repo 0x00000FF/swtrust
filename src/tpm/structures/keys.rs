@@ -115,6 +115,12 @@ impl PublicParms {
                     return Err(TpmRc(rc::VALUE));
                 }
                 let exponent = r.u32()?;
+                // Part 2 Table 228: the exponent is "an odd number greater
+                // than 2", and zero is the mandatory default rather than a
+                // value of its own.
+                if exponent != 0 && (exponent <= 2 || exponent % 2 == 0) {
+                    return Err(TpmRc(rc::VALUE));
+                }
                 PublicParms::Rsa {
                     symmetric,
                     scheme,

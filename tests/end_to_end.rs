@@ -1667,6 +1667,35 @@ fn a_disabled_hierarchy_hides_its_persistent_object_from_every_command() {
 }
 
 #[test]
+fn an_rsa_exponent_is_odd_and_greater_than_two() {
+    // Part 2 Table 228: the exponent is "an odd number greater than 2", and
+    // zero names the default rather than being a value of its own. Part 3
+    // clause 30.4.1 has TPM2_TestParms answer for parameters the TPM cannot
+    // use.
+    let h = Harness::started("exponent");
+    for (exponent, ok) in [(0u32, true), (65537, true), (2, false), (4, false), (1, false)] {
+        let mut p = Writer::new();
+        p.u16(alg::RSA);
+        p.u16(alg::NULL); // symmetric
+        p.u16(alg::NULL); // scheme
+        p.u16(2048);
+        p.u32(exponent);
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::TestParms,
+            &[],
+            None,
+            &p.finish().unwrap(),
+        ));
+        if ok {
+            assert_eq!(r.code, rc::SUCCESS, "exponent {exponent} -> {:08x}", r.code);
+        } else {
+            assert_ne!(r.code, rc::SUCCESS, "exponent {exponent} was accepted");
+        }
+    }
+}
+
+#[test]
 fn a_context_of_a_disabled_hierarchy_does_not_load() {
     // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
     // context is associated with a hierarchy that is disabled."
