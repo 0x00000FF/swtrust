@@ -66,7 +66,14 @@ const STATE_VERSION_WITHOUT_PROFILE: u32 = 1;
 /// Dictionary attack protection, Part 1 clause 19.8.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockoutState {
-    /// Failed authorization attempts since the last successful one.
+    /// The failedTries of Part 1 clause 16.8.2.
+    ///
+    /// It counts every authorization failure of a protected entity. Clause
+    /// 16.8.4 gives the three ways it goes down: TPM2_DictionaryAttackLockReset
+    /// sets it to zero, the TPM decrements it by one every recoveryTime, and it
+    /// is set to zero when the owner changes. A successful authorization is not
+    /// among them, and treating one as though it were would let a guess be
+    /// followed by a success on some entity of the attacker's own.
     pub failed_tries: u32,
     /// Failures allowed before the TPM enters lockout.
     pub max_tries: u32,
@@ -74,10 +81,52 @@ pub struct LockoutState {
     pub recovery_time: u32,
     /// Seconds before lockoutAuth may be used again.
     pub lockout_recovery: u32,
-    /// True while lockoutAuth itself is unavailable.
+    /// The special lockout of Part 1 clause 16.8.5, which an authorization
+    /// failure against lockoutAuth enters "regardless of the setting of
+    /// failedTries and maxTries". Lockout mode itself is not a flag: clause
+    /// 16.8.3 says the TPM is in it "while failedTries is equal to maxTries",
+    /// so it is read from the counters rather than stored beside them.
     pub in_lockout: bool,
     /// Time, in the TPM's own base, when the next try is recovered.
     pub next_recovery: u64,
+    /// Time, in the TPM's own base, when the special lockout ends. Zero while
+    /// clause 16.8.5's "next TPM2_Startup()" is what ends it instead.
+    pub lockout_until: u64,
+}
+
+impl LockoutState {
+    /// Lockout mode, Part 1 clause 16.8.3: "the TPM is in Lockout mode while
+    /// failedTries is equal to maxTries". Part 3 clause 25.3.1 adds that a
+    /// maxTries of zero puts the TPM in lockout outright.
+    pub fn locked_out(&self) -> bool {
+        self.max_tries == 0 || self.failed_tries >= self.max_tries
+    }
+
+    /// True when the dictionary attack logic is switched off, which Part 3
+    /// clause 25.3.1 does with a recovery time of zero: "authorizations are
+    /// checked but authorization failures will not cause the TPM to enter
+    /// lockout".
+    pub fn protection_off(&self) -> bool {
+        self.recovery_time == 0
+    }
+
+    /// Let the counters down as Time passes.
+    ///
+    /// Part 1 clause 16.8.2 decrements failedTries "by one after recoveryTime
+    /// seconds", and clause 16.8.5 leaves the special lockout after
+    /// lockoutRecovery. Part 3 clause 25.3.1 measures both "with respect to the
+    /// Time and not Clock", so they go with the timer that a power cycle
+    /// restarts.
+    pub fn on_time(&mut self, time: u64) {
+        if self.failed_tries > 0 && !self.protection_off() && time >= self.next_recovery {
+            self.failed_tries -= 1;
+            self.next_recovery = time.saturating_add(self.recovery_time as u64 * 1000);
+        }
+        if self.in_lockout && self.lockout_until != 0 && time >= self.lockout_until {
+            self.in_lockout = false;
+            self.lockout_until = 0;
+        }
+    }
 }
 
 impl Default for LockoutState {
@@ -89,6 +138,7 @@ impl Default for LockoutState {
             lockout_recovery: config::DEFAULT_LOCKOUT_RECOVERY,
             in_lockout: false,
             next_recovery: 0,
+            lockout_until: 0,
         }
     }
 }
@@ -113,6 +163,9 @@ impl Unmarshal for LockoutState {
             lockout_recovery: r.u32()?,
             in_lockout: r.u8()? != 0,
             next_recovery: r.u64()?,
+            // The special lockout is measured against Time, which a power
+            // cycle restarts, so a record does not carry the moment it ends.
+            lockout_until: 0,
         })
     }
 }
@@ -486,6 +539,7 @@ impl TpmState {
         self.clock.clock = self.clock.clock.saturating_add(millis);
         self.clock.time = self.clock.time.saturating_add(millis);
         self.act.advance(millis);
+        self.lockout.on_time(self.clock.time);
 
         // Part 2 clause 10.10.2 requires the copy of Clock in NV to be brought
         // up to date at least every TPM_PT_CLOCK_UPDATE milliseconds. Part 1
@@ -1092,6 +1146,52 @@ mod tests {
             unique: PublicId::Ecc(Default::default()),
         };
         Object::new(public, None, rh::OWNER, &rh::OWNER.to_be_bytes(), true).unwrap()
+    }
+
+    #[test]
+    fn the_failure_counter_comes_down_with_time() {
+        // Part 1 clause 16.8.2 decrements failedTries "by one after
+        // recoveryTime seconds", and Part 3 clause 25.3.1 measures that
+        // "with respect to the Time and not Clock".
+        let mut s = TpmState::manufacture().unwrap();
+        s.lockout.recovery_time = 10;
+        s.lockout.failed_tries = 2;
+        s.lockout.next_recovery = 10_000;
+
+        s.advance_time(9_000);
+        assert_eq!(s.lockout.failed_tries, 2, "it came down too soon");
+        s.advance_time(1_000);
+        assert_eq!(s.lockout.failed_tries, 1, "it did not come down");
+        s.advance_time(10_000);
+        assert_eq!(s.lockout.failed_tries, 0);
+        s.advance_time(10_000);
+        assert_eq!(s.lockout.failed_tries, 0, "it went below zero");
+    }
+
+    #[test]
+    fn the_special_lockout_ends_after_its_own_interval() {
+        // Part 1 clause 16.8.5: the TPM leaves the special lockout "after the
+        // TPM is powered for a configurable time period (lockoutRecovery)".
+        let mut s = TpmState::manufacture().unwrap();
+        s.lockout.lockout_recovery = 5;
+        s.lockout.in_lockout = true;
+        s.lockout.lockout_until = 5_000;
+        s.advance_time(4_000);
+        assert!(s.lockout.in_lockout, "it ended too soon");
+        s.advance_time(1_000);
+        assert!(!s.lockout.in_lockout, "it did not end");
+    }
+
+    #[test]
+    fn a_recovery_time_of_zero_switches_the_protection_off() {
+        // Part 3 clause 25.3.1: with a recovery time of zero "DA protection is
+        // disabled. Authorizations are checked but authorization failures will
+        // not cause the TPM to enter lockout."
+        let mut s = TpmState::manufacture().unwrap();
+        s.lockout.recovery_time = 0;
+        assert!(s.lockout.protection_off());
+        crate::tpm::commands::dispatch::record_failure(&mut s, true).unwrap();
+        assert_eq!(s.lockout.failed_tries, 0, "a failure was counted");
     }
 
     #[test]

@@ -637,7 +637,8 @@ pub fn check_authorization(
         if !entity.user_with_auth {
             return Err(TpmRc(rc::AUTH_TYPE).with_session(position));
         }
-        return compare_auth(state, &input.hmac, &entity.auth, protected)
+        let is_lockout = request.handle(index).ok() == Some(rh::LOCKOUT);
+        return compare_auth(state, &input.hmac, &entity.auth, protected, is_lockout)
             .map_err(|e| e.with_session(position));
     }
 
@@ -679,11 +680,14 @@ pub fn check_authorization(
             input.attributes,
         )?;
         if !session::auth_hmac_accepted(&key, &expected, &input.hmac) {
+            // Part 1 clause 16.8.5: a failure against lockoutAuth enters the
+            // special lockout "regardless of the setting of failedTries and
+            // maxTries".
+            if request.handle(index).ok() == Some(rh::LOCKOUT) {
+                record_lockout_failure(state);
+            }
             return record_failure(state, protected)
                 .and(Err(TpmRc(rc::AUTH_FAIL).with_session(position)));
-        }
-        if protected {
-            clear_failures(state);
         }
     }
     Ok(())
@@ -747,7 +751,15 @@ fn check_lockout(
     index: usize,
     protected: bool,
 ) -> TpmResult<()> {
-    if !state.lockout.in_lockout || !protected {
+    // Lockout mode stops any use of a DA protected authValue, clause 16.8.3,
+    // and the special lockout of clause 16.8.5 stops the use of lockoutAuth
+    // alone.
+    let barred = if protected {
+        state.lockout.locked_out()
+    } else {
+        false
+    } || (state.lockout.in_lockout && request.handle(index).ok() == Some(rh::LOCKOUT));
+    if !barred {
         return Ok(());
     }
     // TPM2_DictionaryAttackLockReset is how a caller leaves Lockout mode, so
@@ -828,36 +840,71 @@ fn compare_auth(
     given: &[u8],
     expected: &[u8],
     uses_lockout: bool,
+    is_lockout_auth: bool,
 ) -> TpmResult<()> {
     if constant_time_eq(session::trim_auth(given), session::trim_auth(expected)) {
-        // Only a success against a protected entity clears the counter. A
-        // success against an exempt entity, such as an object with noDA or the
-        // platform hierarchy, must not let a guessing attack reset it.
-        if uses_lockout {
-            clear_failures(state);
-        }
         Ok(())
     } else {
+        if is_lockout_auth {
+            record_lockout_failure(state);
+        }
         record_failure(state, uses_lockout)?;
         Err(TpmRc(rc::AUTH_FAIL))
     }
 }
 
 /// Note a failed authorization against the dictionary attack counter.
+///
+/// Part 1 clause 16.8.2 increments failedTries whenever the TPM answers
+/// TPM_RC_AUTH_FAIL for a protected entity, and clause 16.8.3 puts the TPM in
+/// Lockout mode "while failedTries is equal to maxTries".
 pub fn record_failure(state: &mut TpmState, uses_lockout: bool) -> TpmResult<()> {
     if !uses_lockout {
         return Ok(());
     }
-    state.lockout.failed_tries = state.lockout.failed_tries.saturating_add(1);
-    if state.lockout.failed_tries >= state.lockout.max_tries {
-        state.lockout.in_lockout = true;
+    // Part 3 clause 25.3.1: with a recovery time of zero "DA protection is
+    // disabled. Authorizations are checked but authorization failures will not
+    // cause the TPM to enter lockout."
+    if state.lockout.protection_off() {
+        return Ok(());
     }
+    state.lockout.failed_tries = state.lockout.failed_tries.saturating_add(1);
+    // Clause 16.8.2 takes the counter down one recoveryTime after a failure,
+    // and clause 25.3.1 measures that against Time rather than Clock.
+    state.lockout.next_recovery = state
+        .clock
+        .time
+        .saturating_add(state.lockout.recovery_time as u64 * 1000);
     Ok(())
 }
 
+/// Note a failed authorization that used lockoutAuth.
+///
+/// Part 1 clause 16.8.5: such a failure "causes the TPM to enter this special
+/// lockout state regardless of the setting of failedTries and maxTries". The
+/// TPM leaves it after lockoutRecovery seconds of power, or, when that is zero,
+/// at the next TPM2_Startup.
+pub fn record_lockout_failure(state: &mut TpmState) {
+    state.lockout.in_lockout = true;
+    state.lockout.lockout_until = if state.lockout.lockout_recovery == 0 {
+        0
+    } else {
+        state
+            .clock
+            .time
+            .saturating_add(state.lockout.lockout_recovery as u64 * 1000)
+    };
+}
+
 /// Note a successful authorization.
+///
+/// Only TPM2_DictionaryAttackLockReset, a change of owner and TPM2_Clear put
+/// the counter back, which clause 16.8.4 lists; an ordinary success does not.
 pub fn clear_failures(state: &mut TpmState) {
     state.lockout.failed_tries = 0;
+    state.lockout.next_recovery = 0;
+    state.lockout.in_lockout = false;
+    state.lockout.lockout_until = 0;
 }
 
 /// Check that a policy session satisfies the entity's policy.
@@ -975,7 +1022,8 @@ fn check_policy(
     // TPM2_PolicyAuthValue and TPM2_PolicyPassword both require the caller to
     // prove the authorization value as well as the policy.
     if s.policy.password_needed {
-        return compare_auth(state, &input.hmac, &entity.auth, protected)
+        let is_lockout = request.handle(index).ok() == Some(rh::LOCKOUT);
+        return compare_auth(state, &input.hmac, &entity.auth, protected, is_lockout)
             .map_err(|e| e.with_session(position));
     }
     // Part 1 clause 16.6.9 gives the key for a policy session:
@@ -999,9 +1047,6 @@ fn check_policy(
     if !session::auth_hmac_accepted(&key, &expected, &input.hmac) {
         record_failure(state, protected)?;
         return Err(TpmRc(rc::AUTH_FAIL).with_session(position));
-    }
-    if protected {
-        clear_failures(state);
     }
     Ok(())
 }
@@ -1518,6 +1563,30 @@ mod tests {
         )
     }
 
+    fn owner_command(password: &[u8]) -> Vec<u8> {
+        command(
+            st::SESSIONS,
+            cc::Clear,
+            &[rh::OWNER],
+            &password_auth(password),
+            &[],
+        )
+    }
+
+    /// An entity that carries dictionary attack protection without being
+    /// lockoutAuth. Part 1 clause 16.8.1 leaves every permanent entity but
+    /// TPM_RH_LOCKOUT out of it, so an ordinary object stands in here.
+    fn protected_entity(auth: &[u8]) -> Entity {
+        Entity {
+            name: rh::OWNER.to_be_bytes().to_vec(),
+            auth: auth.to_vec(),
+            policy: None,
+            uses_lockout: true,
+            user_with_auth: true,
+            admin_with_policy: true,
+        }
+    }
+
     #[test]
     fn a_password_authorization_is_compared_against_the_entity() {
         let mut state = TpmState::manufacture().unwrap();
@@ -1702,18 +1771,53 @@ mod tests {
     #[test]
     fn repeated_failures_enter_lockout() {
         let mut state = TpmState::manufacture().unwrap();
-        state.lockout_auth = b"secret".to_vec();
+        state.hierarchies.owner.auth = b"secret".to_vec();
         state.lockout.max_tries = 3;
-        let buf = lockout_command(b"wrong");
+        let buf = owner_command(b"wrong");
         for _ in 0..3 {
             let req = parse(&state, &buf, 0).unwrap();
-            let e = entity(&state, rh::LOCKOUT).unwrap();
+            let e = protected_entity(b"secret");
             let _ = check_authorization(&mut state, &req, 0, &e, &[0u8; 32]);
         }
-        assert!(state.lockout.in_lockout);
+        // Part 1 clause 16.8.3: "the TPM is in Lockout mode while failedTries
+        // is equal to maxTries."
+        assert!(state.lockout.locked_out());
 
-        // Part 1 clause 16.8.3 refuses the protected value while the TPM is
-        // in Lockout mode, even when the caller has it right.
+        // The clause refuses the protected value while the TPM is in Lockout
+        // mode, even when the caller has it right.
+        let buf = owner_command(b"secret");
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = protected_entity(b"secret");
+        assert_eq!(
+            check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap_err(),
+            TpmRc(rc::LOCKOUT)
+        );
+
+        // Clause 16.8.4 item 1: TPM2_DictionaryAttackLockReset is what puts
+        // the counter back, and a success on its own does not.
+        state.lockout.failed_tries = 0;
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = protected_entity(b"secret");
+        check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
+        assert_eq!(state.lockout.failed_tries, 0);
+    }
+
+    #[test]
+    fn a_failure_against_lockout_auth_bars_it_by_itself() {
+        // Part 1 clause 16.8.5: such a failure "causes the TPM to enter this
+        // special lockout state regardless of the setting of failedTries and
+        // maxTries", and "when in this special lockout state, the TPM will not
+        // allow use of lockoutAuth".
+        let mut state = TpmState::manufacture().unwrap();
+        state.lockout_auth = b"secret".to_vec();
+        state.lockout.max_tries = 100;
+        let buf = lockout_command(b"wrong");
+        let req = parse(&state, &buf, 0).unwrap();
+        let e = entity(&state, rh::LOCKOUT).unwrap();
+        let _ = check_authorization(&mut state, &req, 0, &e, &[0u8; 32]);
+        assert!(state.lockout.in_lockout, "the special lockout was not entered");
+        assert!(!state.lockout.locked_out(), "lockout mode was entered as well");
+
         let buf = lockout_command(b"secret");
         let req = parse(&state, &buf, 0).unwrap();
         let e = entity(&state, rh::LOCKOUT).unwrap();
@@ -1722,12 +1826,13 @@ mod tests {
             TpmRc(rc::LOCKOUT)
         );
 
-        // Once out of Lockout mode a success clears the counter.
-        state.lockout.in_lockout = false;
+        // Another entity is not barred by it.
+        state.hierarchies.owner.auth = b"other".to_vec();
+        let buf = owner_command(b"other");
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::LOCKOUT).unwrap();
-        check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
-        assert_eq!(state.lockout.failed_tries, 0);
+        let e = entity(&state, rh::OWNER).unwrap();
+        check_authorization(&mut state, &req, 0, &e, &[0u8; 32])
+            .expect("the special lockout barred another entity");
     }
 
     #[test]
@@ -1811,6 +1916,10 @@ mod tests {
         .unwrap();
         s.bind_uses_lockout = true;
         state.sessions.insert(s).unwrap();
+        // The TPM has to be in Lockout mode for the bound session to be
+        // stopped by it, which clause 16.8.3 words as failedTries equalling
+        // maxTries.
+        state.lockout.failed_tries = state.lockout.max_tries;
 
         let auth = AuthCommand {
             session_handle: handle,
@@ -1832,16 +1941,16 @@ mod tests {
     }
 
     #[test]
-    fn a_success_against_an_exempt_entity_does_not_reset_the_counter() {
+    fn a_successful_authorization_does_not_reset_the_counter() {
         // Guessing against a protected entity, then succeeding against an
         // exempt one, must not clear the dictionary attack counter.
         let mut state = TpmState::manufacture().unwrap();
-        state.lockout_auth = b"secret".to_vec();
+        state.hierarchies.owner.auth = b"secret".to_vec();
         state.hierarchies.platform.auth = b"known".to_vec();
 
-        let buf = lockout_command(b"wrong");
+        let buf = owner_command(b"wrong");
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::LOCKOUT).unwrap();
+        let e = protected_entity(b"secret");
         let _ = check_authorization(&mut state, &req, 0, &e, &[0u8; 32]);
         assert_eq!(state.lockout.failed_tries, 1);
 
@@ -1857,12 +1966,18 @@ mod tests {
             "an exempt success cleared the counter"
         );
 
-        // A success against the protected entity does clear it.
-        let buf = lockout_command(b"secret");
+        // Nor does a success against the protected entity. Part 1 clause
+        // 16.8.4 gives three ways the counter goes down, and an ordinary
+        // success is not one: otherwise a guess could be followed by a success
+        // on an entity the attacker owns, and lockout would never arrive.
+        let buf = owner_command(b"secret");
         let req = parse(&state, &buf, 0).unwrap();
-        let e = entity(&state, rh::LOCKOUT).unwrap();
+        let e = protected_entity(b"secret");
         check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
-        assert_eq!(state.lockout.failed_tries, 0);
+        assert_eq!(
+            state.lockout.failed_tries, 1,
+            "a success put the counter back"
+        );
     }
 
     #[test]

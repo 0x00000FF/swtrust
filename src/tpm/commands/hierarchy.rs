@@ -199,8 +199,12 @@ pub fn dictionary_attack_lock_reset(
     state: &mut TpmState,
     _request: &Request,
 ) -> TpmResult<Response> {
+    // Part 1 clause 16.8.4 item 1: the command "sets failedTries to zero", and
+    // clause 16.8.5 names it as one of the two ways out of the special lockout.
     state.lockout.failed_tries = 0;
+    state.lockout.next_recovery = 0;
     state.lockout.in_lockout = false;
+    state.lockout.lockout_until = 0;
     respond(|_| Ok(()))
 }
 
@@ -215,15 +219,14 @@ pub fn dictionary_attack_parameters(
     let lockout_recovery = r.u32().map_err(|e| e.with_parameter(3))?;
     r.expect_end()?;
 
+    // Part 3 clause 25.3.1 changes the parameters and nothing else. The
+    // counter is not among them: clause 16.8.4 gives three ways it goes down
+    // and this command is not one, so setting a large maximum does not undo
+    // the failures already recorded. Lockout mode is read from the counters, so
+    // a maximum of zero puts the TPM in it without a flag of its own.
     state.lockout.max_tries = max_tries;
     state.lockout.recovery_time = recovery_time;
     state.lockout.lockout_recovery = lockout_recovery;
-    // Setting the parameters also clears the counter.
-    state.lockout.failed_tries = 0;
-    // Part 3 clause 25.3.1 makes a maximum of zero a way to put the TPM in
-    // lockout outright, so no DA protected entity can be used until the
-    // parameters are set again.
-    state.lockout.in_lockout = max_tries == 0;
     respond(|_| Ok(()))
 }
 
@@ -332,7 +335,9 @@ mod tests {
         );
         let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
         assert_eq!(response_code(&r), rc::SUCCESS);
-        assert!(state.lockout.in_lockout);
+        // Lockout mode is read from the counters rather than held in a flag,
+        // which is how Part 1 clause 16.8.3 words it.
+        assert!(state.lockout.locked_out());
         assert_eq!(state.lockout.max_tries, 0);
         assert_eq!(state.lockout.recovery_time, 100);
         assert_eq!(state.lockout.lockout_recovery, 200);
@@ -351,15 +356,26 @@ mod tests {
         let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
         assert_eq!(response_code(&r), rc::LOCKOUT);
 
-        // That reset is the way back out, and the parameters can be set again.
+        // The reset runs, because clause 16.8.3 exempts it, but it sets
+        // failedTries to zero and that is still equal to a maxTries of zero,
+        // so the TPM stays in Lockout mode and the parameters cannot be set.
         let reset = authorized(cc::DictionaryAttackLockReset, rh::LOCKOUT, &[]);
         let r = crate::tpm::commands::execute::run(&mut state, 0, &reset);
         assert_eq!(response_code(&r), rc::SUCCESS);
-        assert!(!state.lockout.in_lockout);
+        assert!(state.lockout.locked_out());
+        let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
+        assert_eq!(response_code(&r), rc::LOCKOUT);
+
+        // TPM2_Clear takes platform authorization, which clause 16.8.1 leaves
+        // out of the protection, and puts the parameters back to what a TPM
+        // is manufactured with.
+        let clear = authorized(cc::Clear, rh::PLATFORM, &[]);
+        let r = crate::tpm::commands::execute::run(&mut state, 0, &clear);
+        assert_eq!(response_code(&r), rc::SUCCESS);
+        assert!(!state.lockout.locked_out(), "TPM2_Clear left the TPM locked");
 
         let r = crate::tpm::commands::execute::run(&mut state, 0, &buf);
         assert_eq!(response_code(&r), rc::SUCCESS);
-        assert!(!state.lockout.in_lockout);
         assert_eq!(state.lockout.max_tries, 5);
     }
 
