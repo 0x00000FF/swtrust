@@ -183,6 +183,26 @@ impl Hierarchies {
     pub fn is_hierarchy(handle: u32) -> bool {
         matches!(handle, rh::PLATFORM | rh::OWNER | rh::ENDORSEMENT | rh::NULL)
     }
+
+    /// Whether `handle` is a value of TPMI_RH_HIERARCHY, Part 2 Table 59.
+    ///
+    /// The table lists the four hierarchies above and, without making them
+    /// conditional, the firmware-limited and SVN-limited ones. Part 2 clause
+    /// 4.5 has an interface type "checked by the unmarshaling code", so a
+    /// structure carrying one of those unmarshals here even though this TPM
+    /// has no such hierarchy; what is done with it fails on its own terms.
+    pub fn is_hierarchy_selector(handle: u32) -> bool {
+        use crate::tpm::constants::hc;
+        Self::is_hierarchy(handle)
+            || matches!(
+                handle,
+                rh::FW_OWNER | rh::FW_PLATFORM | rh::FW_ENDORSEMENT | rh::FW_NULL
+            )
+            || (hc::SVN_OWNER_FIRST..=hc::SVN_OWNER_LAST).contains(&handle)
+            || (hc::SVN_PLATFORM_FIRST..=hc::SVN_PLATFORM_LAST).contains(&handle)
+            || (hc::SVN_ENDORSEMENT_FIRST..=hc::SVN_ENDORSEMENT_LAST).contains(&handle)
+            || (hc::SVN_NULL_FIRST..=hc::SVN_NULL_LAST).contains(&handle)
+    }
 }
 
 #[cfg(test)]

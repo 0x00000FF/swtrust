@@ -5524,3 +5524,44 @@ fn a_ticket_may_name_a_permanent_entity() {
         r.code
     );
 }
+
+
+/// Part 3 clause 10.4.1: "This command will operate when the TPM is in Failure
+/// mode so that software can determine the test status of the TPM and so that
+/// diagnostic information can be obtained for use in failure analysis. If the
+/// TPM is in Failure mode, then tag is required to be TPM_ST_NO_SESSIONS or the
+/// TPM shall return TPM_RC_FAILURE."
+#[test]
+fn a_tpm_in_failure_mode_answers_only_a_command_without_sessions() {
+    let h = Harness::started("failuretag");
+    h.tpm.with_state_mut(|s| s.failure_mode = true);
+
+    // Without sessions the command answers, which is what failure analysis
+    // depends on.
+    let r = h.send(&command(st::NO_SESSIONS, cc::GetTestResult, &[], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS, "GetTestResult -> {:08x}", r.code);
+    assert_eq!(
+        u32::from_be_bytes([r.body[34], r.body[35], r.body[36], r.body[37]]),
+        rc::FAILURE,
+        "the test result did not report the failure"
+    );
+
+    // With a session it does not.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::GetTestResult,
+        &[],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(
+        r.code,
+        rc::FAILURE,
+        "a session tagged command was answered in failure mode -> {:08x}",
+        r.code
+    );
+
+    // And a command that is not one of the two is refused either way.
+    let r = h.send(&command(st::NO_SESSIONS, cc::GetRandom, &[], None, &[0, 8]));
+    assert_eq!(r.code, rc::FAILURE);
+}

@@ -1565,8 +1565,10 @@ fn check_key_name(name: &[u8]) -> TpmResult<()> {
     if name.len() < 2 {
         return Err(TpmRc(rc::SIZE));
     }
+    // Any hash the TCG registry assigns, because the key may belong to the TPM
+    // the policy is being built for rather than to this one.
     let alg_id = u16::from_be_bytes([name[0], name[1]]);
-    let size = hash::digest_size(alg_id).map_err(|_| TpmRc(rc::HASH))?;
+    let size = crate::tpm::structures::base::digest_size(alg_id).ok_or(TpmRc(rc::HASH))?;
     if name.len() != 2 + size {
         return Err(TpmRc(rc::SIZE));
     }

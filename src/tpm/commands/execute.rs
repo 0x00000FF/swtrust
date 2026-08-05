@@ -29,6 +29,15 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     if state.failure_mode && !dispatch::allowed_in_failure_mode(request.code) {
         return Err(TpmRc(rc::FAILURE));
     }
+    // Part 3 clause 10.4.1 adds a rule for the command that reports the test
+    // results: "This command will operate when the TPM is in Failure mode so
+    // that software can determine the test status of the TPM... If the TPM is
+    // in Failure mode, then tag is required to be TPM_ST_NO_SESSIONS or the TPM
+    // shall return TPM_RC_FAILURE." A TPM in failure mode has no working
+    // session logic to answer an authorization with.
+    if state.failure_mode && request.tag != crate::tpm::constants::st::NO_SESSIONS {
+        return Err(TpmRc(rc::FAILURE));
+    }
     if !state.started && !dispatch::allowed_before_startup(request.code) {
         return Err(TpmRc(rc::INITIALIZE));
     }

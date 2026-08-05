@@ -171,11 +171,12 @@ impl Ticket {
             return Err(TpmRc(rc::TAG));
         }
         // Part 2 Table 105 gives a TPMT_TK_AUTH a TPMI_RH_HIERARCHY+ hierarchy,
-        // and Table 71 ends that type with "#TPM_RC_VALUE — response code
-        // returned if the handle is out of range", so a handle that names no
-        // hierarchy does not unmarshal.
+        // and Table 59 ends that type with TPM_RC_VALUE, so a handle that is
+        // not one of its values does not unmarshal. The firmware-limited and
+        // SVN-limited hierarchies are among them whether or not this TPM has
+        // any: a ticket naming one simply fails to verify.
         let hierarchy = r.u32()?;
-        if !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(hierarchy) {
+        if !crate::tpm::core::hierarchy::Hierarchies::is_hierarchy_selector(hierarchy) {
             return Err(TpmRc(rc::VALUE));
         }
         Ok(Ticket {
