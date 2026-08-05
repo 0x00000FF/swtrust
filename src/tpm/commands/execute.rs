@@ -111,6 +111,7 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     // the handle number in the N field, and this is where the number is known.
     let mut names: Vec<Vec<u8>> = Vec::with_capacity(request.handles.len());
     for (index, h) in request.handles.iter().enumerate() {
+        dispatch::check_handle_available(state, *h).map_err(|e| e.with_handle(index + 1))?;
         names.push(dispatch::handle_name(state, *h).map_err(|e| e.with_handle(index + 1))?);
     }
 

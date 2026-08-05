@@ -153,7 +153,17 @@ fn attest_and_sign(
     // of attestations by different keys. To provide improved privacy, the
     // resetCount, restartCount, and firmwareVersion numbers are obfuscated
     // when the signing key is not in the Endorsement or Platform hierarchies."
-    let (clock, firmware) = obfuscated(state, sign_handle, &qualified_signer)?;
+    // Part 3 clause 18.1 takes signHandle->QN as the contextU of the KDF, so
+    // that "the obfuscation value for each signing key will be unique to that
+    // key in a specific location". An anonymous attestation leaves the Name out
+    // of the structure but the key still has one, and the QN of TPM_RH_NULL is
+    // TPM_RH_NULL rather than nothing at all.
+    let obfuscation_name = if sign_handle == rh::NULL {
+        rh::NULL.to_be_bytes().to_vec()
+    } else {
+        signing_object(state, sign_handle)?.qualified_name.clone()
+    };
+    let (clock, firmware) = obfuscated(state, sign_handle, &obfuscation_name)?;
     let attest = Attest::new(
         Tpm2bName::from_slice(&qualified_signer)?,
         extra_data.clone(),
@@ -308,9 +318,11 @@ pub fn quote(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     // TPM_ALG_NULL, then the TPM shall return TPM_RC_SCHEME." The nameAlg of
     // the key is a different algorithm whenever the two were chosen apart.
     let hash_alg = if sign_handle == rh::NULL {
+        // The clause makes no exception for an unsigned quote: without a
+        // scheme there is no algorithm to hash the registers with.
         in_scheme
             .hash_alg()
-            .unwrap_or(crate::tpm::config::CONTEXT_INTEGRITY_HASH_ALG)
+            .ok_or(TpmRc(rc::SCHEME).with_parameter(2))?
     } else {
         let object = signing_object(state, sign_handle).map_err(|e| e.with_handle(1))?;
         let scheme = super::crypto::signing_scheme_at(&object, &in_scheme, 2)?;

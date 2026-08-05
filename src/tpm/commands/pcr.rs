@@ -156,6 +156,19 @@ pub fn pcr_allocate(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     if allocation.is_empty() {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
+    // Clause 22.5.1: "when PCR are allocated, if DRTM_PCR is defined, the
+    // resulting allocation must have at least one bank with the D-RTM PCR
+    // allocated. If HCRTM_PCR is defined, the resulting allocation must have at
+    // least one bank with the HCRTM_PCR allocated. If not, the TPM returns
+    // TPM_RC_PCR."
+    for required in [config::DRTM_PCR, config::HCRTM_PCR] {
+        let anywhere = allocation
+            .iter()
+            .any(|(_, bits)| bits.get(required as usize).copied().unwrap_or(false));
+        if !anywhere {
+            return Err(TpmRc(rc::PCR).with_parameter(1));
+        }
+    }
     if allocation.len() > config::HASH_COUNT {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
@@ -163,6 +176,11 @@ pub fn pcr_allocate(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     // The allocation takes effect at the next TPM Reset, so only the recorded
     // choice changes now.
     state.pcr_allocation = allocation;
+    // "After this command, TPM2_Shutdown() is only allowed to have a
+    // startupType equal to TPM_SU_CLEAR until after the next _TPM_Init", which
+    // the note beside it applies "even if this command does not cause the PCR
+    // allocation to change".
+    state.pcr_allocation_pending = true;
     let max_pcr = config::IMPLEMENTATION_PCR as u32;
     let size_needed = state.pcr_allocation.len() as u32 * max_pcr;
     let size_available = (config::NV_MEMORY_SIZE - state.nv.used()) as u32;

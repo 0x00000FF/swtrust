@@ -60,6 +60,11 @@ pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
     let shutdown_type = r.u16().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
     match shutdown_type {
+        su::STATE if state.pcr_allocation_pending => {
+            // Part 3 clause 22.5.1 allows only TPM_SU_CLEAR after
+            // TPM2_PCR_Allocate, until the next _TPM_Init.
+            return Err(TpmRc(rc::VALUE).with_parameter(1));
+        }
         su::CLEAR | su::STATE => {
             state.shutdown_type = shutdown_type;
             // safe is deliberately left as it is. Part 1 clause 33.3.3: "If
@@ -420,11 +425,16 @@ fn build_capability(
             Ok((more, Capabilities::AuditCommands(TpmlCc { items })))
         }
         cap::PCRS => {
+            // Part 3 clause 30.2 returns "the current allocation of PCR in a
+            // TPM", which Part 1 clause 14.8 chooses per register, so a bank
+            // that was given some of them says so.
             let mut items = Vec::new();
-            for a in state.pcr.algorithms() {
+            for (a, bits) in state.pcr.allocation() {
                 let mut select = PcrSelect::none();
-                for i in 0..config::IMPLEMENTATION_PCR as usize {
-                    select.select(i);
+                for (i, set) in bits.iter().enumerate() {
+                    if *set {
+                        select.select(i);
+                    }
                 }
                 items.push(crate::tpm::structures::base::PcrSelection::new(a, select));
             }

@@ -395,6 +395,14 @@ pub struct TpmState {
     // Values that do not survive power loss.
     pub started: bool,
     pub startup_clear: StartupClearAttributes,
+    /// Set by TPM2_PCR_Allocate and cleared by the next _TPM_Init.
+    ///
+    /// Part 3 clause 22.5.1: "after this command, TPM2_Shutdown() is only
+    /// allowed to have a startupType equal to TPM_SU_CLEAR until after the next
+    /// _TPM_Init", and the note beside it says that holds "even if this command
+    /// does not cause the PCR allocation to change". It is volatile, because a
+    /// shutdown that could record it is the one the rule forbids.
+    pub pcr_allocation_pending: bool,
     pub pcr: PcrBanks,
     pub objects: ObjectSlots,
     pub sessions: SessionSlots,
@@ -478,6 +486,7 @@ impl TpmState {
             shutdown_type: su::NONE,
             started: false,
             startup_clear: StartupClearAttributes(0),
+            pcr_allocation_pending: false,
             pcr: PcrBanks::new(&PcrBanks::whole_banks(config::DEFAULT_PCR_BANKS))?,
             objects: ObjectSlots::new(),
             sessions: SessionSlots::new(),
@@ -657,6 +666,8 @@ impl TpmState {
     /// type goes back to `su::NONE` so a power loss from here is seen as the
     /// disorderly shutdown that it is.
     fn begin_operation(&mut self, orderly: bool, keep_read_only: bool) {
+        // Clause 22.5.1 lifts the restriction "after the next _TPM_Init".
+        self.pcr_allocation_pending = false;
         let mut attributes = StartupClearAttributes::PH_ENABLE
             | StartupClearAttributes::SH_ENABLE
             | StartupClearAttributes::EH_ENABLE

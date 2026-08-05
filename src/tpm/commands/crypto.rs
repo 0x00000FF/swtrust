@@ -1022,6 +1022,22 @@ pub fn ecdh_zgen(state: &TpmState, request: &Request) -> TpmResult<Response> {
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }
+    // Part 3 clause 14.5.1: the key "shall be restricted CLEAR
+    // (TPM_RC_ATTRIBUTES)" and its scheme "shall be TPM_ALG_ECDH or
+    // TPM_ALG_NULL (TPM_RC_SCHEME)". A restricted key would otherwise answer
+    // with a shared secret the TPM is supposed to keep to itself.
+    if object
+        .public
+        .object_attributes
+        .has(ObjectAttributes::RESTRICTED)
+    {
+        return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
+    }
+    if let Some(scheme) = object.public.scheme() {
+        if !scheme.is_null() && scheme.scheme != alg::ECDH {
+            return Err(TpmRc(rc::SCHEME).with_handle(1));
+        }
+    }
     let Some(sensitive) = &object.sensitive else {
         return Err(TpmRc(rc::HANDLE).with_handle(1));
     };

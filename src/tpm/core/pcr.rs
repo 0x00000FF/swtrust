@@ -415,6 +415,12 @@ impl PcrBanks {
 
     /// Extend one PCR in one bank with an already computed digest.
     pub fn extend_digest(&mut self, hash_alg: u16, index: u16, digest: &[u8]) -> TpmResult<()> {
+        // Part 3 clause 22.2.1 extends a bank only where "the PCR is
+        // implemented for the algorithm", and clause 14.8 makes that the
+        // registers the allocation gave the bank.
+        if !self.has_pcr(hash_alg, index) {
+            return Ok(());
+        }
         if !is_implemented(index) {
             return Err(TpmRc(rc::VALUE));
         }

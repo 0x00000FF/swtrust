@@ -198,6 +198,47 @@ pub fn handle_name(state: &TpmState, handle: u32) -> TpmResult<Vec<u8>> {
     Ok(names::handle_name(handle))
 }
 
+/// Refuse a handle whose hierarchy has been turned off.
+///
+/// Part 3 clause 24.3.1: clearing an enable "will disable use of any persistent
+/// entity associated with the disabled hierarchy", clearing shEnable disables
+/// the NV Indices the owner defined and clearing phEnableNV those the platform
+/// defined. Part 1 clause 9.4 bars the authValue and authPolicy of a hierarchy
+/// whose enable is CLEAR. This runs over the handle area before the command
+/// does, so a command that takes no authorization is stopped as well.
+pub fn check_handle_available(state: &TpmState, handle: u32) -> TpmResult<()> {
+    if crate::tpm::core::hierarchy::Hierarchies::is_hierarchy(handle) {
+        if !state.hierarchies.is_enabled(handle) {
+            return Err(TpmRc(rc::HIERARCHY));
+        }
+        return Ok(());
+    }
+    if (hc::PERSISTENT_FIRST..=hc::PERSISTENT_LAST).contains(&handle) {
+        if let Some(object) = state.persistent.get(&handle) {
+            if !state.hierarchies.is_enabled(object.hierarchy) {
+                return Err(TpmRc(rc::HIERARCHY));
+            }
+        }
+        return Ok(());
+    }
+    if crate::tpm::core::nv::NvStore::is_nv_handle(handle) {
+        if let Ok(index) = state.nv.get(handle) {
+            let platform_created = index.public.attributes.has(
+                crate::tpm::structures::attributes::NvAttributes::PLATFORMCREATE,
+            );
+            let reachable = if platform_created {
+                state.hierarchies.platform_nv_enabled
+            } else {
+                state.hierarchies.owner.enabled
+            };
+            if !reachable {
+                return Err(TpmRc(rc::HANDLE));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve the authorization values of a handle.
 pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
     use crate::tpm::structures::attributes::{NvAttributes, ObjectAttributes};

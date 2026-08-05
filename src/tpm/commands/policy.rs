@@ -555,6 +555,21 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
             return Err(TpmRc(rc::NV_AUTHORIZATION).with_handle(1));
         }
     }
+    // Part 3 clause 23.4.1: "a password session, an HMAC session, or a policy
+    // session containing TPM2_PolicyAuthValue() or TPM2_PolicyPassword() will
+    // satisfy this requirement. If a policy session is used and use of the
+    // authValue of authHandle is not required, the TPM will return
+    // TPM_RC_MODE." Without it a policy that proves only the authPolicy would
+    // stand in for knowing the secret.
+    if let Some(input) = request.sessions.first() {
+        if input.handle != rh::RS_PW {
+            if let Ok(s) = state.sessions.get(input.handle) {
+                if s.is_policy() && !s.policy.auth_value_needed && !s.policy.password_needed {
+                    return Err(TpmRc(rc::MODE).with_session(1));
+                }
+            }
+        }
+    }
     let is_trial = policy_session(state, policy_session_handle)?.is_trial();
     let session_nonce = policy_session(state, policy_session_handle)?
         .nonce_tpm
@@ -574,19 +589,33 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
             return Err(TpmRc(rc::EXPIRED).with_parameter(4));
         }
     }
+    // Part 3 clause 23.2.5: "if the authHandle in TPM2_PolicySecret()
+    // references a PIN Pass Index, then the command may succeed but a NULL
+    // Ticket will be returned." A ticket would let the policy be satisfied
+    // again without the Index counting the use, which is the whole of what a
+    // PIN Pass Index is for.
+    let pin_pass = crate::tpm::core::nv::NvStore::is_nv_handle(auth_handle)
+        && state.nv.get(auth_handle).is_ok_and(|i| {
+            i.public.attributes.index_type()
+                == crate::tpm::structures::attributes::nt::PIN_PASS
+        });
     let hierarchy = ticket_hierarchy(state, auth_handle);
-    let ticket = build_authorization_ticket(
-        state,
-        st::AUTH_SECRET,
-        hierarchy,
-        expiration,
-        &timeout,
-        cp_hash_a.as_slice(),
-        policy_ref.as_slice(),
-        &auth_name,
-        is_trial,
-        !nonce_tpm.is_empty(),
-    )?;
+    let ticket = if pin_pass {
+        Ticket::null(st::AUTH_SECRET)
+    } else {
+        build_authorization_ticket(
+            state,
+            st::AUTH_SECRET,
+            hierarchy,
+            expiration,
+            &timeout,
+            cp_hash_a.as_slice(),
+            policy_ref.as_slice(),
+            &auth_name,
+            is_trial,
+            !nonce_tpm.is_empty(),
+        )?
+    };
 
     // Part 3 clause 5.6 leaves the TPM unchanged when a command fails, so the
     // restriction is checked before the policy digest moves.

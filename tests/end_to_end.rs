@@ -1601,6 +1601,72 @@ fn pcr_allocate_changes_only_the_banks_it_names() {
 }
 
 #[test]
+fn a_disabled_hierarchy_hides_its_persistent_object_from_every_command() {
+    // Part 3 clause 24.3.1: clearing an enable "will disable use of any
+    // persistent entity associated with the disabled hierarchy". A command
+    // that takes no authorization reaches such an object too, so the check
+    // belongs to the handle area rather than to the authorization.
+    let h = Harness::started("disabledpersistent");
+    let handle = ecc_kem_key(&h, None);
+    let mut p = Writer::new();
+    p.u32(0x8100_0050);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::EvictControl,
+        &[rh::OWNER, handle],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "EvictControl -> {:08x}", r.code);
+
+    // TPM2_ReadPublic takes no authorization at all.
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::ReadPublic,
+        &[0x8100_0050],
+        None,
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "ReadPublic -> {:08x}", r.code);
+
+    let mut p = Writer::new();
+    p.u32(rh::OWNER);
+    p.u8(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyControl,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "HierarchyControl -> {:08x}", r.code);
+
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::ReadPublic,
+        &[0x8100_0050],
+        None,
+        &[],
+    ));
+    assert_eq!(
+        r.code,
+        rc::HIERARCHY | (1 << 8),
+        "a disabled hierarchy's object was still read -> {:08x}",
+        r.code
+    );
+
+    // The hierarchy's own authorization is barred as well.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Clear,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_ne!(r.code, rc::SUCCESS, "a disabled hierarchy authorized a command");
+}
+
+#[test]
 fn a_context_of_a_disabled_hierarchy_does_not_load() {
     // Part 3 clause 28.3.1: "the TPM will return TPM_RC_HIERARCHY if the
     // context is associated with a hierarchy that is disabled."
