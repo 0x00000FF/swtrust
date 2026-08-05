@@ -248,11 +248,13 @@ TPM is exercised by: firmware, BitLocker, and the tools that talk to a TPM.
 
 ## Commands that report a limitation
 
-- TPM2_ACT_SetTimeout, TPM2_AC_Send and TPM2_SetCapability answer
-  TPM_RC_VALUE because this TPM has no authenticated timers, no attached
-  components and no settable capability. They are implemented and reported as
-  implemented: they check their arguments and refuse a request they cannot
-  carry out, rather than denying that the command exists.
+- TPM2_AC_Send and TPM2_SetCapability answer TPM_RC_VALUE because this TPM has
+  no attached components and no settable capability. They are implemented and
+  reported as implemented: they check their arguments and refuse a request they
+  cannot carry out, rather than denying that the command exists.
+- TPM2_ACT_SetTimeout sets the one timer the PC Client profile clause 5.1.2
+  asks of a TPM that implements the command, TPM_RH_ACT_0, and answers
+  TPM_RC_VALUE for any other timer handle.
 - TPM2_Encapsulate and TPM2_Decapsulate work over ECC. The ML-KEM form is
   refused with TPM_RC_TYPE, as ML-KEM is not implemented.
 

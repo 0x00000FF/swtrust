@@ -5985,6 +5985,24 @@ fn a_command_that_writes_nv_is_refused_while_nv_is_away() {
         rc::NV_UNAVAILABLE,
         "a command that writes NV ran while NV was away"
     );
+    // Part 3 clause 4.2.6: "Any command that uses authorization may cause a
+    // write to NV if there is an authorization failure", so a command carrying
+    // an authorization is refused as well, whatever the table says of it.
+    let mut p = Writer::new();
+    p.u16(0); // qualifyingData
+    p.u16(alg::NULL); // inScheme
+    assert_eq!(
+        h.send(&command(
+            st::SESSIONS,
+            cc::GetTime,
+            &[rh::ENDORSEMENT, rh::NULL],
+            Some(&password_sessions(2)),
+            &p.finish().unwrap(),
+        ))
+        .code,
+        rc::NV_UNAVAILABLE,
+        "a command with an authorization ran while NV was away"
+    );
     assert_eq!(
         counter(),
         before,

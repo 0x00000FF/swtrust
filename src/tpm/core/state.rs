@@ -165,6 +165,22 @@ impl LockoutState {
         }
     }
 
+    /// Count the authorization failure a non-orderly shutdown may have hidden.
+    ///
+    /// Part 1 clause 16.8.6: "at TPM2_Startup(), the TPM checks if it is
+    /// starting after an orderly shutdown. If not, and failedTries is not
+    /// already equal to maxTries, then the TPM will increment failedTries by
+    /// one", so that an attacker cannot try an authorization while NV cannot
+    /// be written and then reset the TPM to forget it.
+    pub fn count_pending_failure(&mut self) {
+        if self.protection_off() {
+            return;
+        }
+        if self.failed_tries < self.max_tries {
+            self.failed_tries += 1;
+        }
+    }
+
     /// Start the timers again against a Time that has just gone back to zero.
     ///
     /// Part 3 clause 25.3.1 measures both against Time, which every startup
@@ -435,6 +451,16 @@ pub struct TpmState {
     pub locality: u8,
     pub physical_presence: bool,
     pub nv_available: bool,
+    /// Set when a write of the state did not reach the file.
+    ///
+    /// Part 1 clause 36.2: "When a command modifies NV RAM, the action of
+    /// writing the NV may fail and it may not be recoverable. If the TPM cannot
+    /// recover from the NV write failure, then it should disable the NV so that
+    /// the affected NV locations cannot be accessed." What the TPM holds and
+    /// what the file holds have parted company at that point, so nothing more
+    /// is written until a restart reads the file again, and what the failed
+    /// command did cannot become permanent behind the caller's back.
+    pub nv_write_failed: bool,
     pub failure_mode: bool,
     pub self_test_done: bool,
     /// Digest of the running image from the pre-operational integrity test,
@@ -559,6 +585,7 @@ impl TpmState {
             locality: 0,
             physical_presence: false,
             nv_available: true,
+            nv_write_failed: false,
             failure_mode: false,
             self_test_done: true,
             commits: crate::tpm::core::commit::Commits::new(),
@@ -659,6 +686,17 @@ impl TpmState {
         // so no non-orderly one, which is what the flag taken above tells apart.
         if disorderly && ever_started {
             self.clock.safe = false;
+            // Part 1 clause 16.8.6: "It is possible that the TPM will be reset
+            // when a write to the NV version of failedTries is pending. If the
+            // TPM did not handle this special case, then an attacker could try
+            // an authorization for a DA protected object when NV writes are
+            // not possible. When the TPM restarted, the failed attempt would
+            // not be recorded, and the attacker could try again. To prevent
+            // this type of attack, at TPM2_Startup(), the TPM checks if it is
+            // starting after an orderly shutdown. If not, and failedTries is
+            // not already equal to maxTries, then the TPM will increment
+            // failedTries by one."
+            self.lockout.count_pending_failure();
         }
         // Part 1 clause 34.4 lists the command audit digest among the values a
         // TPM Reset returns to their initialization value. A TPM Restart keeps

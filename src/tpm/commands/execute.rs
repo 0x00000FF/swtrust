@@ -47,10 +47,16 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     // operations that require update of NV will return TPM_RC_NV_UNAVAILABLE."
     // The answer comes before the command runs, so nothing changes that the
     // file cannot be told about.
+    // Part 3 clause 4.2.6 adds to the commands the table marks: "Any command
+    // that uses authorization may cause a write to NV if there is an
+    // authorization failure", which Part 1 clause 7.4 counts as NV state. A
+    // command carrying an authorization session is therefore one that may
+    // require an NV update, whatever its own decoration says.
     let writes_nv = super::table::lookup(request.code)
         .map(|i| i.nv)
-        .unwrap_or(false);
-    if !state.nv_available && writes_nv {
+        .unwrap_or(false)
+        || request.info.auth_handles > 0;
+    if (!state.nv_available || state.nv_write_failed) && writes_nv {
         return Err(TpmRc(rc::NV_UNAVAILABLE));
     }
     if state.started && request.code == cc::Startup {

@@ -409,8 +409,9 @@ pub fn rewrap(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
 
 /// TPM2_ACT_SetTimeout, Part 3 clause 37.2.
 ///
-/// This TPM implements no authenticated timers, so every ACT handle is
-/// refused rather than silently accepted.
+/// The PC Client Platform TPM Profile clause 5.1.2 asks a TPM that implements
+/// this command for one timer, TPM_RH_ACT_0, which this one has. Any other ACT
+/// handle names a timer that is not there and is refused.
 pub fn act_set_timeout(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
     let mut r = request.reader();

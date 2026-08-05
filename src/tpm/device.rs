@@ -289,6 +289,26 @@ impl Tpm {
     }
 }
 
+/// The NV state a command may change without the table saying so.
+#[derive(PartialEq, Eq)]
+struct NvWitness {
+    failed_tries: u32,
+    in_lockout: bool,
+    audit_counter: u64,
+    audit_digest: Vec<u8>,
+}
+
+impl NvWitness {
+    fn of(state: &TpmState) -> NvWitness {
+        NvWitness {
+            failed_tries: state.lockout.failed_tries,
+            in_lockout: state.lockout.in_lockout,
+            audit_counter: state.audit.counter,
+            audit_digest: state.audit.digest.clone(),
+        }
+    }
+}
+
 impl Device for Tpm {
     fn execute(&self, locality: u8, command: &[u8]) -> Vec<u8> {
         if !self.powered.load(Ordering::SeqCst) {
@@ -296,6 +316,12 @@ impl Device for Tpm {
         }
         let code = parse_header(command).map(|h| h.code).ok();
         let elapsed = self.elapsed();
+        // Part 3 clause 4.2.6: "Any command that uses authorization may cause a
+        // write to NV if there is an authorization failure", and Part 1 clause
+        // 32 counts the audit log among the values NV holds. Neither shows in
+        // the command table, so what the command changed is compared rather
+        // than what its decoration says.
+        let before = NvWitness::of(&self.locked());
         let (response, clock_rolled_over) = {
             let mut state = self.locked();
             // Part 1 clause 31.1: "During an H-CRTM sequence, if any indication
@@ -319,17 +345,22 @@ impl Device for Tpm {
         // the state file matches what the TPM reports. So is a rollover of the
         // clock, which is the moment Part 2 clause 10.10.2 asks for the copy in
         // NV to be brought up to date.
-        let writes_nv = code.map(Tpm::writes_nv).unwrap_or(false);
+        let writes_nv =
+            code.map(Tpm::writes_nv).unwrap_or(false) || NvWitness::of(&self.locked()) != before;
         if (writes_nv || clock_rolled_over) && !self.persist() {
             // Part 1 clause 34.7.2.2 answers TPM_RC_NV_UNAVAILABLE when the
             // memory cannot be updated. This one was reached only after the
-            // command ran, so what the TPM holds and what the file holds have
-            // parted company; clause 34.7.3 says that where "recovery from an
-            // actual write failure is impossible, the TPM should disable the
-            // affected NV locations", so NV is marked away and every later
-            // command that would write it is refused before it changes
-            // anything. The platform brings NV back with its own signal.
-            self.locked().nv_available = false;
+            // command ran, so clause 36.2 applies: "if the TPM cannot recover
+            // from the NV write failure, then it should disable the NV so that
+            // the affected NV locations cannot be accessed". Nothing more is
+            // written until a restart reads the file again, so what the failed
+            // command did cannot become permanent after the caller was told it
+            // had not.
+            {
+                let mut state = self.locked();
+                state.nv_available = false;
+                state.nv_write_failed = true;
+            }
             self.logger
                 .line("NV is no longer available: the state could not be written");
             if writes_nv {
