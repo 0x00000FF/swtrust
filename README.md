@@ -74,6 +74,17 @@ recorded which startup method it last used cannot answer what
 TPM2_Startup(TPM_SU_STATE) has to compare against, so the first startup after
 such an upgrade has to be TPM_SU_CLEAR.
 
+### Software integrity
+
+FIPS 140-3 clause 10.3.1 has a module decide for itself whether its code is the
+code it was built as, by comparing it against a value the module holds. A cargo
+build has no step that can write such a value into the executable after linking,
+so packaging runs the executable once with `--record-integrity`, which writes it
+to `<state-dir>/integrity.hex`. Every later start compares the running image
+against that file: a value that differs is a failed test and the daemon stops,
+and no file at all is reported as a test that was not performed rather than as
+one that passed.
+
 ### Logs
 
 Every command and response pair is appended to `<log-dir>/YYYY-MM-DD.log`,

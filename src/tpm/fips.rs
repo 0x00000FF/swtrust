@@ -437,46 +437,70 @@ pub fn integrity() -> Result<Vec<u8>, Failure> {
 
 /// The pre-operational software integrity test, 140-3 clause 10.3.1.
 ///
-/// The clause requires the module itself to decide whether the test passes,
-/// which means comparing the code above with a value the module already holds.
-/// A module submitted for validation is given that value when it is built, by
-/// a step that writes it into the image after linking. This one is built by
-/// cargo, which has no such step, so the value is written beside the state the
-/// first time the module runs and compared on every run after that. What that
-/// detects is a change to the executable made since it was installed here,
-/// which is what the test is for; what it cannot detect is an executable that
-/// was already modified when it first ran.
+/// "All self-tests shall be performed, and determination of pass or fail shall
+/// be made by the module, without external controls, externally provided input
+/// text vectors, expected output results, or operator intervention." The value
+/// this compares against therefore has to come from the module itself, which
+/// for a software module means a step that writes it into the image, or beside
+/// it, after linking. Cargo has no such step, so this build is packaged by
+/// running it once with `--record-integrity`, which is what writes the file.
 ///
-/// `expected_at` is the file that holds the value. A file that cannot be read
-/// or written is not a failed test, because a module that has never recorded
-/// its own code has nothing to compare with; a file that holds a different
-/// value is.
-pub fn integrity_test(expected_at: &std::path::Path) -> Result<Vec<u8>, Failure> {
-    let mac = integrity()?;
-    let recorded = std::fs::read(expected_at).ok().and_then(|raw| {
-        let text = String::from_utf8(raw).ok()?;
-        let hex = text.trim();
-        (hex.len() == mac.len() * 2)
-            .then(|| {
-                (0..hex.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-                    .collect::<Option<Vec<u8>>>()
-            })
-            .flatten()
-    });
-    match recorded {
-        Some(value) => {
-            if !crate::tpm::core::protect::constant_time_eq(&value, &mac) {
-                return Err(Failure("integrity"));
-            }
-        }
-        None => {
-            let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
-            let _ = std::fs::write(expected_at, hex);
+/// The three outcomes are:
+///
+/// - the file holds a value that matches the code: the test passed;
+/// - the file holds anything else, including a value of the wrong shape: the
+///   test failed, and the caller is expected to stop;
+/// - the file is not there: the module was not packaged, so the test was not
+///   performed. That is reported as such rather than as a pass, because a
+///   module that records its own code at the moment it first runs would bless
+///   whatever it had become by then.
+pub enum Integrity {
+    /// The code matched the recorded value.
+    Passed(Vec<u8>),
+    /// No value was recorded, so nothing was verified.
+    NotPerformed(Vec<u8>),
+}
+
+impl Integrity {
+    /// The message authentication code over the image, whatever the outcome.
+    pub fn code(&self) -> &[u8] {
+        match self {
+            Integrity::Passed(v) | Integrity::NotPerformed(v) => v,
         }
     }
+}
+
+/// Compare the running image with the value recorded beside it.
+pub fn integrity_test(expected_at: &std::path::Path) -> Result<Integrity, Failure> {
+    let mac = integrity()?;
+    let Ok(raw) = std::fs::read(expected_at) else {
+        return Ok(Integrity::NotPerformed(mac));
+    };
+    let recorded = decode_hex(&raw).ok_or(Failure("integrity"))?;
+    if !crate::tpm::core::protect::constant_time_eq(&recorded, &mac) {
+        return Err(Failure("integrity"));
+    }
+    Ok(Integrity::Passed(mac))
+}
+
+/// Write the value the test will compare against, which packaging does once.
+pub fn record_integrity(expected_at: &std::path::Path) -> Result<Vec<u8>, Failure> {
+    let mac = integrity()?;
+    let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(expected_at, hex).map_err(|_| Failure("integrity"))?;
     Ok(mac)
+}
+
+/// A digest written as hex, of any length.
+fn decode_hex(raw: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    if text.is_empty() || text.len() % 2 != 0 {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// Pair-wise consistency test for a generated RSA key, 140-3 Table 40.
@@ -885,9 +909,11 @@ mod tests {
     }
 
     #[test]
-    fn the_integrity_test_compares_against_what_it_recorded() {
+    fn the_integrity_test_compares_against_what_was_recorded() {
         // FIPS 140-3 clause 10.3.1 has the module decide whether the test
-        // passed, which means comparing the code against a value it holds.
+        // passed, "without external controls, externally provided input text
+        // vectors, expected output results, or operator intervention". The
+        // value is written by the packaging step and compared here.
         let mut dir = std::env::temp_dir();
         dir.push(format!(
             "swtrust-integrity-{}-{}",
@@ -897,26 +923,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let at = dir.join("integrity.hex");
 
-        // The first run has nothing to compare with and records the value.
-        let first = integrity_test(&at).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&at).unwrap().trim().len(),
-            first.len() * 2
-        );
-        // The next run compares and agrees.
-        assert_eq!(integrity_test(&at).unwrap(), first);
+        // Nothing recorded: the test was not performed, and nothing is written
+        // on its behalf.
+        let outcome = integrity_test(&at).unwrap();
+        assert!(matches!(outcome, Integrity::NotPerformed(_)));
+        assert!(!at.exists(), "the module recorded its own code");
 
-        // A recorded value that does not match the image is a failed test.
-        let mut wrong: String = first.iter().map(|b| format!("{b:02x}")).collect();
+        // Once packaging records it, the test passes.
+        let mac = record_integrity(&at).unwrap();
+        assert_eq!(outcome.code(), &mac[..]);
+        assert!(matches!(integrity_test(&at).unwrap(), Integrity::Passed(_)));
+
+        // A recorded value that does not match the image is a failed test, and
+        // so is one of no shape at all.
+        let mut wrong: String = mac.iter().map(|b| format!("{b:02x}")).collect();
         wrong.replace_range(0..1, if wrong.starts_with('0') { "1" } else { "0" });
         std::fs::write(&at, &wrong).unwrap();
-        assert_eq!(integrity_test(&at), Err(Failure("integrity")));
-
-        // A value of the wrong shape is treated as none at all, and recorded.
+        assert_eq!(integrity_test(&at).err(), Some(Failure("integrity")));
         std::fs::write(&at, "not a digest").unwrap();
-        assert_eq!(integrity_test(&at).unwrap(), first);
+        assert_eq!(integrity_test(&at).err(), Some(Failure("integrity")));
 
         let _ = std::fs::remove_dir_all(&dir);
+
     }
 
     #[test]

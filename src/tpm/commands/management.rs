@@ -132,8 +132,11 @@ pub fn run_self_tests(state: &mut TpmState) -> TpmResult<()> {
             return Err(TpmRc(rc::FAILURE));
         }
     }
+    // TPM2_SelfTest runs the same test against the same file the module was
+    // started with. A module that was never packaged has no recorded value,
+    // and the code is reported without a claim that it was verified.
     let integrity = match &state.integrity_file {
-        Some(at) => fips::integrity_test(at),
+        Some(at) => fips::integrity_test(at).map(|o| o.code().to_vec()),
         None => fips::integrity(),
     };
     match integrity {
@@ -285,17 +288,39 @@ pub fn clock_set(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     respond(|_| Ok(()))
 }
 
-/// TPM2_ClockRateAdjust, Part 3 clause 36.3.
+/// TPM2_ClockRateAdjust, Part 3 clause 29.3.
 ///
-/// The clock of a software TPM follows the host, so an adjustment is accepted
-/// and recorded as having no effect.
-pub fn clock_rate_adjust(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
+/// "This command adjusts the rate of advance of Clock and Time to provide a
+/// better approximation to real time. The rateAdjust value is relative to the
+/// current rate and not the nominal rate of advance", and the example beside
+/// it shows the adjustments accumulating. "The range of adjustment shall be
+/// sufficient to allow Clock and Time to advance at real time but no more. If
+/// the requested adjustment would make the rate advance faster or slower than
+/// the nominal accuracy of the input frequency, the TPM shall return
+/// TPM_RC_VALUE." The clause's own example takes that accuracy as ten percent,
+/// which is what this TPM allows: a fine step is a tenth of a percent and a
+/// coarse one is a whole percent.
+pub fn clock_rate_adjust(state: &mut TpmState, request: &Request) -> TpmResult<Response> {
+    use crate::tpm::constants::clock_adjust;
+
     let mut r = request.reader();
     let adjust = r.i8().map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
-    if !(-3..=3).contains(&adjust) {
+    let step = match adjust {
+        clock_adjust::COARSE_SLOWER => -10,
+        clock_adjust::MEDIUM_SLOWER => -5,
+        clock_adjust::FINE_SLOWER => -1,
+        clock_adjust::NO_CHANGE => 0,
+        clock_adjust::FINE_FASTER => 1,
+        clock_adjust::MEDIUM_FASTER => 5,
+        clock_adjust::COARSE_FASTER => 10,
+        _ => return Err(TpmRc(rc::VALUE).with_parameter(1)),
+    };
+    let adjusted = state.clock.rate_adjust + step;
+    if !(-100..=100).contains(&adjusted) {
         return Err(TpmRc(rc::VALUE).with_parameter(1));
     }
+    state.clock.rate_adjust = adjusted;
     respond(|_| Ok(()))
 }
 
@@ -636,6 +661,9 @@ fn handles_in_range(state: &TpmState, property: u32) -> Vec<u32> {
 }
 
 /// The permanent handles this TPM answers to.
+///
+/// Part 2 Table 34 counts the authenticated countdown timers among them, and
+/// the PC Client profile clause 5.1.2 asks for one, so TPM_RH_ACT_0 is here.
 fn permanent_handles() -> Vec<u32> {
     use crate::tpm::constants::rh;
     vec![
@@ -645,6 +673,7 @@ fn permanent_handles() -> Vec<u32> {
         rh::ENDORSEMENT,
         rh::PLATFORM,
         rh::PLATFORM_NV,
+        rh::ACT_0,
     ]
 }
 
@@ -653,13 +682,23 @@ fn auth_policies(state: &TpmState, property: u32) -> Vec<crate::tpm::structures:
     use crate::tpm::constants::rh;
     use crate::tpm::structures::lists::TaggedPolicy;
 
+    // Part 3 clause 30.2 reports the policy of every permanent handle that can
+    // have one, which TPM2_SetPrimaryPolicy gives the timer as well.
     let mut out = Vec::new();
-    for handle in [rh::OWNER, rh::ENDORSEMENT, rh::PLATFORM, rh::LOCKOUT] {
+    for handle in [
+        rh::OWNER,
+        rh::ENDORSEMENT,
+        rh::PLATFORM,
+        rh::LOCKOUT,
+        rh::ACT_0,
+    ] {
         if handle < property {
             continue;
         }
         let policy = if handle == rh::LOCKOUT {
             state.lockout_policy.clone()
+        } else if handle == rh::ACT_0 {
+            state.act.policy.clone()
         } else {
             match state.hierarchies.get(handle) {
                 Ok(h) => h.policy.clone(),

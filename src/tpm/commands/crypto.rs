@@ -960,8 +960,11 @@ pub fn rsa_decrypt(state: &TpmState, request: &Request) -> TpmResult<Response> {
     r.expect_end()?;
 
     let object = object_of(state, key_handle).map_err(|e| e.with_handle(1))?;
+    // Part 3 clause 14.3.1: "The key referenced by keyHandle shall be an RSA
+    // key (TPM_RC_KEY) with restricted CLEAR and decrypt SET
+    // (TPM_RC_ATTRIBUTES)."
     if object.public.object_type != alg::RSA {
-        return Err(TpmRc(rc::TYPE).with_handle(1));
+        return Err(TpmRc(rc::KEY).with_handle(1));
     }
     if !object
         .public

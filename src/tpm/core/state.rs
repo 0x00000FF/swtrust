@@ -262,6 +262,19 @@ pub struct ClockState {
     pub reset_value: Vec<u8>,
     /// False when Clock may have gone backwards.
     pub safe: bool,
+    /// How far the rate of advance has been adjusted, in steps.
+    ///
+    /// Part 3 clause 29.3.1: TPM2_ClockRateAdjust "adjusts the rate of advance
+    /// of Clock and Time to provide a better approximation to real time. The
+    /// rateAdjust value is relative to the current rate and not the nominal
+    /// rate of advance", and repeated adjustments accumulate. The range "shall
+    /// be sufficient to allow Clock and Time to advance at real time but no
+    /// more": a step here is a tenth of a percent, a coarse one is ten steps,
+    /// and the range is the ten percent of the example in that clause.
+    pub rate_adjust: i32,
+    /// Milliseconds of host time not yet credited, because an adjusted rate
+    /// turns whole milliseconds into a fraction of one.
+    pub rate_remainder: i64,
     /// Resets over the life of the TPM, which never clears.
     pub total_reset_count: u32,
     /// Identifies the run of Time the TPM is in.
@@ -332,6 +345,12 @@ impl ClockState {
             total_reset_count: r.u32()?,
             time_epoch: r.u64()?,
             nv_elapsed: 0,
+            // The rate is not carried in the record: Part 3 clause 29.3.1 has
+            // the adjustment approximate real time on the platform the TPM is
+            // running on, and a TPM that has just started has yet to be told
+            // what that is.
+            rate_adjust: 0,
+            rate_remainder: 0,
         })
     }
 }
@@ -672,6 +691,19 @@ impl TpmState {
     /// second over the same period. The transport calls this before each
     /// command, which is the only moment the TPM is asked anything.
     pub fn advance_time(&mut self, millis: u64) -> bool {
+        if millis == 0 {
+            return false;
+        }
+        // The adjustment is applied to the host milliseconds before they are
+        // credited, and what does not divide into a whole millisecond is kept
+        // for the next time rather than lost.
+        let millis = {
+            let scaled = (millis as i64)
+                .saturating_mul(1000 + self.clock.rate_adjust as i64)
+                .saturating_add(self.clock.rate_remainder);
+            self.clock.rate_remainder = scaled.rem_euclid(1000);
+            (scaled.div_euclid(1000)).max(0) as u64
+        };
         if millis == 0 {
             return false;
         }

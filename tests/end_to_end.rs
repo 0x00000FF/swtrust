@@ -5774,3 +5774,60 @@ fn nv_certify_with_no_range_certifies_a_digest() {
         r.code
     );
 }
+
+
+/// Part 3 clause 29.3.1: TPM2_ClockRateAdjust "adjusts the rate of advance of
+/// Clock and Time to provide a better approximation to real time. The
+/// rateAdjust value is relative to the current rate and not the nominal rate of
+/// advance", and repeated adjustments accumulate.
+#[test]
+fn the_clock_rate_can_be_adjusted_and_accumulates() {
+    let h = Harness::started("clockrate");
+
+    let adjust = |value: i8| -> u32 {
+        h.send(&command(
+            st::SESSIONS,
+            cc::ClockRateAdjust,
+            &[rh::OWNER],
+            Some(&password(b"")),
+            &[value as u8],
+        ))
+        .code
+    };
+    let rate = || h.tpm.with_state(|s| s.clock.rate_adjust);
+
+    assert_eq!(rate(), 0, "a manufactured TPM runs at the nominal rate");
+    assert_eq!(adjust(1), rc::SUCCESS, "a fine step was refused");
+    assert_eq!(rate(), 1);
+    assert_eq!(adjust(3), rc::SUCCESS, "a coarse step was refused");
+    assert_eq!(rate(), 11, "the adjustments did not accumulate");
+    // The example in the clause: three slower and one faster leave two slower.
+    for _ in 0..3 {
+        assert_eq!(adjust(-3), rc::SUCCESS);
+    }
+    assert_eq!(adjust(3), rc::SUCCESS);
+    assert_eq!(rate(), 11 - 20, "the example of the clause did not hold");
+
+    // "If the requested adjustment would make the rate advance faster or slower
+    // than the nominal accuracy of the input frequency, the TPM shall return
+    // TPM_RC_VALUE."
+    for _ in 0..9 {
+        assert_eq!(adjust(-3), rc::SUCCESS);
+    }
+    assert_eq!(rate(), -99);
+    assert_eq!(
+        adjust(-3),
+        rc::VALUE | 0x080 | 0x040 | (1 << 8),
+        "the rate went past the accuracy of the input frequency"
+    );
+    assert_eq!(rate(), -99, "a refused adjustment still moved the rate");
+
+    // And an adjustment that is no adjustment at all is accepted.
+    assert_eq!(adjust(0), rc::SUCCESS);
+    assert_eq!(rate(), -99);
+    assert_eq!(
+        adjust(4),
+        rc::VALUE | 0x080 | 0x040 | (1 << 8),
+        "a value outside TPM_CLOCK_ADJUST was accepted"
+    );
+}

@@ -72,6 +72,10 @@ pub enum ParseOutcome {
     Run(Box<Config>),
     Help,
     Version,
+    /// Write the value the pre-operational software integrity test compares
+    /// against, which is the packaging step FIPS 140-3 clause 10.3.1 needs and
+    /// which a cargo build has no place to do on its own.
+    RecordIntegrity(Box<Config>),
 }
 
 /// Text printed for `--help`.
@@ -112,6 +116,7 @@ where
 {
     let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
     let mut cfg = Config::default();
+    let mut record_integrity = false;
     let mut idx = 0;
 
     // Takes the value for an option, supporting both "--opt value" and "--opt=value".
@@ -140,6 +145,7 @@ where
         match name.as_str() {
             "-h" | "--help" => return Ok(ParseOutcome::Help),
             "-V" | "--version" => return Ok(ParseOutcome::Version),
+            "--record-integrity" => record_integrity = true,
             "-v" | "--verbose" => cfg.verbose = true,
             "--ptp" => cfg.ptp = true,
             "-c" | "--console" => cfg.console = true,
@@ -182,6 +188,9 @@ where
         idx += 1;
     }
 
+    if record_integrity {
+        return Ok(ParseOutcome::RecordIntegrity(Box::new(cfg)));
+    }
     Ok(ParseOutcome::Run(Box::new(cfg)))
 }
 

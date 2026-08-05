@@ -143,6 +143,19 @@ impl Tpm {
         }
         let integrity = crate::tpm::fips::integrity_test(&expected_at)
             .map_err(|e| io::Error::other(format!("integrity test failed: {}", e.0)))?;
+        match &integrity {
+            crate::tpm::fips::Integrity::Passed(_) => {
+                logger.line("software integrity test passed")
+            }
+            // FIPS 140-3 clause 10.3.1 has the module decide, which it cannot
+            // do without a value to compare against. Saying so is the honest
+            // report; recording the code now would only bless whatever this
+            // image already is.
+            crate::tpm::fips::Integrity::NotPerformed(_) => logger.line(
+                "software integrity test not performed: no recorded value beside the state",
+            ),
+        }
+        let integrity = integrity.code().to_vec();
         crate::tpm::fips::known_answer_tests()
             .map_err(|e| io::Error::other(format!("self test failed: {}", e.0)))?;
 

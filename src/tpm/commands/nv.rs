@@ -495,11 +495,15 @@ pub fn nv_change_auth(state: &mut TpmState, request: &Request) -> TpmResult<Resp
     let mut r = request.reader();
     let new_auth = Tpm2bDigest::unmarshal(&mut r).map_err(|e| e.with_parameter(1))?;
     r.expect_end()?;
-    if new_auth.len() > crate::tpm::structures::base::MAX_DIGEST_SIZE {
+    // Part 3 clause 31.17.1: "the size of the newAuth value may not be larger
+    // than the size of the digest produced by the nameAlg of the NV Index",
+    // which is narrower than the largest digest this TPM produces.
+    let index = state.nv.get_mut(nv_handle).map_err(|e| e.with_handle(1))?;
+    let limit = crate::tpm::crypto::hash::digest_size(index.public.name_alg)?;
+    if new_auth.len() > limit {
         return Err(TpmRc(rc::SIZE).with_parameter(1));
     }
-    state.nv.get_mut(nv_handle).map_err(|e| e.with_handle(1))?.auth =
-        new_auth.as_slice().to_vec();
+    index.auth = new_auth.as_slice().to_vec();
     respond(|_| Ok(()))
 }
 
