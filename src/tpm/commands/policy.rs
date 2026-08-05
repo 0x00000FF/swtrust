@@ -527,6 +527,26 @@ pub fn policy_secret(state: &mut TpmState, request: &Request) -> TpmResult<Respo
 
     let auth_name = super::dispatch::handle_name(state, auth_handle)
         .map_err(|e| e.with_handle(1))?;
+    // Part 3 clause 23.4.1: "if authEntity references a non-PIN Index,
+    // TPMA_NV_AUTHREAD is required to be SET in the Index." A PIN Index is
+    // answered for by the authorization itself, which clause 34.2.6 makes turn
+    // on its own counters.
+    if crate::tpm::core::nv::NvStore::is_nv_handle(auth_handle) {
+        let index = state.nv.get(auth_handle).map_err(|e| e.with_handle(1))?;
+        let is_pin = matches!(
+            index.public.attributes.index_type(),
+            crate::tpm::structures::attributes::nt::PIN_FAIL
+                | crate::tpm::structures::attributes::nt::PIN_PASS
+        );
+        if !is_pin
+            && !index
+                .public
+                .attributes
+                .has(crate::tpm::structures::attributes::NvAttributes::AUTHREAD)
+        {
+            return Err(TpmRc(rc::NV_AUTHORIZATION).with_handle(1));
+        }
+    }
     let is_trial = policy_session(state, policy_session_handle)?.is_trial();
     let session_nonce = policy_session(state, policy_session_handle)?
         .nonce_tpm

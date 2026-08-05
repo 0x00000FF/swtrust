@@ -129,6 +129,14 @@ pub struct Entity {
     pub uses_lockout: bool,
     /// True when the entity accepts its authValue for user role actions.
     pub user_with_auth: bool,
+    /// The handle of the Index, when this entity is a PIN Index.
+    ///
+    /// Part 1 clause 34.2.6 gives such an Index a counter of its own: an
+    /// authorization "will fail if the pinCount field of the Index is not less
+    /// than the pinLimit field or if the TPMA_NV_WRITTEN attribute of the Index
+    /// is CLEAR", and a success or a failure moves that counter depending on
+    /// which of the two kinds it is.
+    pub pin: Option<u32>,
     /// True when an ADMIN role action needs a policy session.
     ///
     /// Part 3 clause 5.6.5 always requires one for an NV Index and for a
@@ -210,6 +218,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             uses_lockout: false,
             user_with_auth: true,
             admin_with_policy: true,
+            pin: None,
         });
     }
     if handle == rh::LOCKOUT {
@@ -222,6 +231,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             uses_lockout: true,
             user_with_auth: true,
             admin_with_policy: true,
+            pin: None,
         });
     }
     if (rh::ACT_0..=rh::ACT_F).contains(&handle) {
@@ -244,6 +254,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             uses_lockout: false,
             user_with_auth: enabled,
             admin_with_policy: true,
+            pin: None,
         });
     }
     if handle == rh::PLATFORM_NV {
@@ -255,6 +266,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             uses_lockout: false,
             user_with_auth: true,
             admin_with_policy: true,
+            pin: None,
         });
     }
     if (hc::PCR_FIRST..=hc::PCR_LAST).contains(&handle) {
@@ -265,6 +277,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             uses_lockout: false,
             user_with_auth: true,
             admin_with_policy: true,
+            pin: None,
         });
     }
     if ObjectSlots::is_transient(handle) {
@@ -297,6 +310,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             uses_lockout: !no_da,
             user_with_auth,
             admin_with_policy,
+            pin: None,
         });
     }
     if (hc::PERSISTENT_FIRST..=hc::PERSISTENT_LAST).contains(&handle) {
@@ -317,6 +331,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
                 .public
                 .object_attributes
                 .has(ObjectAttributes::ADMIN_WITH_POLICY),
+            pin: None,
         });
     }
     if crate::tpm::core::nv::NvStore::is_nv_handle(handle) {
@@ -338,6 +353,12 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
             // Part 3 clause 5.6.5 always requires a policy session for an
             // ADMIN role action on an NV Index.
             admin_with_policy: true,
+            pin: matches!(
+                index.public.attributes.index_type(),
+                crate::tpm::structures::attributes::nt::PIN_FAIL
+                    | crate::tpm::structures::attributes::nt::PIN_PASS
+            )
+            .then_some(index.public.nv_index),
         });
     }
     Err(TpmRc(rc::HANDLE))
@@ -638,8 +659,10 @@ pub fn check_authorization(
             return Err(TpmRc(rc::AUTH_TYPE).with_session(position));
         }
         let is_lockout = request.handle(index).ok() == Some(rh::LOCKOUT);
-        return compare_auth(state, &input.hmac, &entity.auth, protected, is_lockout)
-            .map_err(|e| e.with_session(position));
+        check_pin_available(state, entity).map_err(|e| e.with_session(position))?;
+        let outcome = compare_auth(state, &input.hmac, &entity.auth, protected, is_lockout);
+        record_pin_attempt(state, entity, outcome.is_ok())?;
+        return outcome.map_err(|e| e.with_session(position));
     }
 
     let s = state
@@ -679,7 +702,9 @@ pub fn check_authorization(
             &nonce_encrypt,
             input.attributes,
         )?;
-        if !session::auth_hmac_accepted(&key, &expected, &input.hmac) {
+        let accepted = session::auth_hmac_accepted(&key, &expected, &input.hmac);
+        record_pin_attempt(state, entity, accepted)?;
+        if !accepted {
             // Part 1 clause 16.8.5: a failure against lockoutAuth enters the
             // special lockout "regardless of the setting of failedTries and
             // maxTries".
@@ -851,6 +876,51 @@ fn compare_auth(
         record_failure(state, uses_lockout)?;
         Err(TpmRc(rc::AUTH_FAIL))
     }
+}
+
+/// Refuse a PIN Index that has nothing to authorize with yet, or has run out.
+///
+/// Part 1 clause 34.2.6: "if the authValue of a PIN Index is used for
+/// authorization, then the authorization will fail if the pinCount field of the
+/// Index is not less than the pinLimit field or if the TPMA_NV_WRITTEN
+/// attribute of the Index is CLEAR."
+fn check_pin_available(state: &TpmState, entity: &Entity) -> TpmResult<()> {
+    let Some(handle) = entity.pin else {
+        return Ok(());
+    };
+    let index = state.nv.get(handle)?;
+    if !index.written() {
+        return Err(TpmRc(rc::AUTH_UNAVAILABLE));
+    }
+    let counters = index.pin_counters()?;
+    if counters.pin_count >= counters.pin_limit {
+        return Err(TpmRc(rc::AUTH_FAIL));
+    }
+    Ok(())
+}
+
+/// Move the counter of a PIN Index after an authorization was judged.
+///
+/// The same clause: "when the authValue of a PIN Index is used for
+/// authorization and the authorization succeeds, the pinCount field is set to
+/// zero if the Index is PIN Fail and incremented if the Index is PIN Pass. If
+/// the authorization fails, pinCount is incremented for a PIN Fail Index and
+/// left unchanged for a PIN Pass Index."
+fn record_pin_attempt(state: &mut TpmState, entity: &Entity, succeeded: bool) -> TpmResult<()> {
+    let Some(handle) = entity.pin else {
+        return Ok(());
+    };
+    let index = state.nv.get_mut(handle)?;
+    let fail_index = index.index_type()
+        == crate::tpm::structures::attributes::nt::PIN_FAIL;
+    let mut counters = index.pin_counters()?;
+    match (fail_index, succeeded) {
+        (true, true) => counters.pin_count = 0,
+        (true, false) => counters.pin_count = counters.pin_count.saturating_add(1),
+        (false, true) => counters.pin_count = counters.pin_count.saturating_add(1),
+        (false, false) => {}
+    }
+    index.set_pin_counters(counters)
 }
 
 /// Note a failed authorization against the dictionary attack counter.
@@ -1438,6 +1508,7 @@ pub fn session_can_authorize(session_type: u8) -> bool {
 mod tests {
     use super::*;
     use crate::tpm::marshal::Writer;
+    use crate::tpm::structures::attributes::{nt, NvAttributes};
 
     fn command(tag: u16, code: u32, handles: &[u32], auth: &[u8], params: &[u8]) -> Vec<u8> {
         let mut body = Writer::new();
@@ -1584,6 +1655,7 @@ mod tests {
             uses_lockout: true,
             user_with_auth: true,
             admin_with_policy: true,
+            pin: None,
         }
     }
 
@@ -1800,6 +1872,135 @@ mod tests {
         let e = protected_entity(b"secret");
         check_authorization(&mut state, &req, 0, &e, &[0u8; 32]).unwrap();
         assert_eq!(state.lockout.failed_tries, 0);
+    }
+
+    fn pin_index(kind: u8, count: u32, limit: u32) -> crate::tpm::core::nv::NvIndex {
+        use crate::tpm::structures::nv::{NvPinCounterParameters, NvPublic};
+        let mut index = crate::tpm::core::nv::NvIndex {
+            public: NvPublic {
+                nv_index: hc::NV_INDEX_FIRST,
+                name_alg: alg::SHA256,
+                attributes: NvAttributes(NvAttributes::AUTHREAD | NvAttributes::OWNERWRITE)
+                    .with_index_type(kind),
+                auth_policy: crate::tpm::structures::base::Tpm2bDigest::empty(),
+                data_size: 8,
+            },
+            auth: b"pin".to_vec(),
+            data: Vec::new(),
+            read_locked: false,
+            write_locked: false,
+        };
+        index
+            .set_pin_counters(NvPinCounterParameters {
+                pin_count: count,
+                pin_limit: limit,
+            })
+            .unwrap();
+        index
+    }
+
+    fn pin_attempt(state: &mut TpmState, password: &[u8]) -> TpmResult<()> {
+        let auth = password_auth(password);
+        let buf = command(
+            st::SESSIONS,
+            cc::PolicySecret,
+            &[hc::NV_INDEX_FIRST, hc::POLICY_SESSION_FIRST],
+            &auth,
+            &[],
+        );
+        let req = parse(state, &buf, 0).unwrap();
+        let e = entity(state, hc::NV_INDEX_FIRST).unwrap();
+        check_authorization(state, &req, 0, &e, &[0u8; 32])
+    }
+
+    #[test]
+    fn a_pin_pass_index_counts_its_successes() {
+        // Part 1 clause 34.2.6: on success "the pinCount field is set to zero
+        // if the Index is PIN Fail and incremented if the Index is PIN Pass",
+        // and the authorization fails once pinCount is not less than pinLimit.
+        let mut state = TpmState::manufacture().unwrap();
+        state
+            .nv
+            .define(pin_index(nt::PIN_PASS, 0, 2))
+            .unwrap();
+        pin_attempt(&mut state, b"pin").expect("the first use was refused");
+        pin_attempt(&mut state, b"pin").expect("the second use was refused");
+        assert_eq!(
+            state
+                .nv
+                .get(hc::NV_INDEX_FIRST)
+                .unwrap()
+                .pin_counters()
+                .unwrap()
+                .pin_count,
+            2
+        );
+        assert!(
+            pin_attempt(&mut state, b"pin").is_err(),
+            "a third use was allowed past the limit"
+        );
+    }
+
+    #[test]
+    fn a_pin_fail_index_counts_its_failures_and_forgets_them_on_success() {
+        let mut state = TpmState::manufacture().unwrap();
+        state
+            .nv
+            .define(pin_index(nt::PIN_FAIL, 0, 2))
+            .unwrap();
+        assert!(pin_attempt(&mut state, b"wrong").is_err());
+        assert_eq!(
+            state
+                .nv
+                .get(hc::NV_INDEX_FIRST)
+                .unwrap()
+                .pin_counters()
+                .unwrap()
+                .pin_count,
+            1,
+            "a failure was not counted"
+        );
+        pin_attempt(&mut state, b"pin").expect("the right value was refused");
+        assert_eq!(
+            state
+                .nv
+                .get(hc::NV_INDEX_FIRST)
+                .unwrap()
+                .pin_counters()
+                .unwrap()
+                .pin_count,
+            0,
+            "a success did not clear the count"
+        );
+    }
+
+    #[test]
+    fn a_pin_index_that_was_never_written_authorizes_nothing() {
+        // The same clause: the authorization fails "if the TPMA_NV_WRITTEN
+        // attribute of the Index is CLEAR".
+        use crate::tpm::structures::nv::NvPublic;
+        let mut state = TpmState::manufacture().unwrap();
+        state
+            .nv
+            .define(crate::tpm::core::nv::NvIndex {
+                public: NvPublic {
+                    nv_index: hc::NV_INDEX_FIRST,
+                    name_alg: alg::SHA256,
+                    attributes: NvAttributes(NvAttributes::AUTHREAD | NvAttributes::OWNERWRITE)
+                        .with_index_type(nt::PIN_PASS),
+                    auth_policy: crate::tpm::structures::base::Tpm2bDigest::empty(),
+                    data_size: 8,
+                },
+                auth: b"pin".to_vec(),
+                data: Vec::new(),
+                read_locked: false,
+                write_locked: false,
+            })
+            .unwrap();
+        assert!(
+            pin_attempt(&mut state, b"pin").is_err(),
+            "an Index with nothing written authorized something"
+        );
     }
 
     #[test]
