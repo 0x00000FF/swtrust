@@ -347,10 +347,24 @@ fn hmac_key(state: &TpmState, handle: u32, requested: u16) -> TpmResult<(Vec<u8>
     if object.public.object_type != alg::KEYEDHASH {
         return Err(TpmRc(rc::TYPE).with_handle(1));
     }
+    // Part 3 clauses 15.5.1 and 17.2.1: "If the sign attribute is not SET in the
+    // key referenced by handle, then the TPM shall return TPM_RC_KEY. If the
+    // key type is not TPM_ALG_KEYEDHASH then the TPM shall return TPM_RC_TYPE.
+    // If the key referenced by handle has the restricted attribute SET, the TPM
+    // shall return TPM_RC_ATTRIBUTES." The note explains the last one: "For
+    // symmetric signing with a restricted key, see TPM2_Sign(). TPM2_HMAC() has
+    // no ticket parameter, which is required with a restricted key."
     if !object
         .public
         .object_attributes
         .has(ObjectAttributes::SIGN_ENCRYPT)
+    {
+        return Err(TpmRc(rc::KEY).with_handle(1));
+    }
+    if object
+        .public
+        .object_attributes
+        .has(ObjectAttributes::RESTRICTED)
     {
         return Err(TpmRc(rc::ATTRIBUTES).with_handle(1));
     }

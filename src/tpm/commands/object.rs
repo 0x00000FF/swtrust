@@ -1075,10 +1075,27 @@ pub fn read_public(state: &TpmState, request: &Request) -> TpmResult<Response> {
     })
 }
 
+/// A loaded object, transient or persistent.
+///
+/// Part 2 clause 9.4 gives TPMI_DH_OBJECT both ranges, so a command that names
+/// one takes an object that TPM2_EvictControl has made persistent as readily as
+/// one TPM2_Load put in a transient slot.
+fn loaded_object(state: &TpmState, handle: u32) -> TpmResult<&Object> {
+    use crate::tpm::constants::hc;
+
+    if crate::tpm::core::object::ObjectSlots::is_transient(handle) {
+        state.objects.object(handle)
+    } else if (hc::PERSISTENT_FIRST..=hc::PERSISTENT_LAST).contains(&handle) {
+        state.persistent.get(&handle).ok_or(TpmRc(rc::HANDLE))
+    } else {
+        Err(TpmRc(rc::HANDLE))
+    }
+}
+
 /// TPM2_Unseal, Part 3 clause 12.7.
 pub fn unseal(state: &TpmState, request: &Request) -> TpmResult<Response> {
     let handle = request.handle(0)?;
-    let object = state.objects.object(handle).map_err(|e| e.with_handle(1))?;
+    let object = loaded_object(state, handle).map_err(|e| e.with_handle(1))?;
     if object.public.object_type != alg::KEYEDHASH {
         return Err(TpmRc(rc::TYPE).with_handle(1));
     }
@@ -1107,10 +1124,9 @@ pub fn object_change_auth(state: &mut TpmState, request: &Request) -> TpmResult<
     r.expect_end()?;
 
     let parent = parent_of(state, parent_handle).map_err(|e| e.with_handle(2))?;
-    let object = state
-        .objects
-        .object(object_handle)
-        .map_err(|e| e.with_handle(1))?;
+    // Part 3 clause 12.8.1: "the object may be a transient object or a
+    // persistent object", which is why its handle is a TPMI_DH_OBJECT.
+    let object = loaded_object(state, object_handle).map_err(|e| e.with_handle(1))?;
     // The object must be a child of the named parent.
     if object.qualified_name
         != names::qualified_name(object.public.name_alg, &parent.qualified_name, &object.name)?

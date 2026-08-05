@@ -141,21 +141,23 @@ impl Tpm {
         if let Some(parent) = expected_at.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let integrity = crate::tpm::fips::integrity_test(&expected_at)
+        // A value that disagrees with the code is a failed test and the TPM
+        // does not come up. A module with none recorded cannot perform the
+        // test at all, which is reported rather than treated as a pass; the
+        // daemon in `crate::server` is what refuses to expose such a TPM,
+        // because FIPS 140-3 clause 10.1.1.1 ties the requirement to "the
+        // module providing any data output via the data output interface".
+        let outcome = crate::tpm::fips::integrity_test(&expected_at)
             .map_err(|e| io::Error::other(format!("integrity test failed: {}", e.0)))?;
-        match &integrity {
+        match &outcome {
             crate::tpm::fips::Integrity::Passed(_) => {
                 logger.line("software integrity test passed")
             }
-            // FIPS 140-3 clause 10.3.1 has the module decide, which it cannot
-            // do without a value to compare against. Saying so is the honest
-            // report; recording the code now would only bless whatever this
-            // image already is.
             crate::tpm::fips::Integrity::NotPerformed(_) => logger.line(
                 "software integrity test not performed: no recorded value beside the state",
             ),
         }
-        let integrity = integrity.code().to_vec();
+        let integrity = outcome.code().to_vec();
         crate::tpm::fips::known_answer_tests()
             .map_err(|e| io::Error::other(format!("self test failed: {}", e.0)))?;
 
@@ -230,16 +232,21 @@ impl Tpm {
         f(&mut self.locked())
     }
 
-    /// Write the non-volatile state out.
-    pub fn persist(&self) {
+    /// Write the non-volatile state out, saying whether it reached the file.
+    pub fn persist(&self) -> bool {
         let state = self.locked();
         match state.save() {
-            Ok(bytes) => {
-                if let Err(e) = self.store.save(&bytes) {
+            Ok(bytes) => match self.store.save(&bytes) {
+                Ok(()) => true,
+                Err(e) => {
                     self.logger.line(&format!("cannot write state: {e}"));
+                    false
                 }
+            },
+            Err(e) => {
+                self.logger.line(&format!("cannot marshal state: {e}"));
+                false
             }
-            Err(e) => self.logger.line(&format!("cannot marshal state: {e}")),
         }
     }
 
@@ -313,8 +320,16 @@ impl Device for Tpm {
         // clock, which is the moment Part 2 clause 10.10.2 asks for the copy in
         // NV to be brought up to date.
         let writes_nv = code.map(Tpm::writes_nv).unwrap_or(false);
-        if writes_nv || clock_rolled_over {
-            self.persist();
+        if (writes_nv || clock_rolled_over) && !self.persist() {
+            // Part 1 clause 34.7.2.2: "When the memory is not accessible,
+            // operations that require update of NV will return
+            // TPM_RC_NV_UNAVAILABLE." The command has already run, so what the
+            // TPM holds and what the file holds have parted company; saying so
+            // is the only honest answer, and the warning tells the caller the
+            // change did not reach NV.
+            if writes_nv {
+                return error_response(TpmRc(rc::NV_UNAVAILABLE));
+            }
         }
         response
     }

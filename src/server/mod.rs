@@ -94,6 +94,20 @@ pub fn run(config: Config) -> io::Result<()> {
         ));
     }
 
+    // FIPS 140-3 clause 10.1.1.1: "The pre-operational self-tests shall be
+    // performed and passed successfully prior to the module providing any data
+    // output via the data output interface." Serving a transport is that
+    // output, so a build whose integrity value was never recorded does not get
+    // that far. The value comes from `swtrust --record-integrity`, which is
+    // the packaging step a cargo build has no place to do on its own.
+    let expected_at = config.state_dir.join("integrity.hex");
+    if !expected_at.exists() {
+        return Err(io::Error::other(format!(
+            "software integrity test not performed: no value recorded at {}.              Run 'swtrust --record-integrity' first, which records one for this build.",
+            expected_at.display()
+        )));
+    }
+
     let logger = Arc::new(Logger::new(&config.log_dir, config.verbose)?);
     let tpm = Arc::new(Tpm::new(&config.state_dir, logger.clone())?);
 

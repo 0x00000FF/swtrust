@@ -80,10 +80,15 @@ FIPS 140-3 clause 10.3.1 has a module decide for itself whether its code is the
 code it was built as, by comparing it against a value the module holds. A cargo
 build has no step that can write such a value into the executable after linking,
 so packaging runs the executable once with `--record-integrity`, which writes it
-to `<state-dir>/integrity.hex`. Every later start compares the running image
-against that file: a value that differs is a failed test and the daemon stops,
-and no file at all is reported as a test that was not performed rather than as
-one that passed.
+to `<state-dir>/integrity.hex`:
+
+    swtrust --record-integrity --state ./state
+
+Every later start compares the running image against that file. A value that
+differs is a failed test and the daemon stops. No file at all means the test
+could not be performed, and clause 10.1.1.1 requires it to pass "prior to the
+module providing any data output via the data output interface", so the daemon
+refuses to serve a transport until one is recorded.
 
 ### Logs
 

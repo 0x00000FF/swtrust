@@ -5831,3 +5831,120 @@ fn the_clock_rate_can_be_adjusted_and_accumulates() {
         "a value outside TPM_CLOCK_ADJUST was accepted"
     );
 }
+
+
+/// Part 3 clause 15.5.1 and clause 17.2.1: "If the sign attribute is not SET in
+/// the key referenced by handle, then the TPM shall return TPM_RC_KEY... If the
+/// key referenced by handle has the restricted attribute SET, the TPM shall
+/// return TPM_RC_ATTRIBUTES", because "TPM2_HMAC() has no ticket parameter,
+/// which is required with a restricted key."
+#[test]
+fn hmac_refuses_a_restricted_key_and_names_a_key_that_cannot_sign() {
+    let h = Harness::started("hmackeys");
+
+    // A keyed hash key under a storage parent, built from a template the
+    // caller supplies so the attributes can be varied.
+    let template = storage_template();
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u16(0);
+    p.u16(0);
+    p.u16(template.len() as u16);
+    p.bytes(&template);
+    p.u16(0);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CreatePrimary,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS);
+    let parent = Reader::new(&r.body).u32().unwrap();
+
+    let keyed_hash = |attrs: u32| -> u32 {
+        let public = {
+            let mut w = Writer::new();
+            w.u16(0x0008); // TPM_ALG_KEYEDHASH
+            w.u16(alg::SHA256);
+            w.u32(attrs);
+            w.u16(0); // authPolicy
+            w.u16(alg::HMAC);
+            w.u16(alg::SHA256);
+            w.u16(0); // unique
+            w.finish().unwrap()
+        };
+        let mut p = Writer::new();
+        p.u16(4);
+        p.u16(0);
+        p.u16(0);
+        p.u16(public.len() as u16);
+        p.bytes(&public);
+        p.u16(0);
+        p.u32(0);
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::Create,
+            &[parent],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "Create -> {:08x}", r.code);
+        let mut rd = Reader::new(&r.body);
+        let _param_size = rd.u32().unwrap();
+        let n = rd.u16().unwrap() as usize;
+        let private = rd.take(n).unwrap().to_vec();
+        let n = rd.u16().unwrap() as usize;
+        let pub_area = rd.take(n).unwrap().to_vec();
+
+        let mut p = Writer::new();
+        p.u16(private.len() as u16);
+        p.bytes(&private);
+        p.u16(pub_area.len() as u16);
+        p.bytes(&pub_area);
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::Load,
+            &[parent],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "Load -> {:08x}", r.code);
+        Reader::new(&r.body).u32().unwrap()
+    };
+    let hmac = |handle: u32| -> u32 {
+        let mut p = Writer::new();
+        p.u16(4);
+        p.bytes(b"data");
+        p.u16(alg::NULL);
+        h.send(&command(
+            st::SESSIONS,
+            cc::HMAC,
+            &[handle],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ))
+        .code
+    };
+
+    // fixedTPM fixedParent sensitiveDataOrigin userWithAuth sign
+    let signing = keyed_hash(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000);
+    assert_eq!(hmac(signing), rc::SUCCESS, "an ordinary HMAC key was refused");
+
+    // The same with restricted SET, which needs the ticket TPM2_Sign carries.
+    let restricted = keyed_hash(0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0004_0000 | 0x0001_0000);
+    assert_eq!(
+        hmac(restricted),
+        rc::ATTRIBUTES | 0x080 | (1 << 8),
+        "a restricted key produced a MAC"
+    );
+
+    // And a keyed hash object that cannot sign at all is a key error.
+    let sealed = keyed_hash(0x0002 | 0x0010 | 0x0020 | 0x0040);
+    assert_eq!(
+        hmac(sealed),
+        rc::KEY | 0x080 | (1 << 8),
+        "a key that cannot sign was not reported as a key error"
+    );
+}
