@@ -1539,8 +1539,10 @@ pub fn policy_ac_send_select(state: &mut TpmState, request: &Request) -> TpmResu
     let s = policy_session(state, handle)?;
     // Part 3 clause 32.4.1: "if either policySession->cpHash or
     // policySession->nameHash has been previously set, the TPM shall return
-    // TPM_RC_CPHASH", because the two share the same place.
-    if s.policy.cp_hash.is_some() || s.policy.name_hash.is_some() {
+    // TPM_RC_CPHASH", because the note beside it says the two "may share the
+    // same memory space", which is the space the other exclusive assertions
+    // use as well.
+    if shared_cp_hash_taken(s) {
         return Err(TpmRc(rc::CPHASH));
     }
     let mut data = Vec::new();
