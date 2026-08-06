@@ -237,6 +237,46 @@ pub fn role(code: u32, index: usize) -> Role {
         .unwrap_or(Role::User)
 }
 
+/// What a command does to the NV Index it names, for Part 3 clause 5.6 item 7.2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NvAccess {
+    /// The command reads the Index data.
+    Read,
+    /// The command modifies the Index data.
+    Write,
+}
+
+/// Whether `code` reads or modifies the NV Index it is authorized against.
+///
+/// Part 3 clause 5.6 item 7.2 makes the availability of an Index-specific
+/// authorization depend on this: a command that modifies the data needs
+/// TPMA_NV_POLICYWRITE or TPMA_NV_AUTHWRITE, and one that reads it needs
+/// TPMA_NV_POLICYREAD or TPMA_NV_AUTHREAD.
+///
+/// Part 2 Table 249 lists what each word covers: "read" is TPM2_NV_Read,
+/// TPM2_NV_ReadPublic, TPM2_NV_Certify and TPM2_PolicyNV, and "write" is
+/// TPM2_NV_Write, TPM2_NV_Increment, TPM2_NV_Extend and TPM2_NV_SetBits.
+/// TPM2_NV_ReadPublic takes no authorization, so it is not here. Clause 5.6
+/// item 7.2 adds TPM2_PolicySecret to the reading side by name. The two lock
+/// commands go with the operation they block, which Table 249 bit 0 states as
+/// "the Index data can be written or write-locked if Platform Authorization is
+/// provided", and bit 16 likewise for reading. TPM2_PolicyAuthorizeNV reads the
+/// Index to find the policy it holds.
+pub fn nv_access(code: u32) -> Option<NvAccess> {
+    match code {
+        cc::NV_Write | cc::NV_Increment | cc::NV_Extend | cc::NV_SetBits | cc::NV_WriteLock => {
+            Some(NvAccess::Write)
+        }
+        cc::NV_Read
+        | cc::NV_ReadLock
+        | cc::NV_Certify
+        | cc::PolicyNV
+        | cc::PolicyAuthorizeNV
+        | cc::PolicySecret => Some(NvAccess::Read),
+        _ => None,
+    }
+}
+
 /// True for a command whose schematic defines no parameters.
 ///
 /// Part 3 clause 5.8.2 refuses a command that carries more than its schematic

@@ -1327,7 +1327,14 @@ pub fn policy_nv(state: &mut TpmState, request: &Request) -> TpmResult<Response>
     // trial policy session, the TPM will update policySession->policyDigest as
     // shown in Equation 4 and Equation 5 below and return TPM_RC_SUCCESS. It
     // will not perform any further validation."
+    // Clause 23.9.1: "the authorization to read the NV Index must succeed even
+    // if policySession is a trial policy session", and clause 31.2 fixes what
+    // reading it takes: TPMA_NV_PPREAD for platformAuth, TPMA_NV_OWNERREAD for
+    // ownerAuth, and the Index attributes for the Index itself.
+    let auth_handle = request.handle(0)?;
+    let is_policy = super::nv::auth_is_policy(state, request, 0);
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
+    super::nv::check_read_authority(index, auth_handle, is_policy)?;
     let nv_name = index.name()?;
     if !policy_session(state, handle)?.is_trial() {
         let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
@@ -1369,7 +1376,13 @@ pub fn policy_authorize_nv(state: &mut TpmState, request: &Request) -> TpmResult
     // policySession->policyDigest as shown in Equation 9 below and return
     // TPM_RC_SUCCESS. It will not perform any further validation." The Name is
     // what Equation 9 covers, so it is read either way.
+    // Clause 23.22.1: "an authorization session providing authorization to read
+    // the NV Index shall be provided", and it "must succeed even if
+    // policySession is a trial policy session".
+    let auth_handle = request.handle(0)?;
+    let is_policy = super::nv::auth_is_policy(state, request, 0);
     let index = state.nv.get(nv_handle).map_err(|e| e.with_handle(2))?;
+    super::nv::check_read_authority(index, auth_handle, is_policy)?;
     let nv_name = index.name()?;
 
     if !policy_session(state, handle)?.is_trial() {

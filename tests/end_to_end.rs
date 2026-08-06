@@ -1652,6 +1652,111 @@ fn clearing_ph_enable_nv_stops_the_platform_defining_an_index() {
     assert_eq!(r.code, rc::SUCCESS, "NV_DefineSpace again -> {:08x}", r.code);
 }
 
+/// Part 3 clause 5.6 item 7.2 checks whether the authorization method the
+/// caller chose is available for the Index before item 10 compares the
+/// password, and the clause closes with "if the TPM returns an error other than
+/// TPM_RC_AUTH_FAIL, then the TPM shall not alter any TPM state". A wrong
+/// authorization value against a method the Index does not offer is therefore
+/// TPM_RC_AUTH_UNAVAILABLE and does not count against the lockout.
+#[test]
+fn an_unavailable_nv_authorization_is_answered_before_the_value_is_read() {
+    let h = Harness::started("nvunavailable");
+    let handle = 0x0100_0020u32;
+
+    // TPMA_NV_AUTHWRITE | TPMA_NV_PPREAD: the Index authorizes a write with its
+    // own authValue, and reading it is for Platform Authorization alone.
+    let attributes = (1u32 << 2) | (1 << 16);
+    let mut p = Writer::new();
+    p.u16(4);
+    p.bytes(b"pass");
+    p.u16(14);
+    p.u32(handle);
+    p.u16(alg::SHA256);
+    p.u32(attributes);
+    p.u16(0);
+    p.u16(8);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_DefineSpace,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "NV_DefineSpace -> {:08x}", r.code);
+
+    let failed_tries = |h: &Harness| {
+        let mut p = Writer::new();
+        p.u32(0x00000006); // TPM_CAP_TPM_PROPERTIES
+        p.u32(0x0000020E); // TPM_PT_LOCKOUT_COUNTER
+        p.u32(1);
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::GetCapability,
+            &[],
+            None,
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "GetCapability -> {:08x}", r.code);
+        u32::from_be_bytes([r.body[13], r.body[14], r.body[15], r.body[16]])
+    };
+    let before = failed_tries(&h);
+
+    // Reading with a password is not offered, whatever the password is.
+    let mut p = Writer::new();
+    p.u16(8);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Read,
+        &[handle, handle],
+        Some(&password(b"wrong")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::AUTH_UNAVAILABLE,
+        "NV_Read with AUTHREAD clear -> {:08x}",
+        r.code
+    );
+    assert_eq!(
+        failed_tries(&h),
+        before,
+        "an answer other than TPM_RC_AUTH_FAIL leaves the lockout alone"
+    );
+
+    // Writing is offered, and the value is compared there.
+    let mut p = Writer::new();
+    p.u16(8);
+    p.bytes(&[1u8; 8]);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Write,
+        &[handle, handle],
+        Some(&password(b"wrong")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::AUTH_FAIL + 0x800 + 0x100,
+        "NV_Write with a wrong value -> {:08x}",
+        r.code
+    );
+
+    let mut p = Writer::new();
+    p.u16(8);
+    p.bytes(&[1u8; 8]);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Write,
+        &[handle, handle],
+        Some(&password(b"pass")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "NV_Write -> {:08x}", r.code);
+}
+
 #[test]
 fn read_only_mode_refuses_what_table_207_names() {
     // Part 3 clause 24.9.1: in Read-Only mode the TPM "will return

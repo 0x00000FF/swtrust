@@ -777,6 +777,54 @@ fn transform_parameter(
 /// `index` is the position of the session, counting from one, so a failure can
 /// name it.
 #[allow(clippy::too_many_arguments)]
+/// Check that the Index-specific authorization the caller chose is available.
+///
+/// Part 3 clause 5.6 item 7.2: when the entity being authorized is an NV Index
+/// and the command requires USER role, a policy session needs
+/// TPMA_NV_POLICYWRITE to modify the data or TPMA_NV_POLICYREAD to read it, and
+/// an HMAC session or a password needs TPMA_NV_AUTHWRITE or TPMA_NV_AUTHREAD.
+/// The answer for an attribute that is CLEAR is TPM_RC_AUTH_UNAVAILABLE.
+///
+/// Item 7 comes before items 9 and 10, which check the HMAC and the password,
+/// and the clause closes with "if the TPM returns an error other than
+/// TPM_RC_AUTH_FAIL, then the TPM shall not alter any TPM state". Checking here
+/// rather than inside the command is what keeps a wrong authorization value
+/// against an unavailable method from reaching the comparison that would answer
+/// TPM_RC_AUTH_FAIL and step failedTries.
+fn check_nv_authorization_available(
+    state: &TpmState,
+    request: &Request,
+    index: usize,
+    role: super::handles::Role,
+) -> TpmResult<()> {
+    use super::handles::NvAccess;
+    use crate::tpm::structures::attributes::NvAttributes;
+
+    if role != super::handles::Role::User {
+        return Ok(());
+    }
+    let Some(access) = super::handles::nv_access(request.code) else {
+        return Ok(());
+    };
+    let handle = request.handle(index)?;
+    if !crate::tpm::core::nv::NvStore::is_nv_handle(handle) {
+        return Ok(());
+    }
+    let attributes = state.nv.get(handle)?.public.attributes;
+    let is_policy = super::nv::auth_is_policy(state, request, index);
+    let needed = match (access, is_policy) {
+        (NvAccess::Write, true) => NvAttributes::POLICYWRITE,
+        (NvAccess::Write, false) => NvAttributes::AUTHWRITE,
+        (NvAccess::Read, true) => NvAttributes::POLICYREAD,
+        (NvAccess::Read, false) => NvAttributes::AUTHREAD,
+    };
+    if attributes.has(needed) {
+        Ok(())
+    } else {
+        Err(TpmRc(rc::AUTH_UNAVAILABLE).with_session(index + 1))
+    }
+}
+
 pub fn check_authorization(
     state: &mut TpmState,
     request: &Request,
@@ -790,6 +838,7 @@ pub fn check_authorization(
     let role = super::handles::role(request.code, index);
 
     check_lockout(state, request, index, protected)?;
+    check_nv_authorization_available(state, request, index, role)?;
 
     // A password session carries the authorization value in the clear.
     if input.handle == rh::RS_PW {
