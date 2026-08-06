@@ -803,6 +803,15 @@ impl TpmState {
         // sequence that any of them interrupts.
         self.hcrtm_sequence = None;
         self.pcr_allocation_pending = false;
+        // Part 1 clause 9.4.1: "when phEnable is CLEAR, a _TPM_Init is required
+        // to SET it. On any _TPM_Init, phEnable is SET to ensure that the
+        // platform can use the TPM during its initialization." That is before
+        // TPM2_Startup, so a TPM Resume that follows a shutdown taken with the
+        // platform hierarchy off still comes up with it on.
+        self.hierarchies.platform.enabled = true;
+        self.startup_clear = self
+            .startup_clear
+            .with(StartupClearAttributes::PH_ENABLE);
         Ok(())
     }
 
@@ -872,10 +881,26 @@ impl TpmState {
     fn begin_operation(&mut self, orderly: bool, keep_read_only: bool) {
         // Clause 22.5.1 lifts the restriction "after the next _TPM_Init".
         self.pcr_allocation_pending = false;
-        let mut attributes = StartupClearAttributes::PH_ENABLE
-            | StartupClearAttributes::SH_ENABLE
-            | StartupClearAttributes::EH_ENABLE
-            | StartupClearAttributes::PH_ENABLE_NV;
+        // Part 2 Table 41 describes each enable as the state of its hierarchy,
+        // so the word reports what the hierarchies hold rather than a value of
+        // its own. A TPM Reset and a TPM Restart turn all four on before this
+        // runs; a TPM Resume restores what the state file saved, and Part 1
+        // clause 8.6.2 keeps those values. Rebuilding the word with the bits
+        // forced on made TPM_PT_STARTUP_CLEAR report a hierarchy as enabled
+        // that every access check treated as disabled.
+        let mut attributes = 0u32;
+        if self.hierarchies.platform.enabled {
+            attributes |= StartupClearAttributes::PH_ENABLE;
+        }
+        if self.hierarchies.owner.enabled {
+            attributes |= StartupClearAttributes::SH_ENABLE;
+        }
+        if self.hierarchies.endorsement.enabled {
+            attributes |= StartupClearAttributes::EH_ENABLE;
+        }
+        if self.hierarchies.platform_nv_enabled {
+            attributes |= StartupClearAttributes::PH_ENABLE_NV;
+        }
         if orderly {
             attributes |= StartupClearAttributes::ORDERLY;
         }
@@ -1502,6 +1527,71 @@ mod tests {
             unique: PublicId::Ecc(Default::default()),
         };
         Object::new(public, None, rh::OWNER, &rh::OWNER.to_be_bytes(), true).unwrap()
+    }
+
+    /// Part 2 Table 41 makes each enable in TPMA_STARTUP_CLEAR the state of its
+    /// hierarchy, so what TPM_PT_STARTUP_CLEAR reports and what an access check
+    /// sees have to be the same thing. Part 1 clause 8.6.2 keeps the enables
+    /// over a TPM Resume, except phEnable, which clause 9.4.1 has _TPM_Init set.
+    #[test]
+    fn a_resume_reports_the_enables_it_came_back_with() {
+        let mut s = TpmState::manufacture().unwrap();
+        s.on_startup_clear(0).unwrap();
+
+        // Turn off everything the platform is allowed to turn off.
+        s.hierarchies.platform.enabled = false;
+        s.hierarchies.owner.enabled = false;
+        s.hierarchies.endorsement.enabled = false;
+        s.hierarchies.platform_nv_enabled = false;
+        s.startup_clear = StartupClearAttributes(0);
+
+        // A TPM2_Shutdown(STATE), a power cycle and a TPM2_Startup(STATE).
+        s.shutdown_type = su::STATE;
+        let saved = s.save().unwrap();
+        let mut back = TpmState::load(&saved).unwrap();
+        back.on_init().unwrap();
+        back.on_startup_state(0).unwrap();
+
+        assert!(
+            back.startup_clear.has(StartupClearAttributes::PH_ENABLE),
+            "_TPM_Init sets phEnable"
+        );
+        assert!(back.hierarchies.platform.enabled);
+        for (bit, enabled, name) in [
+            (
+                StartupClearAttributes::SH_ENABLE,
+                back.hierarchies.owner.enabled,
+                "shEnable",
+            ),
+            (
+                StartupClearAttributes::EH_ENABLE,
+                back.hierarchies.endorsement.enabled,
+                "ehEnable",
+            ),
+            (
+                StartupClearAttributes::PH_ENABLE_NV,
+                back.hierarchies.platform_nv_enabled,
+                "phEnableNV",
+            ),
+        ] {
+            assert!(!enabled, "{name} stayed off over the resume");
+            assert!(
+                !back.startup_clear.has(bit),
+                "{name} is reported as it is held"
+            );
+        }
+
+        // A TPM Reset turns all four back on and says so.
+        back.shutdown_type = su::CLEAR;
+        back.on_startup_clear(0).unwrap();
+        for bit in [
+            StartupClearAttributes::PH_ENABLE,
+            StartupClearAttributes::SH_ENABLE,
+            StartupClearAttributes::EH_ENABLE,
+            StartupClearAttributes::PH_ENABLE_NV,
+        ] {
+            assert!(back.startup_clear.has(bit), "a reset enables every hierarchy");
+        }
     }
 
     /// Part 1 Table 41 puts clearCount in the state reset data, incremented on
