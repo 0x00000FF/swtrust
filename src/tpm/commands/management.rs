@@ -856,7 +856,7 @@ fn tpm_properties(state: &TpmState, property: u32) -> Vec<TaggedProperty> {
         TaggedProperty::new(pt::ML_PARAMETER_SETS, 0),
         // Variable properties.
         TaggedProperty::new(pt::PERMANENT, permanent_attributes(state).0),
-        TaggedProperty::new(pt::STARTUP_CLEAR, state.startup_clear.0),
+        TaggedProperty::new(pt::STARTUP_CLEAR, state.startup_clear_word().0),
         TaggedProperty::new(pt::HR_NV_INDEX, state.nv.len() as u32),
         // Part 2 Table 28 counts authorization sessions here, not objects:
         // TPM_PT_HR_LOADED is "the number of authorization sessions currently

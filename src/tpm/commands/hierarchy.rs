@@ -39,9 +39,6 @@ pub fn hierarchy_control(state: &mut TpmState, request: &Request) -> TpmResult<R
     match enable {
         rh::PLATFORM => {
             state.hierarchies.platform.enabled = new_state;
-            state
-                .startup_clear
-                .set(StartupClearAttributes::PH_ENABLE, new_state);
             if !new_state {
                 state.objects.flush_hierarchy(rh::PLATFORM);
             }
@@ -51,9 +48,6 @@ pub fn hierarchy_control(state: &mut TpmState, request: &Request) -> TpmResult<R
                 return Err(TpmRc(rc::AUTH_TYPE).with_handle(1));
             }
             state.hierarchies.owner.enabled = new_state;
-            state
-                .startup_clear
-                .set(StartupClearAttributes::SH_ENABLE, new_state);
             if !new_state {
                 state.objects.flush_hierarchy(rh::OWNER);
             }
@@ -63,18 +57,12 @@ pub fn hierarchy_control(state: &mut TpmState, request: &Request) -> TpmResult<R
                 return Err(TpmRc(rc::AUTH_TYPE).with_handle(1));
             }
             state.hierarchies.endorsement.enabled = new_state;
-            state
-                .startup_clear
-                .set(StartupClearAttributes::EH_ENABLE, new_state);
             if !new_state {
                 state.objects.flush_hierarchy(rh::ENDORSEMENT);
             }
         }
         rh::PLATFORM_NV => {
             state.hierarchies.platform_nv_enabled = new_state;
-            state
-                .startup_clear
-                .set(StartupClearAttributes::PH_ENABLE_NV, new_state);
         }
         _ => return Err(TpmRc(rc::VALUE).with_parameter(1)),
     }
@@ -148,9 +136,6 @@ pub fn change_eps(state: &mut TpmState, _request: &Request) -> TpmResult<Respons
     state.hierarchies.endorsement.enabled = true;
     // Part 2 Table 45 reports the same enable in TPMA_STARTUP_CLEAR, which
     // TPM_PT_STARTUP_CLEAR gives back, so the two say the same thing.
-    state.startup_clear = crate::tpm::structures::attributes::StartupClearAttributes(
-        state.startup_clear.0 | crate::tpm::structures::attributes::StartupClearAttributes::EH_ENABLE,
-    );
     // "It will flush any resident objects (transient or persistent) in the
     // Endorsement hierarchy."
     state.objects.flush_hierarchy(rh::ENDORSEMENT);

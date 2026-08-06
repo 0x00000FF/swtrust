@@ -809,9 +809,6 @@ impl TpmState {
         // TPM2_Startup, so a TPM Resume that follows a shutdown taken with the
         // platform hierarchy off still comes up with it on.
         self.hierarchies.platform.enabled = true;
-        self.startup_clear = self
-            .startup_clear
-            .with(StartupClearAttributes::PH_ENABLE);
         Ok(())
     }
 
@@ -881,26 +878,11 @@ impl TpmState {
     fn begin_operation(&mut self, orderly: bool, keep_read_only: bool) {
         // Clause 22.5.1 lifts the restriction "after the next _TPM_Init".
         self.pcr_allocation_pending = false;
-        // Part 2 Table 41 describes each enable as the state of its hierarchy,
-        // so the word reports what the hierarchies hold rather than a value of
-        // its own. A TPM Reset and a TPM Restart turn all four on before this
-        // runs; a TPM Resume restores what the state file saved, and Part 1
-        // clause 8.6.2 keeps those values. Rebuilding the word with the bits
-        // forced on made TPM_PT_STARTUP_CLEAR report a hierarchy as enabled
-        // that every access check treated as disabled.
+        // The four enables are not kept here: [`TpmState::startup_clear_word`]
+        // reads them off the hierarchies, so what the property reports and what
+        // an access check sees cannot drift apart. Only the two bits that
+        // belong to the startup itself are stored.
         let mut attributes = 0u32;
-        if self.hierarchies.platform.enabled {
-            attributes |= StartupClearAttributes::PH_ENABLE;
-        }
-        if self.hierarchies.owner.enabled {
-            attributes |= StartupClearAttributes::SH_ENABLE;
-        }
-        if self.hierarchies.endorsement.enabled {
-            attributes |= StartupClearAttributes::EH_ENABLE;
-        }
-        if self.hierarchies.platform_nv_enabled {
-            attributes |= StartupClearAttributes::PH_ENABLE_NV;
-        }
         if orderly {
             attributes |= StartupClearAttributes::ORDERLY;
         }
@@ -917,6 +899,35 @@ impl TpmState {
         // Time started again from zero, so this is a new epoch and any
         // timeout recorded against the previous one has passed.
         self.clock.time_epoch = self.clock.time_epoch.wrapping_add(1);
+    }
+
+    /// TPMA_STARTUP_CLEAR as TPM_PT_STARTUP_CLEAR reports it.
+    ///
+    /// Part 2 Table 41 defines phEnable, shEnable, ehEnable and phEnableNV as
+    /// the state of the hierarchy each names, so they are read off the
+    /// hierarchies rather than kept a second time. Keeping a copy meant every
+    /// command that turns a hierarchy on or off had to remember to update both,
+    /// and TPM2_Clear did not: it sets shEnable and ehEnable, as Part 3 clause
+    /// 24.6.1 requires, but left the reported word saying they were still off.
+    ///
+    /// orderly and readOnly are properties of the startup and of the mode
+    /// rather than of a hierarchy, so those two are stored.
+    pub fn startup_clear_word(&self) -> StartupClearAttributes {
+        let mut word = self.startup_clear.0
+            & (StartupClearAttributes::ORDERLY | StartupClearAttributes::READ_ONLY);
+        if self.hierarchies.platform.enabled {
+            word |= StartupClearAttributes::PH_ENABLE;
+        }
+        if self.hierarchies.owner.enabled {
+            word |= StartupClearAttributes::SH_ENABLE;
+        }
+        if self.hierarchies.endorsement.enabled {
+            word |= StartupClearAttributes::EH_ENABLE;
+        }
+        if self.hierarchies.platform_nv_enabled {
+            word |= StartupClearAttributes::PH_ENABLE_NV;
+        }
+        StartupClearAttributes(word)
     }
 
     /// Record that RAM backed NV data has moved away from what NV holds.
@@ -1553,7 +1564,7 @@ mod tests {
         back.on_startup_state(0).unwrap();
 
         assert!(
-            back.startup_clear.has(StartupClearAttributes::PH_ENABLE),
+            back.startup_clear_word().has(StartupClearAttributes::PH_ENABLE),
             "_TPM_Init sets phEnable"
         );
         assert!(back.hierarchies.platform.enabled);
@@ -1576,7 +1587,7 @@ mod tests {
         ] {
             assert!(!enabled, "{name} stayed off over the resume");
             assert!(
-                !back.startup_clear.has(bit),
+                !back.startup_clear_word().has(bit),
                 "{name} is reported as it is held"
             );
         }
@@ -1590,7 +1601,10 @@ mod tests {
             StartupClearAttributes::EH_ENABLE,
             StartupClearAttributes::PH_ENABLE_NV,
         ] {
-            assert!(back.startup_clear.has(bit), "a reset enables every hierarchy");
+            assert!(
+                back.startup_clear_word().has(bit),
+                "a reset enables every hierarchy"
+            );
         }
     }
 
@@ -1785,10 +1799,10 @@ mod tests {
         assert_eq!(s.clock.reset_count, 1);
         assert_eq!(s.clock.total_reset_count, 1);
         assert_eq!(s.clock.restart_count, 0);
-        assert!(s.startup_clear.has(StartupClearAttributes::PH_ENABLE));
-        assert!(s.startup_clear.has(StartupClearAttributes::SH_ENABLE));
-        assert!(s.startup_clear.has(StartupClearAttributes::EH_ENABLE));
-        assert!(s.startup_clear.has(StartupClearAttributes::PH_ENABLE_NV));
+        assert!(s.startup_clear_word().has(StartupClearAttributes::PH_ENABLE));
+        assert!(s.startup_clear_word().has(StartupClearAttributes::SH_ENABLE));
+        assert!(s.startup_clear_word().has(StartupClearAttributes::EH_ENABLE));
+        assert!(s.startup_clear_word().has(StartupClearAttributes::PH_ENABLE_NV));
     }
 
     #[test]

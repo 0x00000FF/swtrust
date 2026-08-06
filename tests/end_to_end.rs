@@ -2082,6 +2082,84 @@ fn set_capability_reads_its_argument_and_refuses_the_selector() {
     assert_ne!(attributes & (1 << 22), 0, "the {{NV}} decoration");
 }
 
+/// Part 3 clause 24.6.1 has TPM2_Clear "SET shEnable and ehEnable", and Part 2
+/// Table 41 defines those bits as the state of the hierarchy each names. What
+/// TPM_PT_STARTUP_CLEAR reports and what an access check sees therefore have to
+/// agree after every command that turns a hierarchy on or off.
+#[test]
+fn the_reported_enables_follow_every_command_that_changes_them() {
+    let h = Harness::started("enablesreport");
+
+    let word = |h: &Harness| {
+        let mut p = Writer::new();
+        p.u32(0x0000_0006); // TPM_CAP_TPM_PROPERTIES
+        p.u32(0x0000_0201); // TPM_PT_STARTUP_CLEAR
+        p.u32(1);
+        let r = h.send(&command(
+            st::NO_SESSIONS,
+            cc::GetCapability,
+            &[],
+            None,
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "GetCapability -> {:08x}", r.code);
+        u32::from_be_bytes([r.body[13], r.body[14], r.body[15], r.body[16]])
+    };
+    let control = |h: &Harness, hierarchy: u32, on: u8| {
+        let mut p = Writer::new();
+        p.u32(hierarchy);
+        p.u8(on);
+        let r = h.send(&command(
+            st::SESSIONS,
+            cc::HierarchyControl,
+            &[rh::PLATFORM],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        ));
+        assert_eq!(r.code, rc::SUCCESS, "HierarchyControl -> {:08x}", r.code);
+    };
+
+    // shEnable is bit 1 and ehEnable is bit 2.
+    assert_ne!(word(&h) & 0b110, 0, "both start enabled");
+    control(&h, rh::OWNER, 0);
+    control(&h, rh::ENDORSEMENT, 0);
+    assert_eq!(word(&h) & 0b110, 0, "the report follows HierarchyControl");
+
+    // A disabled storage hierarchy refuses its own authorization, which is the
+    // access check the report has to agree with.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &[0, 0],
+    ));
+    assert_eq!(r.code, rc::HIERARCHY + (1 << 8), "owner is off -> {:08x}", r.code);
+
+    // TPM2_Clear sets both again.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::Clear,
+        &[rh::LOCKOUT],
+        Some(&password(b"")),
+        &[],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Clear -> {:08x}", r.code);
+    assert_eq!(
+        word(&h) & 0b110,
+        0b110,
+        "Clear sets shEnable and ehEnable, and the report says so"
+    );
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &[0, 0],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "owner is on again -> {:08x}", r.code);
+}
+
 #[test]
 fn read_only_mode_refuses_what_table_207_names() {
     // Part 3 clause 24.9.1: in Read-Only mode the TPM "will return

@@ -353,9 +353,7 @@ pub fn entity(state: &TpmState, handle: u32) -> TpmResult<Entity> {
         // used if phEnable is SET. The authPolicy is ACT-specific and is
         // neither enabled nor disabled by phEnable."
         let platform = state.hierarchies.get(rh::PLATFORM)?;
-        let enabled = state
-            .startup_clear
-            .has(crate::tpm::structures::attributes::StartupClearAttributes::PH_ENABLE);
+        let enabled = state.hierarchies.platform.enabled;
         return Ok(Entity {
             name,
             auth: if enabled {
