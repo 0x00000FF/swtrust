@@ -659,7 +659,7 @@ impl TpmState {
         } else {
             self.sessions.clear();
         }
-        self.nv.on_startup_clear_with(disorderly);
+        self.nv.on_startup_clear_with(restart, disorderly);
         self.clock.clear_count = self.clock.clear_count.wrapping_add(1);
         if !restart {
             // Part 1 Equation 52 wants a value that "changes on each TPM Reset

@@ -44,6 +44,12 @@ impl Harness {
     fn send(&self, buf: &[u8]) -> Answer {
         Answer::parse(&self.tpm.execute(0, buf))
     }
+
+    /// A power cycle: _TPM_Init, after which TPM2_Startup runs again.
+    fn restart(&self) {
+        self.tpm.power_off();
+        self.tpm.power_on();
+    }
 }
 
 impl Drop for Harness {
@@ -1462,6 +1468,103 @@ fn a_session_bound_to_an_object_outlives_it() {
         r.code,
         rc::SUCCESS,
         "the session went with the object -> {:08x}",
+        r.code
+    );
+}
+
+/// Part 3 clause 9.3.2 lists TPMA_NV_CLEAR_STCLEAR under both TPM Reset and
+/// TPM Restart: "for each NV Index with TPMA_NV_CLEAR_STCLEAR SET,
+/// TPMA_NV_WRITTEN shall be CLEAR". The Index keeps its definition and its
+/// authorization, so what goes away is the data and nothing else.
+#[test]
+fn a_clear_stclear_index_forgets_what_was_written_at_the_next_startup() {
+    let h = Harness::started("clearstclear");
+    let handle = 0x0100_0010u32;
+
+    // TPMA_NV_AUTHREAD | TPMA_NV_AUTHWRITE | TPMA_NV_CLEAR_STCLEAR.
+    let attributes = (1u32 << 18) | (1 << 2) | (1 << 27);
+    let mut p = Writer::new();
+    p.u16(0); // auth
+    p.u16(14); // publicInfo
+    p.u32(handle);
+    p.u16(alg::SHA256);
+    p.u32(attributes);
+    p.u16(0); // authPolicy
+    p.u16(8); // dataSize
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_DefineSpace,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "NV_DefineSpace -> {:08x}", r.code);
+
+    let mut p = Writer::new();
+    p.u16(8);
+    p.bytes(&[0xA5u8; 8]);
+    p.u16(0); // offset
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Write,
+        &[handle, handle],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "NV_Write -> {:08x}", r.code);
+
+    let mut p = Writer::new();
+    p.u16(8);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Read,
+        &[handle, handle],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "NV_Read -> {:08x}", r.code);
+
+    // A TPM Restart: TPM2_Shutdown(STATE), then _TPM_Init and
+    // TPM2_Startup(TPM_SU_CLEAR).
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::Shutdown,
+        &[],
+        None,
+        &[0x00, 0x01], // TPM_SU_STATE
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Shutdown -> {:08x}", r.code);
+    h.restart();
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::Startup,
+        &[],
+        None,
+        &[0x00, 0x00], // TPM_SU_CLEAR
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "Startup -> {:08x}", r.code);
+
+    // The Index is still defined, so TPM2_NV_ReadPublic answers.
+    let r = h.send(&command(st::NO_SESSIONS, cc::NV_ReadPublic, &[handle], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS, "NV_ReadPublic -> {:08x}", r.code);
+
+    // Reading it is refused, because Part 3 clause 32.2 answers
+    // TPM_RC_NV_UNINITIALIZED while TPMA_NV_WRITTEN is CLEAR.
+    let mut p = Writer::new();
+    p.u16(8);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::NV_Read,
+        &[handle, handle],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::NV_UNINITIALIZED,
+        "NV_Read after the restart -> {:08x}",
         r.code
     );
 }

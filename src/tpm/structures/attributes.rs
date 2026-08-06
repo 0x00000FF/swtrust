@@ -318,7 +318,7 @@ attribute! {
         NO_DA = 25;
         /// The Index is kept in RAM and written to NV on an orderly shutdown.
         ORDERLY = 26;
-        /// The read lock is cleared by a Startup(CLEAR).
+        /// TPMA_NV_WRITTEN is cleared by a TPM Reset or a TPM Restart.
         CLEAR_STCLEAR = 27;
         /// Reads are currently locked.
         READLOCKED = 28;

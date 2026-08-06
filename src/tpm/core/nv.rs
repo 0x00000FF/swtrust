@@ -361,10 +361,15 @@ impl NvStore {
     /// Part 1 clause 13.6 fixes the rules: a read lock is dropped when the
     /// Index has TPMA_NV_READ_STCLEAR, and a write lock when it has
     /// TPMA_NV_WRITE_STCLEAR, except that an Index with TPMA_NV_WRITEDEFINE
-    /// that has been written stays locked for good. `disorderly` says whether
-    /// the last shutdown failed to save the state, which is when an orderly
-    /// counter has to jump forward to stay monotonic.
-    pub fn on_startup_clear_with(&mut self, disorderly: bool) {
+    /// that has been written stays locked for good.
+    ///
+    /// `restart` says whether this startup followed a TPM2_Shutdown(STATE),
+    /// which makes it a TPM Restart rather than a TPM Reset. Part 3 clause
+    /// 9.3.2 lists what each of the two does, and the lists differ: only a
+    /// Reset drops the data of an orderly Index. `disorderly` says whether the
+    /// last shutdown failed to save the state, which is when an orderly counter
+    /// has to jump forward to stay monotonic.
+    pub fn on_startup_clear_with(&mut self, restart: bool, disorderly: bool) {
         for index in self.indices.values_mut() {
             if index.public.attributes.has(NvAttributes::READ_STCLEAR) {
                 index.set_read_lock(false);
@@ -378,12 +383,25 @@ impl NvStore {
             if !permanent {
                 index.set_write_lock(false);
             }
-            // An orderly Index that is not a counter loses its data, because
-            // the value was only ever held in RAM.
+            // Part 3 clause 9.3.2, on TPM Reset: "for each NV Index with
+            // TPMA_NV_ORDERLY SET, TPMA_NV_WRITTEN shall be CLEAR unless the
+            // type is TPM_NT_COUNTER". The value of such an Index reaches NV
+            // only at an orderly shutdown, and a Reset is where the TPM stops
+            // standing behind it. The same line is absent from the TPM Restart
+            // list, so a Shutdown(STATE) carries the value across.
             if index.public.attributes.has(NvAttributes::ORDERLY)
                 && index.index_type() != nt::COUNTER
-                && disorderly
+                && !restart
             {
+                index.data.clear();
+                index.public.attributes =
+                    index.public.attributes.without(NvAttributes::WRITTEN);
+            }
+            // The same clause, in both the Reset and the Restart list: "for
+            // each NV Index with TPMA_NV_CLEAR_STCLEAR SET, TPMA_NV_WRITTEN
+            // shall be CLEAR". Part 2 Table 249 bit 27 says the same of the
+            // attribute, and only a counter is forbidden to carry it.
+            if index.public.attributes.has(NvAttributes::CLEAR_STCLEAR) {
                 index.data.clear();
                 index.public.attributes =
                     index.public.attributes.without(NvAttributes::WRITTEN);
@@ -405,9 +423,9 @@ impl NvStore {
         }
     }
 
-    /// Apply a Startup(CLEAR) that followed an orderly shutdown.
+    /// Apply a TPM Reset that followed an orderly TPM2_Shutdown(CLEAR).
     pub fn on_startup_clear(&mut self) {
-        self.on_startup_clear_with(false);
+        self.on_startup_clear_with(false, false);
     }
 
     /// Remove every Index that the platform did not create.
@@ -676,7 +694,7 @@ mod tests {
         // A disorderly one may have lost up to MAX_ORDERLY_COUNT increments,
         // so the low bits are filled in and the next increment carries past
         // every value the counter could have held.
-        store.on_startup_clear_with(true);
+        store.on_startup_clear_with(false, true);
         assert_eq!(
             store.get(hc::NV_INDEX_FIRST).unwrap().counter_value().unwrap(),
             config::MAX_ORDERLY_COUNT
@@ -688,8 +706,11 @@ mod tests {
         );
     }
 
+    /// Part 3 clause 9.3.2 drops the data of an orderly ordinary Index on a
+    /// TPM Reset, whether or not the shutdown before it was orderly, and keeps
+    /// it across a TPM Restart.
     #[test]
-    fn orderly_data_is_lost_after_a_disorderly_shutdown() {
+    fn orderly_data_is_lost_on_a_reset_and_kept_across_a_restart() {
         let mut store = NvStore::new();
         let mut i = index(nt::ORDINARY, 8, NvAttributes::ORDERLY);
         i.public.nv_index = hc::NV_INDEX_FIRST;
@@ -700,11 +721,58 @@ mod tests {
             .write(0, &[7u8; 8])
             .unwrap();
 
-        store.on_startup_clear();
+        // A TPM Restart, which followed a TPM2_Shutdown(STATE).
+        store.on_startup_clear_with(true, false);
         assert!(store.get(hc::NV_INDEX_FIRST).unwrap().written());
 
-        store.on_startup_clear_with(true);
+        // A TPM Reset after an orderly TPM2_Shutdown(CLEAR).
+        store.on_startup_clear();
         assert!(!store.get(hc::NV_INDEX_FIRST).unwrap().written());
+    }
+
+    /// Part 3 clause 9.3.2 names TPMA_NV_CLEAR_STCLEAR in both the TPM Reset
+    /// list and the TPM Restart list, so neither carries the value across.
+    #[test]
+    fn a_clear_stclear_index_is_unwritten_by_a_reset_and_a_restart() {
+        let mut store = NvStore::new();
+        let mut i = index(nt::ORDINARY, 8, NvAttributes::CLEAR_STCLEAR);
+        i.public.nv_index = hc::NV_INDEX_FIRST;
+        store.define(i).unwrap();
+
+        store
+            .get_mut(hc::NV_INDEX_FIRST)
+            .unwrap()
+            .write(0, &[7u8; 8])
+            .unwrap();
+        store.on_startup_clear_with(true, false);
+        assert!(!store.get(hc::NV_INDEX_FIRST).unwrap().written());
+
+        store
+            .get_mut(hc::NV_INDEX_FIRST)
+            .unwrap()
+            .write(0, &[7u8; 8])
+            .unwrap();
+        store.on_startup_clear();
+        assert!(!store.get(hc::NV_INDEX_FIRST).unwrap().written());
+    }
+
+    /// An Index without the attribute keeps what was written to it, so the
+    /// clear above follows the attribute and not the startup.
+    #[test]
+    fn an_ordinary_index_keeps_its_data_across_a_startup() {
+        let mut store = NvStore::new();
+        let mut i = index(nt::ORDINARY, 8, 0);
+        i.public.nv_index = hc::NV_INDEX_FIRST;
+        store.define(i).unwrap();
+        store
+            .get_mut(hc::NV_INDEX_FIRST)
+            .unwrap()
+            .write(0, &[7u8; 8])
+            .unwrap();
+
+        store.on_startup_clear();
+        assert!(store.get(hc::NV_INDEX_FIRST).unwrap().written());
+        assert_eq!(store.get(hc::NV_INDEX_FIRST).unwrap().data, vec![7u8; 8]);
     }
 
     #[test]
