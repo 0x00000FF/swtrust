@@ -87,10 +87,18 @@ const fn rhandle_nv(code: u32, handles: u8, auth: u8) -> CommandInfo {
 }
 
 /// Every command this TPM implements, in command code order.
+///
+/// The `nv` and `extensive` of each row are the `{NV}` and `{E}` of the Part 3
+/// command schematics, which clause 4.2.6 defines: `{NV}` "indicates that the
+/// command may result in an update of NV memory and be subject to rate
+/// throttling by the TPM. If the command code does not have this notation, then
+/// a write to NV memory does not occur as part of the command actions." What a
+/// caller reads from TPMA_CC is that decoration, and this TPM answers
+/// TPM_RC_NV_UNAVAILABLE for what it marks, so the two have to agree.
 pub const COMMANDS: &[CommandInfo] = &[
     nv(cc::NV_UndefineSpaceSpecial, 2, 2),
     nv(cc::EvictControl, 2, 1),
-    nv(cc::HierarchyControl, 1, 1),
+    CommandInfo::new(cc::HierarchyControl, 1, 1, false, true, true, false),
     nv(cc::NV_UndefineSpace, 2, 1),
     CommandInfo::new(cc::ChangeEPS, 1, 1, false, true, true, false),
     CommandInfo::new(cc::ChangePPS, 1, 1, false, true, true, false),
@@ -103,10 +111,10 @@ pub const COMMANDS: &[CommandInfo] = &[
     nv(cc::PCR_SetAuthPolicy, 1, 1),
     nv(cc::PP_Commands, 1, 1),
     nv(cc::SetPrimaryPolicy, 1, 1),
-    nv(cc::ClockRateAdjust, 1, 1),
-    rhandle_nv(cc::CreatePrimary, 1, 1),
+    plain(cc::ClockRateAdjust, 1, 1),
+    rhandle(cc::CreatePrimary, 1, 1),
     nv(cc::NV_GlobalWriteLock, 1, 1),
-    plain(cc::GetCommandAuditDigest, 2, 2),
+    nv(cc::GetCommandAuditDigest, 2, 2),
     nv(cc::NV_Increment, 2, 1),
     nv(cc::NV_SetBits, 2, 1),
     nv(cc::NV_Extend, 2, 1),
@@ -120,13 +128,13 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo::new(cc::SequenceComplete, 1, 1, false, false, false, true),
     nv(cc::SetAlgorithmSet, 1, 1),
     nv(cc::SetCommandCodeAuditStatus, 1, 1),
-    plain(cc::IncrementalSelfTest, 0, 0),
-    plain(cc::SelfTest, 0, 0),
+    nv(cc::IncrementalSelfTest, 0, 0),
+    nv(cc::SelfTest, 0, 0),
     // Part 3 Table 8 marks TPM2_Startup {NV}: it records that the TPM is
     // running, so a later power loss is seen as the disorderly shutdown it is.
     nv(cc::Startup, 0, 0),
     nv(cc::Shutdown, 0, 0),
-    plain(cc::StirRandom, 0, 0),
+    nv(cc::StirRandom, 0, 0),
     plain(cc::ActivateCredential, 2, 2),
     plain(cc::Certify, 2, 2),
     plain(cc::PolicyNV, 3, 1),
@@ -182,7 +190,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     plain(cc::PolicyRestart, 1, 0),
     plain(cc::ReadClock, 0, 0),
     nv(cc::PCR_Extend, 1, 1),
-    nv(cc::PCR_SetAuthValue, 1, 1),
+    plain(cc::PCR_SetAuthValue, 1, 1),
     plain(cc::NV_Certify, 3, 2),
     CommandInfo::new(cc::EventSequenceComplete, 2, 2, false, true, false, true),
     rhandle(cc::HashSequenceStart, 0, 0),
@@ -196,7 +204,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     plain(cc::EC_Ephemeral, 0, 0),
     plain(cc::PolicyNvWritten, 1, 0),
     plain(cc::PolicyTemplate, 1, 0),
-    rhandle_nv(cc::CreateLoaded, 1, 1),
+    rhandle(cc::CreateLoaded, 1, 1),
     plain(cc::PolicyAuthorizeNV, 3, 1),
     plain(cc::EncryptDecrypt2, 1, 1),
     plain(cc::AC_GetCapability, 1, 0),
@@ -211,7 +219,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     plain(cc::PolicyParameters, 1, 0),
     nv(cc::NV_DefineSpace2, 1, 1),
     plain(cc::NV_ReadPublic2, 1, 0),
-    nv(cc::ReadOnlyControl, 1, 1),
+    plain(cc::ReadOnlyControl, 1, 1),
     plain(cc::PolicyTransportSPDM, 1, 0),
     // Part 3 Table 118 authorizes the sequence but not the verification key.
     CommandInfo::new(cc::VerifySequenceComplete, 2, 1, false, false, false, true),
@@ -363,12 +371,23 @@ mod tests {
         assert_eq!(a.handles(), 1);
         assert!(a.has(CommandAttributes::NV) == info.nv);
 
+        // TPM2_CreatePrimary returns a handle and, its schematic having no
+        // {NV}, writes no NV: a Primary Object is made in TPM memory.
         let info = lookup(cc::CreatePrimary).unwrap();
         assert!(info.attributes().has(CommandAttributes::R_HANDLE));
-        assert!(info.attributes().has(CommandAttributes::NV));
+        assert!(!info.attributes().has(CommandAttributes::NV));
 
+        // TPM2_SelfTest carries {NV} and no handle at all.
+        let info = lookup(cc::SelfTest).unwrap();
+        assert!(info.attributes().has(CommandAttributes::NV));
+        assert_eq!(info.attributes().handles(), 0);
+
+        // TPM2_Clear and TPM2_HierarchyControl both carry {NV E}.
         let info = lookup(cc::Clear).unwrap();
         assert!(info.attributes().has(CommandAttributes::EXTENSIVE));
+        let info = lookup(cc::HierarchyControl).unwrap();
+        assert!(info.attributes().has(CommandAttributes::EXTENSIVE));
+        assert!(info.attributes().has(CommandAttributes::NV));
 
         let info = lookup(cc::SequenceComplete).unwrap();
         assert!(info.attributes().has(CommandAttributes::FLUSHED));
