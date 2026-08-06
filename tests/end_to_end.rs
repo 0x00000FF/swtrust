@@ -6369,3 +6369,120 @@ fn the_permanent_bits_record_the_command_and_not_the_value() {
         "TPM2_Clear left an authorization bit set"
     );
 }
+
+
+/// Part 1 clause 16.6 authorizes a command with an HMAC session by proving the
+/// authValue of the entity: the key is the sessionKey and the authValue
+/// together, and the HMAC covers the cpHash, the two nonces and the session
+/// attributes. This is the path a caller that does not send its authorization
+/// in the clear uses, and it is what Windows uses to provision a TPM.
+#[test]
+fn an_hmac_session_authorizes_with_the_authorization_value() {
+    use swtrust::tpm::core::session;
+    use swtrust::tpm::crypto::hash;
+
+    let h = Harness::started("hmacauth");
+    let owner_auth = b"an owner secret";
+
+    // Give the storage hierarchy an authorization value, in the clear.
+    let mut p = Writer::new();
+    p.u16(owner_auth.len() as u16);
+    p.bytes(owner_auth);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "HierarchyChangeAuth -> {:08x}", r.code);
+
+    // An unbound, unsalted HMAC session: Part 1 clause 16.6.9 gives it no
+    // session key at all, so the HMAC key is the authValue alone.
+    let nonce_caller = [0x11u8; 32];
+    let mut p = Writer::new();
+    p.u16(nonce_caller.len() as u16);
+    p.bytes(&nonce_caller);
+    p.u16(0); // encryptedSalt
+    p.u8(se::HMAC);
+    p.u16(alg::NULL); // symmetric
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+    let mut rd = Reader::new(&r.body);
+    let handle = rd.u32().unwrap();
+    let n = rd.u16().unwrap() as usize;
+    let nonce_tpm = rd.take(n).unwrap().to_vec();
+
+    // TPM2_SetPrimaryPolicy over the storage hierarchy, authorized by that
+    // session. cpHash covers the command code, the Name of the handle and the
+    // parameters, Part 1 clause 18.4.
+    let mut params = Writer::new();
+    params.u16(0); // authPolicy: the Empty Buffer clears it
+    params.u16(alg::NULL);
+    let params = params.finish().unwrap();
+    let mut cp = Writer::new();
+    cp.u32(cc::SetPrimaryPolicy);
+    cp.bytes(&rh::OWNER.to_be_bytes()); // the Name of a permanent handle
+    cp.bytes(&params);
+    let cp_hash = hash::digest(alg::SHA256, &cp.finish().unwrap()).unwrap();
+
+    let authorize = |key: &[u8], nonce: &[u8]| -> Vec<u8> {
+        let hmac = session::auth_hmac(
+            alg::SHA256,
+            key,
+            &cp_hash,
+            nonce,
+            &nonce_tpm,
+            swtrust::tpm::structures::attributes::SessionAttributes(0x01),
+        )
+        .unwrap();
+        let mut auth = Writer::new();
+        auth.u32(handle);
+        auth.u16(nonce.len() as u16);
+        auth.bytes(nonce);
+        auth.u8(0x01); // continueSession
+        auth.u16(hmac.len() as u16);
+        auth.bytes(&hmac);
+        auth.finish().unwrap()
+    };
+
+    // The wrong value is refused, and the hierarchy being exempt from
+    // dictionary attack protection makes that TPM_RC_BAD_AUTH.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SetPrimaryPolicy,
+        &[rh::OWNER],
+        Some(&authorize(b"not the secret", &nonce_caller)),
+        &params,
+    ));
+    assert_eq!(
+        r.code & 0x03f,
+        rc::BAD_AUTH & 0x03f,
+        "a wrong authorization value was accepted -> {:08x}",
+        r.code
+    );
+
+    // The right one is taken. The nonce has to change, which is what stops the
+    // authorization being replayed.
+    let nonce_caller = [0x22u8; 32];
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SetPrimaryPolicy,
+        &[rh::OWNER],
+        Some(&authorize(owner_auth, &nonce_caller)),
+        &params,
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "the authorization value was not accepted -> {:08x}",
+        r.code
+    );
+}
