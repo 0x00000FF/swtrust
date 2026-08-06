@@ -240,6 +240,17 @@ fn define(
     if platform_create != (auth_handle == rh::PLATFORM) {
         return Err(TpmRc(rc::ATTRIBUTES).with_parameter(2));
     }
+    // The same clause: "for creating an Index, Owner Authorization may not be
+    // used if shEnable is CLEAR and Platform Authorization may not be used if
+    // phEnable or phEnableNV is CLEAR." Part 2 Table 41 gives the answer for
+    // the last of the three: with phEnableNV CLEAR "the platform cannot define
+    // (TPM_RC_HIERARCHY) or undefine (TPM_RC_HANDLE) indices". The other two
+    // enables are read over the handle area before the command runs, but
+    // phEnableNV is not one of them, because it gates the Indices rather than
+    // TPM_RH_PLATFORM itself.
+    if auth_handle == rh::PLATFORM && !state.hierarchies.platform_nv_enabled {
+        return Err(TpmRc(rc::HIERARCHY).with_handle(1));
+    }
     // The same clause: "if TPMA_NV_POLICY_DELETE is SET, then the
     // authorization shall be with Platform Authorization."
     if public.attributes.has(NvAttributes::POLICY_DELETE) && auth_handle != rh::PLATFORM {

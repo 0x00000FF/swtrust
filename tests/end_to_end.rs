@@ -1569,6 +1569,89 @@ fn a_clear_stclear_index_forgets_what_was_written_at_the_next_startup() {
     );
 }
 
+/// Part 3 clause 31.3.1: "for creating an Index, Owner Authorization may not be
+/// used if shEnable is CLEAR and Platform Authorization may not be used if
+/// phEnable or phEnableNV is CLEAR." Part 2 Table 41 names the answers: a
+/// define is TPM_RC_HIERARCHY and reaching an Index that is already there is
+/// TPM_RC_HANDLE, so the two are told apart.
+#[test]
+fn clearing_ph_enable_nv_stops_the_platform_defining_an_index() {
+    let h = Harness::started("phenablenv");
+    let handle = 0x0140_0010u32;
+
+    let define = |handle: u32| {
+        // TPMA_NV_PPREAD | TPMA_NV_PPWRITE | TPMA_NV_PLATFORMCREATE.
+        let attributes = (1u32 << 16) | 1 | (1 << 30);
+        let mut p = Writer::new();
+        p.u16(0); // auth
+        p.u16(14); // publicInfo
+        p.u32(handle);
+        p.u16(alg::SHA256);
+        p.u32(attributes);
+        p.u16(0); // authPolicy
+        p.u16(8); // dataSize
+        command(
+            st::SESSIONS,
+            cc::NV_DefineSpace,
+            &[rh::PLATFORM],
+            Some(&password(b"")),
+            &p.finish().unwrap(),
+        )
+    };
+
+    let r = h.send(&define(handle));
+    assert_eq!(r.code, rc::SUCCESS, "NV_DefineSpace -> {:08x}", r.code);
+
+    // TPM2_HierarchyControl over TPM_RH_PLATFORM_NV clears phEnableNV alone.
+    let mut p = Writer::new();
+    p.u32(rh::PLATFORM_NV);
+    p.u8(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyControl,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "HierarchyControl -> {:08x}", r.code);
+
+    // Defining another one is refused, and the hierarchy is what is wrong.
+    let r = h.send(&define(0x0140_0011));
+    assert_eq!(
+        r.code,
+        rc::HIERARCHY + (1 << 8),
+        "NV_DefineSpace with phEnableNV clear -> {:08x}",
+        r.code
+    );
+
+    // The Index that is there answers TPM_RC_HANDLE instead, because Table 41
+    // hides its existence rather than reporting the hierarchy.
+    let r = h.send(&command(st::NO_SESSIONS, cc::NV_ReadPublic, &[handle], None, &[]));
+    assert_eq!(
+        r.code,
+        rc::HANDLE + (1 << 8),
+        "NV_ReadPublic with phEnableNV clear -> {:08x}",
+        r.code
+    );
+
+    // phEnable is untouched, so the platform hierarchy itself still works.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyControl,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &{
+            let mut p = Writer::new();
+            p.u32(rh::PLATFORM_NV);
+            p.u8(1);
+            p.finish().unwrap()
+        },
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "HierarchyControl back -> {:08x}", r.code);
+    let r = h.send(&define(0x0140_0011));
+    assert_eq!(r.code, rc::SUCCESS, "NV_DefineSpace again -> {:08x}", r.code);
+}
+
 #[test]
 fn read_only_mode_refuses_what_table_207_names() {
     // Part 3 clause 24.9.1: in Read-Only mode the TPM "will return
