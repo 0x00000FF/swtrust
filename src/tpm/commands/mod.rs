@@ -16,6 +16,7 @@ pub mod pcr;
 pub mod policy;
 pub mod signing;
 pub mod table;
+pub mod x509;
 
 use crate::tpm::constants::{cc, rc};
 use crate::tpm::core::state::TpmState;
@@ -82,6 +83,8 @@ pub fn run_command(state: &mut TpmState, request: &Request) -> TpmResult<Respons
         cc::EncryptDecrypt => crypto::encrypt_decrypt(state, request, false),
         cc::EncryptDecrypt2 => crypto::encrypt_decrypt(state, request, true),
         cc::Hash => crypto::hash_command(state, request),
+        cc::CertifyX509 => x509::certify_x509(state, request),
+        cc::SetCapability => management::set_capability(state, request),
         cc::HMAC => crypto::hmac_command(state, request),
 
         // Part 3 clause 17, hash and HMAC sequences.

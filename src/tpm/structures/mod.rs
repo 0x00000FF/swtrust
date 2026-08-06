@@ -5,6 +5,7 @@ pub mod attributes;
 pub mod base;
 pub mod capability;
 pub mod context;
+pub mod der;
 pub mod keys;
 pub mod lists;
 pub mod nv;

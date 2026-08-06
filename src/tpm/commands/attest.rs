@@ -21,7 +21,7 @@ use super::execute::respond;
 use super::management::clock_info;
 
 /// The object a signing handle names.
-fn signing_object(state: &TpmState, handle: u32) -> TpmResult<Object> {
+pub fn signing_object(state: &TpmState, handle: u32) -> TpmResult<Object> {
     let object = if crate::tpm::core::object::ObjectSlots::is_transient(handle) {
         state.objects.object(handle)?
     } else {

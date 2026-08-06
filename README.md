@@ -193,10 +193,8 @@ response code means. Part 1 clause 5 allows a command Part 3 does not make
 mandatory to be left out; it does not allow one to be left out and still
 reported as present.
 
-Four optional commands are left out on that basis:
+Three optional commands are left out on that basis:
 
-- TPM2_CertifyX509, because completing and re-encoding a partial X.509
-  certificate needs DER handling that is not written.
 - TPM2_FieldUpgradeStart, TPM2_FieldUpgradeData and TPM2_FirmwareRead,
   because a software TPM has no field upgradeable firmware to replace or to
   read back.
@@ -248,10 +246,13 @@ TPM is exercised by: firmware, BitLocker, and the tools that talk to a TPM.
 
 ## Commands that report a limitation
 
-- TPM2_AC_Send and TPM2_SetCapability answer TPM_RC_VALUE because this TPM has
-  no attached components and no settable capability. They are implemented and
-  reported as implemented: they check their arguments and refuse a request they
-  cannot carry out, rather than denying that the command exists.
+- TPM2_AC_Send answers TPM_RC_VALUE because this TPM has no attached
+  components. TPM2_SetCapability answers TPM_RC_VALUE because Part 2 Table 140
+  leaves TPMU_SET_CAPABILITIES to "a TCG Registry", so the library
+  specification defines no member of it and there is nothing to set. Both are
+  implemented and reported as implemented: they check their arguments and
+  refuse a request they cannot carry out, rather than denying that the command
+  exists.
 - TPM2_ACT_SetTimeout sets the one timer the PC Client profile clause 5.1.2
   asks of a TPM that implements the command, TPM_RH_ACT_0, and answers
   TPM_RC_VALUE for any other timer handle.

@@ -62,6 +62,14 @@ impl CommandInfo {
         if self.response_handle {
             flags |= CommandAttributes::R_HANDLE;
         }
+        // Part 2 Table 43 bit 29: "indicates that the command is vendor
+        // specific". Part 2 Table 12 marks such a command with TPM_CC_VEND,
+        // which is the same bit of the command code, so the two say the same
+        // thing and the attribute is read off the code rather than repeated in
+        // every row.
+        if self.code & cc::CC_VEND != 0 {
+            flags |= CommandAttributes::V;
+        }
         CommandAttributes::build(self.code as u16, self.handles, flags)
     }
 }
@@ -107,6 +115,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     nv(cc::PP_Commands, 1, 1),
     nv(cc::SetPrimaryPolicy, 1, 1),
     plain(cc::ClockRateAdjust, 1, 1),
+    nv(cc::SetCapability, 1, 1),
     rhandle(cc::CreatePrimary, 1, 1),
     nv(cc::NV_GlobalWriteLock, 1, 1),
     nv(cc::GetCommandAuditDigest, 2, 2),
@@ -132,6 +141,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     nv(cc::StirRandom, 0, 0),
     plain(cc::ActivateCredential, 2, 2),
     plain(cc::Certify, 2, 2),
+    plain(cc::CertifyX509, 2, 2),
     plain(cc::PolicyNV, 3, 1),
     plain(cc::CertifyCreation, 2, 1),
     plain(cc::Duplicate, 2, 1),
@@ -274,16 +284,11 @@ mod tests {
     /// that sends one is told the command code is not supported.
     ///
     /// Field upgrade is absent because a software TPM has no field upgradeable
-    /// firmware to replace or read back. TPM2_CertifyX509 is absent because
-    /// completing and re-encoding a partial X.509 certificate is not written.
-    /// TPM2_SetCapability is absent because there is no capability this TPM
-    /// lets a caller set, so every well formed request could only be refused.
+    /// firmware to replace or read back.
     const NOT_IMPLEMENTED: &[u32] = &[
-        cc::SetCapability,
         cc::FieldUpgradeStart,
         cc::FieldUpgradeData,
         cc::FirmwareRead,
-        cc::CertifyX509,
     ];
 
     #[test]

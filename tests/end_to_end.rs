@@ -1785,6 +1785,303 @@ fn an_unavailable_nv_authorization_is_answered_before_the_value_is_read() {
     assert_eq!(r.code, rc::SUCCESS, "NV_Write -> {:08x}", r.code);
 }
 
+/// Part 3 clause 18.8 has the TPM complete a partial X.509 certificate: it adds
+/// the version, a serial number, the subject public key and, when the caller
+/// left it out, the signature algorithm identifier, then signs the whole
+/// TBSCertificate.
+#[test]
+fn certify_x509_completes_and_signs_the_partial_certificate() {
+    use swtrust::tpm::structures::der::{self, tag};
+
+    let h = Harness::started("certifyx509");
+
+    // fixedTPM fixedParent sensitiveDataOrigin userWithAuth sign
+    let r = ask_for_ecc_key(&h, 0x0004_0072, alg::ECDSA, None);
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let key = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    // A minimal RFC 5280 partial certificate: Issuer, Validity, Subject and
+    // the [3] tagged Extensions, with a KeyUsage of digitalSignature. The
+    // Names are empty SEQUENCEs, which RFC 5280 permits for a Name with no
+    // RDNs, and the Validity holds two UTCTime values.
+    let name = der::sequence(&[]);
+    let utc = |text: &str| der::tlv(0x17, text.as_bytes());
+    let validity = der::sequence(&[&utc("250101000000Z"), &utc("350101000000Z")]);
+    // KeyUsage is a BIT STRING with digitalSignature, X.509 bit 0, alone.
+    let key_usage_value = der::tlv(tag::BIT_STRING, &[7, 0x80]);
+    let key_usage = der::sequence(&[
+        &der::tlv(tag::OID, &[0x55, 0x1D, 0x0F]),
+        &der::tlv(tag::OCTET_STRING, &key_usage_value),
+    ]);
+    let extensions = der::context(3, &[&der::sequence(&[&key_usage])]);
+    let partial = der::sequence(&[&name, &validity, &name, &extensions]);
+
+    let mut p = Writer::new();
+    p.u16(0); // reserved, an Empty Buffer
+    p.u16(alg::NULL); // inScheme, the key's own scheme is used
+    p.u16(partial.len() as u16);
+    p.bytes(&partial);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::CertifyX509,
+        &[key, key],
+        Some(&password_sessions(2)),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "CertifyX509 -> {:08x}", r.code);
+
+    // The response is tagged with sessions, so a parameterSize comes first.
+    let mut area = Reader::new(&r.body);
+    let parameter_size = area.u32().unwrap() as usize;
+    let parameters = area.take(parameter_size).unwrap().to_vec();
+    let mut rd = Reader::new(&parameters);
+    let added_size = rd.u16().unwrap() as usize;
+    let added = rd.take(added_size).unwrap().to_vec();
+    let digest_size = rd.u16().unwrap() as usize;
+    let tbs_digest = rd.take(digest_size).unwrap().to_vec();
+    assert_eq!(tbs_digest.len(), 32, "the digest is over SHA-256");
+
+    // addedToCertificate is a SEQUENCE of the fields the TPM made: the [0]
+    // version, the serial number, the signature algorithm identifier the
+    // caller did not supply, and the SubjectPublicKeyInfo.
+    let mut outer = der::Reader::new(&added);
+    let seq = outer.tagged(tag::SEQUENCE).unwrap();
+    assert!(outer.is_empty());
+    let mut fields = der::Reader::new(seq.value);
+    let version = fields.tagged(tag::context(0)).unwrap();
+    assert_eq!(version.value, &[0x02, 0x01, 0x02], "version 3 is integer 2");
+    let serial = fields.tagged(tag::INTEGER).unwrap();
+    assert!(
+        !serial.value.is_empty() && serial.value.len() <= 20 && serial.value[0] & 0x80 == 0,
+        "RFC 5280 clause 4.1.2.2 wants a positive serial of at most twenty octets"
+    );
+    let algorithm = fields.tagged(tag::SEQUENCE).unwrap();
+    let mut inner = der::Reader::new(algorithm.value);
+    assert_eq!(
+        inner.tagged(tag::OID).unwrap().value,
+        &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02],
+        "ecdsa-with-SHA256"
+    );
+    let spki = fields.tagged(tag::SEQUENCE).unwrap();
+    assert!(fields.is_empty(), "the TPM added exactly four fields");
+
+    // The SubjectPublicKeyInfo names the curve of the certified key and holds
+    // its uncompressed point.
+    let mut parts = der::Reader::new(spki.value);
+    let identifiers = parts.tagged(tag::SEQUENCE).unwrap();
+    let mut ids = der::Reader::new(identifiers.value);
+    assert_eq!(
+        ids.tagged(tag::OID).unwrap().value,
+        &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01],
+        "id-ecPublicKey"
+    );
+    assert_eq!(
+        ids.tagged(tag::OID).unwrap().value,
+        &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
+        "prime256v1"
+    );
+    let point = parts.tagged(tag::BIT_STRING).unwrap();
+    assert_eq!(point.value.len(), 1 + 1 + 64, "an uncompressed P-256 point");
+    assert_eq!(point.value[1], 0x04);
+
+    // The digest is over the whole TBSCertificate, which is the added fields
+    // and the supplied ones woven into the RFC 5280 order.
+    let mut added_fields = der::Reader::new(seq.value);
+    let version = added_fields.element().unwrap().raw.to_vec();
+    let serial = added_fields.element().unwrap().raw.to_vec();
+    let algorithm = added_fields.element().unwrap().raw.to_vec();
+    let spki = added_fields.element().unwrap().raw.to_vec();
+    let mut supplied = der::Reader::new(&partial);
+    let body = supplied.tagged(tag::SEQUENCE).unwrap();
+    let mut given = der::Reader::new(body.value);
+    let issuer = given.element().unwrap().raw.to_vec();
+    let validity = given.element().unwrap().raw.to_vec();
+    let subject = given.element().unwrap().raw.to_vec();
+    let extensions = given.element().unwrap().raw.to_vec();
+    let mut expected = Vec::new();
+    for part in [
+        &version, &serial, &algorithm, &issuer, &validity, &subject, &spki, &extensions,
+    ] {
+        expected.extend_from_slice(part);
+    }
+    let tbs = der::tlv(tag::SEQUENCE, &expected);
+    let want = swtrust::tpm::crypto::hash::digest(alg::SHA256, &tbs).unwrap();
+    assert_eq!(tbs_digest, want, "tbsDigest is over the whole TBSCertificate");
+
+    // The signature is over that digest, which TPM2_VerifySignature confirms
+    // with the same key. The signature follows tbsDigest in the response.
+    let signature = rd.rest().to_vec();
+    let mut p = Writer::new();
+    p.u16(tbs_digest.len() as u16);
+    p.bytes(&tbs_digest);
+    p.bytes(&signature);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::VerifySignature,
+        &[key],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "the certificate signature verifies -> {:08x}",
+        r.code
+    );
+}
+
+/// The same clause holds the KeyUsage to the attributes of the certified key
+/// and rejects a partial certificate with no KeyUsage extension at all.
+#[test]
+fn certify_x509_holds_the_key_usage_to_the_object() {
+    use swtrust::tpm::structures::der::{self, tag};
+
+    let h = Harness::started("certifyx509usage");
+    let r = ask_for_ecc_key(&h, 0x0004_0072, alg::ECDSA, None);
+    assert_eq!(r.code, rc::SUCCESS, "CreatePrimary -> {:08x}", r.code);
+    let key = u32::from_be_bytes([r.body[0], r.body[1], r.body[2], r.body[3]]);
+
+    let name = der::sequence(&[]);
+    let utc = |text: &str| der::tlv(0x17, text.as_bytes());
+    let validity = der::sequence(&[&utc("250101000000Z"), &utc("350101000000Z")]);
+    let build = |extension_set: Vec<u8>| {
+        let extensions = der::context(3, &[&extension_set]);
+        let partial = der::sequence(&[&name, &validity, &name, &extensions]);
+        let mut p = Writer::new();
+        p.u16(0);
+        p.u16(alg::NULL);
+        p.u16(partial.len() as u16);
+        p.bytes(&partial);
+        command(
+            st::SESSIONS,
+            cc::CertifyX509,
+            &[key, key],
+            Some(&password_sessions(2)),
+            &p.finish().unwrap(),
+        )
+    };
+    let usage = |bits: &[u8]| {
+        der::sequence(&[
+            &der::tlv(tag::OID, &[0x55, 0x1D, 0x0F]),
+            &der::tlv(tag::OCTET_STRING, &der::tlv(tag::BIT_STRING, bits)),
+        ])
+    };
+
+    // keyEncipherment, X.509 bit 2, asks for a key with decrypt and restricted
+    // SET, which this signing key does not have.
+    let r = h.send(&build(der::sequence(&[&usage(&[5, 0x20])])));
+    assert_eq!(
+        r.code,
+        rc::ATTRIBUTES + 0x340,
+        "keyEncipherment on a signing key -> {:08x}",
+        r.code
+    );
+
+    // "The Extensions element is required to contain a Key Usage extension."
+    let unrelated = der::sequence(&[
+        &der::tlv(tag::OID, &[0x55, 0x1D, 0x13]), // basicConstraints
+        &der::tlv(tag::OCTET_STRING, &der::sequence(&[])),
+    ]);
+    let r = h.send(&build(der::sequence(&[&unrelated])));
+    assert_eq!(
+        r.code,
+        rc::VALUE + 0x340,
+        "no KeyUsage extension -> {:08x}",
+        r.code
+    );
+
+    // A TPMA_OBJECT extension has to match the object exactly.
+    let tpma = |value: u32| {
+        let mut bits = vec![0u8];
+        bits.extend_from_slice(&value.to_be_bytes());
+        der::sequence(&[
+            &der::tlv(tag::OID, &[0x67, 0x81, 0x05, 0x0A, 0x01, 0x01, 0x01]),
+            &der::tlv(tag::OCTET_STRING, &der::tlv(tag::BIT_STRING, &bits)),
+        ])
+    };
+    let r = h.send(&build(der::sequence(&[&usage(&[7, 0x80]), &tpma(0x0004_0072)])));
+    assert_eq!(r.code, rc::SUCCESS, "a matching TPMA_OBJECT -> {:08x}", r.code);
+    let r = h.send(&build(der::sequence(&[&usage(&[7, 0x80]), &tpma(0x0004_0073)])));
+    assert_eq!(
+        r.code,
+        rc::ATTRIBUTES + 0x340,
+        "a TPMA_OBJECT that differs -> {:08x}",
+        r.code
+    );
+}
+
+/// Part 2 Table 140 leaves TPMU_SET_CAPABILITIES to "a TCG Registry", so the
+/// library specification defines no member of it and there is nothing this TPM
+/// can be told to set. The command still reads its argument and refuses the
+/// selector, rather than denying that the command exists: Part 3 clause 30.1
+/// answers TPM_RC_VALUE for a capability a TPM does not have.
+#[test]
+fn set_capability_reads_its_argument_and_refuses_the_selector() {
+    let h = Harness::started("setcapability");
+
+    // TPM2B_SET_CAPABILITY_DATA holding a TPM_CAP of TPM_CAP_TPM_PROPERTIES
+    // and nothing else, which is a well formed argument for a union member
+    // that does not exist.
+    let mut p = Writer::new();
+    p.u16(4);
+    p.u32(0x0000_0006);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SetCapability,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::VALUE + 0x140,
+        "a capability with no settable member -> {:08x}",
+        r.code
+    );
+
+    // A buffer too short to hold the TPM_CAP is an unmarshaling error rather
+    // than a refusal of the selector.
+    let mut p = Writer::new();
+    p.u16(2);
+    p.u16(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SetCapability,
+        &[rh::PLATFORM],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::INSUFFICIENT + 0x140,
+        "a truncated TPMS_SET_CAPABILITY_DATA -> {:08x}",
+        r.code
+    );
+
+    // The command is reported as implemented, which is what lets a caller tell
+    // a refusal apart from a command the TPM does not have.
+    let mut p = Writer::new();
+    p.u32(0x0000_0002); // TPM_CAP_COMMANDS
+    p.u32(cc::SetCapability);
+    p.u32(1);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::GetCapability,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "GetCapability -> {:08x}", r.code);
+    let attributes = u32::from_be_bytes([r.body[9], r.body[10], r.body[11], r.body[12]]);
+    assert_eq!(
+        attributes & 0xFFFF,
+        cc::SetCapability & 0xFFFF,
+        "TPM_CAP_COMMANDS names it"
+    );
+    // Table 242 decorates the command {NV}, which is bit 22 of a TPMA_CC.
+    assert_ne!(attributes & (1 << 22), 0, "the {{NV}} decoration");
+}
+
 #[test]
 fn read_only_mode_refuses_what_table_207_names() {
     // Part 3 clause 24.9.1: in Read-Only mode the TPM "will return

@@ -97,6 +97,32 @@ pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
     respond(|_| Ok(()))
 }
 
+/// TPM2_SetCapability, Part 3 clause 30.4.
+///
+/// The command "is used to set specific data in the TPM, such as TPM
+/// configurations", named by a TPM_CAP and the TPMU_SET_CAPABILITIES member it
+/// selects. Part 2 Table 140 defines that union nowhere: the note beside it
+/// says "the TPMU_SET_CAPABILITIES Structure may be defined by a TCG Registry",
+/// so at this revision the library specification gives it no member at all and
+/// there is nothing a caller can name that this TPM could set.
+///
+/// The argument is still read and checked, and the refusal names the selector
+/// that has no member, rather than denying that the command exists. Part 3
+/// clause 30.1 answers TPM_RC_VALUE for a capability a TPM does not have.
+pub fn set_capability(_state: &mut TpmState, request: &Request) -> TpmResult<Response> {
+    let mut r = request.reader();
+    // TPM2B_SET_CAPABILITY_DATA, Part 2 Table 141: a size and the
+    // TPMS_SET_CAPABILITY_DATA it wraps.
+    let size = r.u16().map_err(|e| e.with_parameter(1))? as usize;
+    let body = r.take(size).map_err(|e| e.with_parameter(1))?;
+    r.expect_end()?;
+    let mut inner = crate::tpm::marshal::Reader::new(body);
+    // TPMS_SET_CAPABILITY_DATA, Table 140: the TPM_CAP to be set, then the
+    // union member it selects.
+    inner.u32().map_err(|e| e.with_parameter(1))?;
+    Err(TpmRc(rc::VALUE).with_parameter(1))
+}
+
 /// TPM2_SelfTest, Part 3 clause 10.2.
 ///
 /// fullTest of YES repeats every test whether or not it has already been run,
@@ -517,7 +543,16 @@ fn build_capability(
                 .filter(|c| c.code >= property)
                 .map(|c| c.attributes())
                 .collect();
-            all.sort_by_key(|a| a.command_index());
+            // Part 3 clause 30.1: "if vendor specific commands are
+            // implemented, the vendor-specific command attribute with the
+            // lowest commandIndex, is returned after the non-vendor-specific
+            // (base) command." A vendor command code keeps its index in the
+            // low sixteen bits like any other, and TPM_CC_Vendor_TCG_Test has
+            // an index of zero, so ordering on the index alone would put it
+            // first. The V bit is what separates the two groups.
+            all.sort_by_key(|a| {
+                (a.has(CommandAttributes::V), a.command_index())
+            });
             let (items, more) = take(all, count, TpmlCca::MAX);
             Ok((more, Capabilities::Command(TpmlCca { items })))
         }
