@@ -544,6 +544,14 @@ pub fn set_command_code_audit_status(
         if super::table::lookup(*code).is_none() {
             continue;
         }
+        // Clause 21.1: "TPM2_Shutdown() cannot be audited but TPM2_Startup()
+        // can be audited." A code that is never accumulated may not be reported
+        // either, because TPM_CAP_AUDIT_COMMANDS returns the commands
+        // "currently set for command audit" and TPM2_GetCommandAuditDigest
+        // signs a digest of that same list.
+        if *code == cc::Shutdown {
+            continue;
+        }
         if !state.audit.commands.contains(code) {
             state.audit.commands.push(*code);
         }

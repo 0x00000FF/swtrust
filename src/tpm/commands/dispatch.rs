@@ -808,6 +808,15 @@ fn check_nv_authorization_available(
     if !crate::tpm::core::nv::NvStore::is_nv_handle(handle) {
         return Ok(());
     }
+    // The check speaks for the Index the command operates on. When the
+    // authorization handle is a different Index, Part 3 clause 31.2 answers
+    // TPM_RC_NV_AUTHORIZATION from the command itself, and reading the wrong
+    // Index here would answer for it.
+    if let Some(position) = super::handles::nv_index_handle(request.code) {
+        if request.handle(position).ok() != Some(handle) {
+            return Ok(());
+        }
+    }
     let attributes = state.nv.get(handle)?.public.attributes;
     let is_policy = super::nv::auth_is_policy(state, request, index);
     let needed = match (access, is_policy) {
@@ -841,8 +850,11 @@ pub fn check_authorization(
     // A password session carries the authorization value in the clear.
     if input.handle == rh::RS_PW {
         check_role_allows_auth_value(role, entity, position)?;
+        // Part 3 clause 5.6 item 7.1: "if the entity being authorized is an
+        // object and its userWithAuth attribute is CLEAR, then the associated
+        // authorization session is a policy session (TPM_RC_POLICY_FAIL)".
         if !entity.user_with_auth {
-            return Err(TpmRc(rc::AUTH_TYPE).with_session(position));
+            return Err(TpmRc(rc::POLICY_FAIL).with_session(position));
         }
         let is_lockout = request.handle(index).ok() == Some(rh::LOCKOUT);
         check_pin_available(state, entity).map_err(|e| e.with_session(position))?;
@@ -873,8 +885,11 @@ pub fn check_authorization(
         check_policy(state, request, index, entity, cp_hash, &s, protected)?;
     } else {
         check_role_allows_auth_value(role, entity, position)?;
+        // Part 3 clause 5.6 item 7.1: "if the entity being authorized is an
+        // object and its userWithAuth attribute is CLEAR, then the associated
+        // authorization session is a policy session (TPM_RC_POLICY_FAIL)".
         if !entity.user_with_auth {
-            return Err(TpmRc(rc::AUTH_TYPE).with_session(position));
+            return Err(TpmRc(rc::POLICY_FAIL).with_session(position));
         }
         let key = s.hmac_key(&entity.name, &entity.auth);
         let (nonce_decrypt, nonce_encrypt) = auxiliary_nonces(state, request, index);
@@ -1507,11 +1522,13 @@ pub fn update_audit(
     // command, and takes it away when any other auditable command runs. A
     // command that is allowed no session at all is not auditable and so
     // leaves the exclusive session alone.
-    if !requires_no_sessions(request.code) {
-        state.audit.exclusive_session = match audit_index {
-            Some(index) => request.sessions[index].handle,
-            None => rh::UNASSIGNED,
-        };
+    match audit_index {
+        Some(index) => state.audit.exclusive_session = request.sessions[index].handle,
+        None => {
+            if !keeps_exclusive_audit(request.code) {
+                state.audit.exclusive_session = rh::UNASSIGNED;
+            }
+        }
     }
 
     if command_audit_applies(state, request.code) {
@@ -1530,14 +1547,27 @@ pub fn update_audit(
 
 /// True for the four commands whose tag Part 3 requires to be
 /// TPM_ST_NO_SESSIONS.
-///
-/// They can carry no audit session, so Part 1 clause 17.2 also leaves the
-/// current exclusive audit session alone when one of them runs.
 pub fn requires_no_sessions(code: u32) -> bool {
     matches!(
         code,
         cc::ContextSave | cc::ContextLoad | cc::FlushContext | cc::Startup
     )
+}
+
+/// True for a command that never takes the exclusive audit session away.
+///
+/// Part 1 clause 17.2: "a command that is not allowed to have any sessions will
+/// not change the current exclusive audit session. Those commands include the
+/// context management commands (TPM2_ContextSave(), TPM2_ContextLoad(), and
+/// TPM2_Flush()), TPM2_Startup(), and TPM2_ReadClock()."
+///
+/// TPM2_ReadClock is in that list although Part 3 Table 232 gives it
+/// TPM_ST_SESSIONS "if an audit session is present". The two hold together if
+/// what the clause exempts is the taking away: a TPM2_ReadClock that carries no
+/// audit session leaves the exclusive one alone, and one that carries a session
+/// has used that session for audit, which the same clause makes exclusive.
+fn keeps_exclusive_audit(code: u32) -> bool {
+    requires_no_sessions(code) || code == cc::ReadClock
 }
 
 /// True when the command code is one the TPM records in the command audit.

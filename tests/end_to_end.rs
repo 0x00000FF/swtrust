@@ -2160,6 +2160,210 @@ fn the_reported_enables_follow_every_command_that_changes_them() {
     assert_eq!(r.code, rc::SUCCESS, "owner is on again -> {:08x}", r.code);
 }
 
+/// Part 3 clause 21.1: "TPM2_Shutdown() cannot be audited but TPM2_Startup()
+/// can be audited." A command that is never accumulated may not be reported as
+/// selected either, because TPM_CAP_AUDIT_COMMANDS returns the commands
+/// "currently set for command audit".
+#[test]
+fn shutdown_is_never_selected_for_the_command_audit() {
+    let h = Harness::started("auditlist");
+
+    // setList of TPM2_Shutdown and TPM2_Startup, clearList empty.
+    let mut p = Writer::new();
+    p.u16(alg::NULL); // auditAlg, leave it alone
+    p.u32(2);
+    p.u32(cc::Shutdown);
+    p.u32(cc::Startup);
+    p.u32(0);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::SetCommandCodeAuditStatus,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "SetCommandCodeAuditStatus -> {:08x}",
+        r.code
+    );
+
+    let mut p = Writer::new();
+    p.u32(0x0000_0004); // TPM_CAP_AUDIT_COMMANDS
+    p.u32(0);
+    p.u32(32);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::GetCapability,
+        &[],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "GetCapability -> {:08x}", r.code);
+    let count = u32::from_be_bytes([r.body[5], r.body[6], r.body[7], r.body[8]]) as usize;
+    let mut selected = Vec::new();
+    for i in 0..count {
+        let at = 9 + 4 * i;
+        selected.push(u32::from_be_bytes([
+            r.body[at],
+            r.body[at + 1],
+            r.body[at + 2],
+            r.body[at + 3],
+        ]));
+    }
+    assert!(
+        selected.contains(&cc::Startup),
+        "TPM2_Startup can be audited: {selected:08x?}"
+    );
+    assert!(
+        !selected.contains(&cc::Shutdown),
+        "TPM2_Shutdown cannot: {selected:08x?}"
+    );
+}
+
+/// Part 1 clause 17.2: "a command that is not allowed to have any sessions will
+/// not change the current exclusive audit session. Those commands include the
+/// context management commands (TPM2_ContextSave(), TPM2_ContextLoad(), and
+/// TPM2_Flush()), TPM2_Startup(), and TPM2_ReadClock()."
+#[test]
+fn read_clock_does_not_take_the_exclusive_audit_session_away() {
+    use swtrust::tpm::core::session;
+
+    let h = Harness::started("exclusiveaudit");
+
+    // An unbound, unsalted HMAC session, whose key is the authValue alone.
+    let nonce_caller = [0x22u8; 32];
+    let mut p = Writer::new();
+    p.u16(nonce_caller.len() as u16);
+    p.bytes(&nonce_caller);
+    p.u16(0);
+    p.u8(se::HMAC);
+    p.u16(alg::NULL);
+    p.u16(alg::SHA256);
+    let r = h.send(&command(
+        st::NO_SESSIONS,
+        cc::StartAuthSession,
+        &[rh::NULL, rh::NULL],
+        None,
+        &p.finish().unwrap(),
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "StartAuthSession -> {:08x}", r.code);
+    let mut rd = Reader::new(&r.body);
+    let handle = rd.u32().unwrap();
+    let n = rd.u16().unwrap() as usize;
+    let mut nonce_tpm = rd.take(n).unwrap().to_vec();
+
+    // An audit session over TPM2_GetRandom. The attributes are audit and
+    // continueSession, and the HMAC is over the cpHash with the session key,
+    // which is empty for an unbound, unsalted session with no authValue.
+    let audit_only = |code: u32,
+                      params: &[u8],
+                      nonce_tpm: &[u8],
+                      reset: bool,
+                      only_if_exclusive: bool|
+     -> Vec<u8> {
+        let attributes = 0x01u8
+            | 0x80
+            | if reset { 0x04 } else { 0 }
+            | if only_if_exclusive { 0x02 } else { 0 };
+        let cp = session::cp_hash(alg::SHA256, code, &[], params).unwrap();
+        let mac = session::auth_hmac_with_nonces(
+            alg::SHA256,
+            &[],
+            &cp,
+            &nonce_caller,
+            nonce_tpm,
+            &[],
+            &[],
+            swtrust::tpm::structures::attributes::SessionAttributes(attributes),
+        )
+        .unwrap();
+        let mut w = Writer::new();
+        w.u32(handle);
+        w.u16(nonce_caller.len() as u16);
+        w.bytes(&nonce_caller);
+        w.u8(attributes);
+        w.u16(mac.len() as u16);
+        w.bytes(&mac);
+        w.finish().unwrap()
+    };
+
+    let exclusive = |r: &Answer| -> bool {
+        // The response session area follows parameterSize and the parameters.
+        let mut rd = Reader::new(&r.body);
+        let size = rd.u32().unwrap() as usize;
+        rd.take(size).unwrap();
+        let n = rd.u16().unwrap() as usize;
+        rd.take(n).unwrap();
+        rd.u8().unwrap() & 0x02 != 0
+    };
+
+    let params = [0x00u8, 0x08];
+    let area = audit_only(cc::GetRandom, &params, &nonce_tpm, true, false);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::GetRandom,
+        &[],
+        Some(&area),
+        &params,
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "audited GetRandom -> {:08x}", r.code);
+    assert!(exclusive(&r), "the session became exclusive");
+    let mut rd = Reader::new(&r.body);
+    let size = rd.u32().unwrap() as usize;
+    rd.take(size).unwrap();
+    let n = rd.u16().unwrap() as usize;
+    nonce_tpm = rd.take(n).unwrap().to_vec();
+
+    // TPM2_ReadClock with no session at all does not take it away. Part 2
+    // Table 38: with auditExclusive SET "in a command, this setting indicates
+    // that the command should only be executed if the session is exclusive at
+    // the start of the command", so this succeeding is the proof.
+    let r = h.send(&command(st::NO_SESSIONS, cc::ReadClock, &[], None, &[]));
+    assert_eq!(r.code, rc::SUCCESS, "ReadClock -> {:08x}", r.code);
+
+    let area = audit_only(cc::GetRandom, &params, &nonce_tpm, false, true);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::GetRandom,
+        &[],
+        Some(&area),
+        &params,
+    ));
+    assert_eq!(
+        r.code,
+        rc::SUCCESS,
+        "TPM2_ReadClock left the exclusive session alone -> {:08x}",
+        r.code
+    );
+    assert!(exclusive(&r));
+    let mut rd = Reader::new(&r.body);
+    let size = rd.u32().unwrap() as usize;
+    rd.take(size).unwrap();
+    let n = rd.u16().unwrap() as usize;
+    nonce_tpm = rd.take(n).unwrap().to_vec();
+
+    // An auditable command that does not use the session does take it away,
+    // which the same attribute reports as TPM_RC_EXCLUSIVE.
+    let r = h.send(&command(st::NO_SESSIONS, cc::GetRandom, &[], None, &params));
+    assert_eq!(r.code, rc::SUCCESS, "unaudited GetRandom -> {:08x}", r.code);
+    let area = audit_only(cc::GetRandom, &params, &nonce_tpm, false, true);
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::GetRandom,
+        &[],
+        Some(&area),
+        &params,
+    ));
+    assert_eq!(
+        r.code,
+        rc::EXCLUSIVE,
+        "another auditable command took exclusivity away -> {:08x}",
+        r.code
+    );
+}
+
 #[test]
 fn read_only_mode_refuses_what_table_207_names() {
     // Part 3 clause 24.9.1: in Read-Only mode the TPM "will return

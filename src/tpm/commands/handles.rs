@@ -279,6 +279,25 @@ pub fn nv_access(code: u32) -> Option<NvAccess> {
     }
 }
 
+/// Where the schematic of `code` puts the NV Index it operates on.
+///
+/// `None` means the Index is the authorization handle itself, which is the
+/// shape TPM2_PolicySecret has: the entity it authorizes against is the Index.
+/// Every other command names the Index in its own handle, and Part 3 clause
+/// 31.2 requires the two to be equal when the authorization handle is an Index:
+/// "if an operation on an NV index requires authorization, and the authHandle
+/// parameter is the handle of an NV Index, then the nvIndex parameter must have
+/// the same value or the TPM will return TPM_RC_NV_AUTHORIZATION". That answer
+/// belongs to the command, so the clause 5.6 item 7.2 check ahead of it has to
+/// stay out of the way when they differ.
+pub fn nv_index_handle(code: u32) -> Option<usize> {
+    match code {
+        cc::NV_Certify => Some(2),
+        cc::PolicySecret => None,
+        _ => Some(1),
+    }
+}
+
 /// True for a command whose schematic defines no parameters.
 ///
 /// Part 3 clause 5.8.2 refuses a command that carries more than its schematic

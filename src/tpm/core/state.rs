@@ -654,10 +654,17 @@ impl TpmState {
         self.objects.clear();
         // Only a TPM Reset invalidates a saved session context; a TPM Restart
         // flushes what is in memory and leaves the saved ones reloadable.
+        //
+        // Part 1 clause 17.2 leaves the current exclusive audit session alone
+        // over a TPM2_Startup, which it names among the commands that "will not
+        // change" it. A TPM Reset still takes it away, because the session it
+        // named cannot be reloaded afterwards and the handle would otherwise be
+        // handed to a session that never audited anything.
         if restart {
             self.sessions.flush_loaded();
         } else {
             self.sessions.clear();
+            self.audit.exclusive_session = rh::UNASSIGNED;
         }
         self.nv.on_startup_clear_with(restart, disorderly);
         // Part 1 Table 41 describes clearCount as "a value that is incremented
@@ -725,7 +732,7 @@ impl TpmState {
         if !restart {
             self.audit.digest.clear();
         }
-        self.audit.exclusive_session = rh::UNASSIGNED;
+
         // Part 1 Table 41 puts the commit values in the state reset data, which
         // clause 34.4.4 restores on a Startup of any type and initializes only
         // on a TPM Reset. A TPM Restart therefore keeps them, so an
