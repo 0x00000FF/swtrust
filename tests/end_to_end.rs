@@ -6371,6 +6371,70 @@ fn the_permanent_bits_record_the_command_and_not_the_value() {
 }
 
 
+/// Part 3 clause 5.5 item 4 gives two different answers for a session handle
+/// the TPM cannot resolve, and the difference matters to a resource manager.
+///
+/// Item 4.1 answers TPM_RC_HANDLE when the handle is not an HMAC session, a
+/// policy session or TPM_RS_PW, because no such session can ever exist. Item
+/// 4.2 answers the warning TPM_RC_REFERENCE_S0 + N when the handle names a
+/// session that is simply not loaded, which tells the caller to load that
+/// context and send the command again.
+#[test]
+fn an_unloaded_session_is_a_warning_and_a_wrong_one_is_an_error() {
+    let h = Harness::started("sessionhandles");
+
+    let area = |handle: u32| {
+        let mut w = Writer::new();
+        w.u32(handle);
+        w.u16(0); // nonce
+        w.u8(0x01); // continueSession
+        w.u16(0); // hmac
+        w.finish().unwrap()
+    };
+
+    // A handle inside the HMAC session range that was never started.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&area(0x0200_0000)),
+        &[0, 0],
+    ));
+    assert_eq!(
+        r.code,
+        rc::REFERENCE_S0,
+        "an unloaded session is session zero -> {:08x}",
+        r.code
+    );
+
+    // The same shape with a handle that names no session at all. It is the
+    // first session, so were it a warning it would carry the same number.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&area(0x8000_0000)),
+        &[0, 0],
+    ));
+    assert_eq!(
+        r.code,
+        rc::HANDLE + 0x800 + 0x100,
+        "a handle that names no session -> {:08x}",
+        r.code
+    );
+
+    // A password session still authorizes after both of those, so neither
+    // check turned away the handle clause 5.5 item 4.1 permits.
+    let r = h.send(&command(
+        st::SESSIONS,
+        cc::HierarchyChangeAuth,
+        &[rh::OWNER],
+        Some(&password(b"")),
+        &[0, 0],
+    ));
+    assert_eq!(r.code, rc::SUCCESS, "password session -> {:08x}", r.code);
+}
+
 /// Part 1 clause 16.6 authorizes a command with an HMAC session by proving the
 /// authValue of the entity: the key is the sessionKey and the authValue
 /// together, and the HMAC covers the cpHash, the two nonces and the session

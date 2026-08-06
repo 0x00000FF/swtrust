@@ -162,8 +162,10 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         names.push(dispatch::handle_name(state, *h).map_err(|e| e.with_handle(index + 1))?);
     }
 
-    // Part 3 clause 5.5 checks that the sessions ask for a consistent set of
-    // things before any of them is used.
+    // Part 3 clause 5.5 item 4 resolves each session handle before any session
+    // is used, then checks that the sessions ask for a consistent set of
+    // things.
+    dispatch::check_session_handles(state, &request)?;
     dispatch::check_session_attributes(&request)?;
 
     // Part 3 clause 5.6 checks each authorization before clause 5.7 decrypts a

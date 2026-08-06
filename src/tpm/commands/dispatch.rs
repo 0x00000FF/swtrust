@@ -206,6 +206,35 @@ pub fn handle_name(state: &TpmState, handle: u32) -> TpmResult<Vec<u8>> {
 /// defined. Part 1 clause 9.4 bars the authValue and authPolicy of a hierarchy
 /// whose enable is CLEAR. This runs over the handle area before the command
 /// does, so a command that takes no authorization is stopped as well.
+/// Check every session handle the way Part 3 clause 5.5 item 4 does.
+///
+/// Item 4.1: "if the session handle is not a handle for an HMAC session, a
+/// handle for a policy session, or, TPM_RS_PW then the TPM shall return
+/// TPM_RC_HANDLE." Item 4.2: "if the session is not loaded, the TPM will return
+/// the warning TPM_RC_REFERENCE_S0 + N where N is the number of the session."
+///
+/// The two answers are told apart by whether the handle names a session at all.
+/// A handle outside both session ranges cannot be loaded by anyone, so the
+/// warning would send a resource manager looking for a context that never
+/// existed; a handle inside them may simply be swapped out, which is what the
+/// warning is for. The check covers every session in the area, not only the
+/// ones that carry an authorization, because clause 5.5 runs while the area is
+/// unmarshaled and before any session is used.
+pub fn check_session_handles(state: &TpmState, request: &Request) -> TpmResult<()> {
+    for (index, input) in request.sessions.iter().enumerate() {
+        if input.handle == rh::RS_PW {
+            continue;
+        }
+        if !crate::tpm::core::session::is_session_handle(input.handle) {
+            return Err(TpmRc(rc::HANDLE).with_session(index + 1));
+        }
+        if state.sessions.get(input.handle).is_err() {
+            return Err(TpmRc(rc::REFERENCE_S0 + index as u32));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a handle that must name a loaded context names one.
 ///
 /// Part 3 clause 5.3 answers TPM_RC_REFERENCE_H0 + N for a transient object or
@@ -778,7 +807,7 @@ pub fn check_authorization(
     let s = state
         .sessions
         .get(input.handle)
-        .map_err(|_| TpmRc(rc::REFERENCE_S0 + index as u32))?
+?
         .clone();
 
     if s.is_trial() {
@@ -946,7 +975,7 @@ pub fn check_unauthorized_session(
     let s = state
         .sessions
         .get(input.handle)
-        .map_err(|_| TpmRc(rc::REFERENCE_S0 + index as u32))?;
+?;
 
     // An unbound, unsalted session has no key, so Part 1 clause 19.6.16 lets
     // it send an empty HMAC. It may not send a wrong one, so anything present
@@ -1379,7 +1408,7 @@ pub fn check_audit_session(state: &TpmState, request: &Request) -> TpmResult<()>
     let s = state
         .sessions
         .get(input.handle)
-        .map_err(|_| TpmRc(rc::REFERENCE_S0 + index as u32))?;
+?;
     if !s.is_hmac() {
         return Err(TpmRc(rc::ATTRIBUTES).with_session(position));
     }
