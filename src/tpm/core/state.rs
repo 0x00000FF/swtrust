@@ -660,7 +660,19 @@ impl TpmState {
             self.sessions.clear();
         }
         self.nv.on_startup_clear_with(restart, disorderly);
-        self.clock.clear_count = self.clock.clear_count.wrapping_add(1);
+        // Part 1 Table 41 describes clearCount as "a value that is incremented
+        // each time the TPM performs a TPM Restart", with an initialization
+        // value of zero, and the note under the table says "the default reset
+        // value is applied on each TPM Reset". A Reset therefore puts it back
+        // to zero rather than stepping it, which is also what tagging the
+        // contexts of stClear objects needs: a Reset already stops every saved
+        // context verifying, so the count only has to separate the Restarts
+        // that follow it.
+        if restart {
+            self.clock.clear_count = self.clock.clear_count.wrapping_add(1);
+        } else {
+            self.clock.clear_count = 0;
+        }
         if !restart {
             // Part 1 Equation 52 wants a value that "changes on each TPM Reset
             // and has the size of the digest produced by vendorAlg". Drawing
@@ -1490,6 +1502,31 @@ mod tests {
             unique: PublicId::Ecc(Default::default()),
         };
         Object::new(public, None, rh::OWNER, &rh::OWNER.to_be_bytes(), true).unwrap()
+    }
+
+    /// Part 1 Table 41 puts clearCount in the state reset data, incremented on
+    /// each TPM Restart and put back to its initialization value of zero on
+    /// each TPM Reset.
+    #[test]
+    fn clear_count_steps_on_a_restart_and_goes_back_on_a_reset() {
+        let mut s = TpmState::manufacture().unwrap();
+        // A TPM Restart is a Startup(CLEAR) that followed a Shutdown(STATE).
+        s.shutdown_type = su::STATE;
+        s.on_startup_clear(0).unwrap();
+        assert_eq!(s.clock.clear_count, 1);
+        s.shutdown_type = su::STATE;
+        s.on_startup_clear(0).unwrap();
+        assert_eq!(s.clock.clear_count, 2);
+
+        // A TPM Reset is one that followed a Shutdown(CLEAR) or no shutdown.
+        s.shutdown_type = su::CLEAR;
+        s.on_startup_clear(0).unwrap();
+        assert_eq!(s.clock.clear_count, 0, "a reset applies the reset value");
+
+        // And it steps again from there.
+        s.shutdown_type = su::STATE;
+        s.on_startup_clear(0).unwrap();
+        assert_eq!(s.clock.clear_count, 1);
     }
 
     #[test]
