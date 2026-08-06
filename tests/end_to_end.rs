@@ -2025,10 +2025,10 @@ fn a_trial_policy_session_accumulates_a_digest() {
         &p.finish().unwrap(),
     ));
     assert_eq!(r.code, rc::SUCCESS);
-    // The handle no longer references a session, which Part 1 clause 12.5
-    // reports as TPM_RC_HANDLE against the first handle.
+    // Part 3 clause 5.3 item 4: the handle no longer names a session context in
+    // TPM memory, which is the warning TPM_RC_REFERENCE_H0 + N.
     let r = h.send(&get_digest);
-    assert_eq!(r.code & 0x03f, rc::HANDLE & 0x03f);
+    assert_eq!(r.code, rc::REFERENCE_H0);
 }
 
 #[test]
@@ -2224,7 +2224,9 @@ fn hierarchy_authorization_can_be_changed_and_is_enforced() {
         Some(&password(b"")),
         &p.finish().unwrap(),
     ));
-    assert_eq!(r.code & 0x03f, rc::AUTH_FAIL & 0x03f);
+    // Part 1 clause 16.6.8: a hierarchy is exempt from dictionary attack
+    // protection, so the failure is TPM_RC_BAD_AUTH and costs nothing.
+    assert_eq!(r.code & 0x03f, rc::BAD_AUTH & 0x03f);
 
     // The new one does.
     let mut p = Writer::new();
@@ -2331,8 +2333,11 @@ fn a_primary_key_is_created_and_regenerates_identically() {
         &p.finish().unwrap(),
     ));
     assert_eq!(r.code, rc::SUCCESS);
+    // Part 3 clause 5.3 item 2: a transient handle that names no loaded object
+    // is the warning TPM_RC_REFERENCE_H0 + N, which tells a resource manager
+    // to load the context and send the command again.
     let r = h.send(&command(st::NO_SESSIONS, cc::ReadPublic, &[handle], None, &[]));
-    assert_eq!(r.code & 0x03f, rc::HANDLE & 0x03f);
+    assert_eq!(r.code, rc::REFERENCE_H0);
 }
 
 #[test]
@@ -2653,7 +2658,7 @@ fn a_hash_sequence_matches_a_single_hash() {
         Some(&password(b"")),
         &[0x00, 0x00],
     ));
-    assert_eq!(r.code & 0x03f, rc::HANDLE & 0x03f);
+    assert_eq!(r.code, rc::REFERENCE_H0, "a flushed sequence is not a bad handle");
 }
 
 #[test]
@@ -3132,7 +3137,7 @@ fn a_saved_policy_session_keeps_the_restrictions_it_recorded() {
     let context = r.body.clone();
 
     let r = h.send(&get_digest);
-    assert_eq!(r.code & 0x03f, rc::HANDLE & 0x03f, "the session is gone");
+    assert_eq!(r.code, rc::REFERENCE_H0, "the session is gone");
 
     // Load it back. Part 1 clause 27.2.1 rebuilds the whole session.
     let r = h.send(&command(
@@ -3359,7 +3364,7 @@ fn trailing_parameter_octets_are_refused_without_changing_anything() {
     ));
     assert_eq!(
         r.code & 0x03f,
-        rc::AUTH_FAIL & 0x03f,
+        rc::BAD_AUTH & 0x03f,
         "TPM2_Clear ran despite the error"
     );
 
@@ -4849,7 +4854,7 @@ fn a_capability_assertion_is_held_to_the_property_the_tpm_reports() {
     // A property that the capability itself refuses is reported against the
     // parameter that carried it, which Table 185 makes the fifth here and
     // TPM2_GetCapability makes the second.
-    let r = assert_capability(s, &[0, 0, 0, 0], 0, eo::EQ, cap::ACT, rh::OWNER);
+    let r = assert_capability(s, &[0, 0, 0, 0], 0, eo::EQ, cap::ACT, hc::TRANSIENT_FIRST);
     assert_eq!(
         r.code,
         rc::VALUE | 0x080 | 0x040 | (5 << 8),

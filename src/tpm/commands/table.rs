@@ -81,11 +81,6 @@ const fn rhandle(code: u32, handles: u8, auth: u8) -> CommandInfo {
     CommandInfo::new(code, handles, auth, true, false, false, false)
 }
 
-/// Shorthand for a command that returns a handle and writes NV.
-const fn rhandle_nv(code: u32, handles: u8, auth: u8) -> CommandInfo {
-    CommandInfo::new(code, handles, auth, true, true, false, false)
-}
-
 /// Every command this TPM implements, in command code order.
 ///
 /// The `nv` and `extensive` of each row are the `{NV}` and `{E}` of the Part 3

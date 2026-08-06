@@ -340,7 +340,9 @@ pub fn context_save(state: &mut TpmState, request: &Request) -> TpmResult<Respon
     // A counter that has stopped would stamp every later context with the same
     // number, which clause 27.5 does not allow the TPM to let happen.
     if state.sessions.counters_exhausted() {
-        return Err(TpmRc(rc::CONTEXT_GAP));
+        // Part 2 Table 18: TPM_RC_TOO_MANY_CONTEXTS is "the TPM has run out of
+        // context ID values", which TPM_RC_CONTEXT_GAP does not say.
+        return Err(TpmRc(rc::TOO_MANY_CONTEXTS));
     }
 
     let (hierarchy, saved_handle, body, sequence) =

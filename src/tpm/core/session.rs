@@ -766,7 +766,11 @@ impl SessionSlots {
         }
         self.check_gap()?;
         if self.counters_exhausted() {
-            return Err(TpmRc(rc::CONTEXT_GAP));
+            // Part 2 Table 18 keeps the two apart: TPM_RC_CONTEXT_GAP is "the
+            // gap between saved context counts is too large", while
+            // TPM_RC_TOO_MANY_CONTEXTS is "the TPM has run out of context ID
+            // values", which is this one.
+            return Err(TpmRc(rc::TOO_MANY_CONTEXTS));
         }
         let handle = session.handle;
         let id = self.next_context_id();

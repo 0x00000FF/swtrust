@@ -206,6 +206,22 @@ pub fn handle_name(state: &TpmState, handle: u32) -> TpmResult<Vec<u8>> {
 /// defined. Part 1 clause 9.4 bars the authValue and authPolicy of a hierarchy
 /// whose enable is CLEAR. This runs over the handle area before the command
 /// does, so a command that takes no authorization is stopped as well.
+/// Whether a handle that must name a loaded context names one.
+///
+/// Part 3 clause 5.3 answers TPM_RC_REFERENCE_H0 + N for a transient object or
+/// a session that is not in TPM memory, which is a warning rather than an
+/// error: the caller is being told to load the context and send the command
+/// again. Every other kind of handle is judged by the checks that follow.
+pub fn handle_is_present(state: &TpmState, handle: u32) -> bool {
+    if crate::tpm::core::object::ObjectSlots::is_transient(handle) {
+        return state.objects.get(handle).is_ok();
+    }
+    if crate::tpm::core::session::is_session_handle(handle) {
+        return state.sessions.get(handle).is_ok();
+    }
+    true
+}
+
 pub fn check_handle_available(state: &TpmState, handle: u32) -> TpmResult<()> {
     // A limited hierarchy is there while its base is, so a caller cannot tell
     // a right authorization from a wrong one against a hierarchy that is off.
@@ -762,7 +778,7 @@ pub fn check_authorization(
     let s = state
         .sessions
         .get(input.handle)
-        .map_err(|_| TpmRc(rc::VALUE).with_session(position))?
+        .map_err(|_| TpmRc(rc::REFERENCE_S0 + index as u32))?
         .clone();
 
     if s.is_trial() {
@@ -806,8 +822,10 @@ pub fn check_authorization(
             if request.handle(index).ok() == Some(rh::LOCKOUT) {
                 record_lockout_failure(state);
             }
+            // Clause 16.6.8 changes the code when the entity is exempt.
+            let code = if protected { rc::AUTH_FAIL } else { rc::BAD_AUTH };
             return record_failure(state, protected)
-                .and(Err(TpmRc(rc::AUTH_FAIL).with_session(position)));
+                .and(Err(TpmRc(code).with_session(position)));
         }
     }
     Ok(())
@@ -928,7 +946,7 @@ pub fn check_unauthorized_session(
     let s = state
         .sessions
         .get(input.handle)
-        .map_err(|_| TpmRc(rc::VALUE).with_session(position))?;
+        .map_err(|_| TpmRc(rc::REFERENCE_S0 + index as u32))?;
 
     // An unbound, unsalted session has no key, so Part 1 clause 19.6.16 lets
     // it send an empty HMAC. It may not send a wrong one, so anything present
@@ -969,7 +987,17 @@ fn compare_auth(
             record_lockout_failure(state);
         }
         record_failure(state, uses_lockout)?;
-        Err(TpmRc(rc::AUTH_FAIL))
+        // Part 1 clause 16.6.8: "when an authorization failure occurs, the TPM
+        // will check to see if the use of the object is exempt from dictionary
+        // attack protection. If it is exempt, the response code is changed from
+        // TPM_RC_AUTH_FAIL to TPM_RC_BAD_AUTH and no increment of the failed
+        // authorization counter occurs." A caller can tell from the answer
+        // whether the guess cost it anything.
+        Err(TpmRc(if uses_lockout {
+            rc::AUTH_FAIL
+        } else {
+            rc::BAD_AUTH
+        }))
     }
 }
 
@@ -1228,7 +1256,8 @@ fn check_policy(
     }
     if !accepted {
         record_failure(state, protected)?;
-        return Err(TpmRc(rc::AUTH_FAIL).with_session(position));
+        let code = if protected { rc::AUTH_FAIL } else { rc::BAD_AUTH };
+        return Err(TpmRc(code).with_session(position));
     }
     Ok(())
 }
@@ -1350,7 +1379,7 @@ pub fn check_audit_session(state: &TpmState, request: &Request) -> TpmResult<()>
     let s = state
         .sessions
         .get(input.handle)
-        .map_err(|_| TpmRc(rc::VALUE).with_session(position))?;
+        .map_err(|_| TpmRc(rc::REFERENCE_S0 + index as u32))?;
     if !s.is_hmac() {
         return Err(TpmRc(rc::ATTRIBUTES).with_session(position));
     }

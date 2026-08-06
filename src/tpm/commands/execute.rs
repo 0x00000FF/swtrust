@@ -149,6 +149,15 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
     // the handle number in the N field, and this is where the number is known.
     let mut names: Vec<Vec<u8>> = Vec::with_capacity(request.handles.len());
     for (index, h) in request.handles.iter().enumerate() {
+        // Part 3 clause 5.3 item 2: "if the handle references a transient
+        // object, the handle shall reference a loaded object
+        // (TPM_RC_REFERENCE_H0 + N where N is the number of the handle in the
+        // command)", and item 4 says the same of a session context. The warning
+        // is what tells a resource manager which context to load and send
+        // again, which TPM_RC_HANDLE does not.
+        if !dispatch::handle_is_present(state, *h) {
+            return Err(TpmRc(rc::REFERENCE_H0 + index as u32));
+        }
         dispatch::check_handle_available(state, *h).map_err(|e| e.with_handle(index + 1))?;
         names.push(dispatch::handle_name(state, *h).map_err(|e| e.with_handle(index + 1))?);
     }

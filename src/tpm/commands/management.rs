@@ -598,8 +598,13 @@ fn build_capability(
             // and asks for TPM_RC_VALUE when it is not in the range the
             // capability covers, which for a timer is TPM_RH_ACT_0 to
             // TPM_RH_ACT_F.
-            if !(crate::tpm::constants::rh::ACT_0..=crate::tpm::constants::rh::ACT_F)
-                .contains(&property)
+            // Part 3 Table 236 note 3 answers TPM_RC_VALUE only when the
+            // handle "does not reference the range for permanent handles", and
+            // clause 30.2 has a property that names nothing select "the next
+            // higher implemented property", so a caller may start below the
+            // timers and be given them.
+            if (property >> crate::tpm::constants::hc::HR_SHIFT) as u8
+                != crate::tpm::constants::ht::PERMANENT
             {
                 return Err(TpmRc(rc::VALUE).with_parameter(2));
             }
@@ -732,9 +737,10 @@ fn auth_policies(state: &TpmState, property: u32) -> Vec<crate::tpm::structures:
                 Err(_) => continue,
             }
         };
-        if policy.hash_alg == alg::NULL {
-            continue;
-        }
+        // Part 2 clause 10.13.4 leaves out only a permanent handle that cannot
+        // have a policy, not one whose policy is empty: an empty one is a
+        // TPMT_HA of TPM_ALG_NULL, which is what TPM2_SetPrimaryPolicy takes to
+        // clear a policy and what a caller asking for the list expects to see.
         out.push(TaggedPolicy {
             handle,
             policy_hash: policy,
