@@ -88,7 +88,12 @@ pub fn shutdown(state: &mut TpmState, request: &Request) -> TpmResult<Response> 
     state.startup_clear = state
         .startup_clear
         .with(crate::tpm::structures::attributes::StartupClearAttributes::ORDERLY);
-    state.started = false;
+    // Part 3 clause 9.4.1: this command "saves TPM state but does not change
+    // the state other than the internal indication that the context has been
+    // saved. The TPM shall continue to accept commands." So the TPM stays
+    // started, and it is the next command that undoes the indication. Marking
+    // the TPM as not started here answered TPM_RC_INITIALIZE to everything
+    // that followed, including a second TPM2_Shutdown.
     respond(|_| Ok(()))
 }
 

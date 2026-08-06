@@ -464,13 +464,39 @@ fn shutdown_and_restart_keeps_the_state() {
     let h = Harness::started("shutdown");
     let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
     assert_eq!(r.code, rc::SUCCESS);
-    // After a shutdown the TPM will not take commands until it starts again.
+
+    // Part 3 clause 9.4.1: TPM2_Shutdown "saves TPM state but does not change
+    // the state other than the internal indication that the context has been
+    // saved. The TPM shall continue to accept commands."
     let r = h.send(&command(st::NO_SESSIONS, cc::GetRandom, &[], None, &[0x00, 0x08]));
-    assert_eq!(r.code, rc::INITIALIZE);
+    assert_eq!(r.code, rc::SUCCESS, "a command after a shutdown -> {:08x}", r.code);
+
+    // The same clause nullifies the shutdown when a command follows it, and
+    // then "the next TPM2_Startup() shall be TPM2_Startup(TPM_SU_CLEAR)".
+    h.restart();
     let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
+    assert_eq!(
+        r.code,
+        rc::VALUE + (1 << 8) + 0x40,
+        "Startup(STATE) after the shutdown was nullified -> {:08x}",
+        r.code
+    );
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::SUCCESS, "Startup(CLEAR) -> {:08x}", r.code);
+
+    // A shutdown with nothing after it does resume.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
     assert_eq!(r.code, rc::SUCCESS);
+    h.restart();
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
+    assert_eq!(r.code, rc::SUCCESS, "Startup(STATE) -> {:08x}", r.code);
     let r = h.send(&command(st::NO_SESSIONS, cc::GetRandom, &[], None, &[0x00, 0x08]));
     assert_eq!(r.code, rc::SUCCESS);
+
+    // Part 3 clause 9.3.1 takes a second TPM2_Startup with no _TPM_Init
+    // between them as TPM_RC_INITIALIZE.
+    let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
+    assert_eq!(r.code, rc::INITIALIZE, "a second Startup -> {:08x}", r.code);
 }
 
 #[test]
@@ -1292,7 +1318,9 @@ fn a_startup_flushes_every_transient_context() {
 
     let r = h.send(&command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
     assert_eq!(r.code, rc::SUCCESS);
-    // No power cycle: the next command is the startup itself.
+    // Part 3 clause 9.3.1: "TPM2_Startup() is always preceded by _TPM_Init",
+    // so the power cycle comes between the two.
+    h.restart();
     let r = h.send(&command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
     assert_eq!(r.code, rc::SUCCESS, "Startup(STATE) -> {:08x}", r.code);
 

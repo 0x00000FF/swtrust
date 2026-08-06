@@ -63,6 +63,25 @@ fn execute(state: &mut TpmState, locality: u8, command: &[u8]) -> TpmResult<Vec<
         return Err(TpmRc(rc::INITIALIZE));
     }
 
+    // Part 3 clause 9.4.1: "if a subsequent command changes TPM state saved by
+    // [TPM2_Shutdown], then the effect of this command is nullified. The TPM
+    // MAY nullify this command for any subsequent command rather than check
+    // whether the command changed state saved by this command. If this command
+    // is nullified, and if no TPM2_Shutdown() occurs before the next
+    // TPM2_Startup(), then the next TPM2_Startup() shall be
+    // TPM2_Startup(TPM_SU_CLEAR)." The permitted shortcut is taken: any command
+    // other than another TPM2_Shutdown undoes the indication, which is what
+    // makes the next startup a disorderly one.
+    if state.started
+        && request.code != cc::Shutdown
+        && state.shutdown_type != crate::tpm::constants::su::NONE
+    {
+        state.shutdown_type = crate::tpm::constants::su::NONE;
+        state.startup_clear = state.startup_clear.without(
+            crate::tpm::structures::attributes::StartupClearAttributes::ORDERLY,
+        );
+    }
+
     // A command that needs physical presence must have it asserted. Part 3
     // clause 26.2.1 says TPM2_PP_Commands always does, whatever the list that
     // command itself maintains happens to hold. For the rest, the list makes a

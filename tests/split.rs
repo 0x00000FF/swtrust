@@ -900,9 +900,12 @@ fn a_commit_survives_a_resume_and_a_restart_but_not_a_reset() {
     assert_eq!(r.code, rc::SUCCESS);
     let (_, counter) = commit_response(&r.body);
 
-    // Shutdown(STATE) then Startup(STATE) is a TPM Resume.
+    // Shutdown(STATE), a power cycle, then Startup(STATE) is a TPM Resume.
+    // Part 3 clause 9.3.1: "TPM2_Startup() is always preceded by _TPM_Init".
     let r = send(&h, &command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x01]));
     assert_eq!(r.code, rc::SUCCESS, "Shutdown -> {:08x}", r.code);
+    h.tpm.power_off();
+    h.tpm.power_on();
     let r = send(&h, &command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x01]));
     assert_eq!(r.code, rc::SUCCESS, "Startup(STATE) -> {:08x}", r.code);
 
@@ -937,10 +940,12 @@ fn a_commit_survives_a_resume_and_a_restart_but_not_a_reset() {
         r.code
     );
 
-    // A TPM Reset is Shutdown(CLEAR) then Startup(CLEAR), and that does
-    // initialize them, so a new commit starts the counter again.
+    // A TPM Reset is Shutdown(CLEAR), a power cycle, then Startup(CLEAR), and
+    // that does initialize them, so a new commit starts the counter again.
     let r = send(&h, &command(st::NO_SESSIONS, cc::Shutdown, &[], None, &[0x00, 0x00]));
     assert_eq!(r.code, rc::SUCCESS);
+    h.tpm.power_off();
+    h.tpm.power_on();
     let r = send(&h, &command(st::NO_SESSIONS, cc::Startup, &[], None, &[0x00, 0x00]));
     assert_eq!(r.code, rc::SUCCESS, "Startup(CLEAR) -> {:08x}", r.code);
     let (handle, _) = primary(&h, 0x001A, Some(0));
