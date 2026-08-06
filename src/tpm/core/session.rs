@@ -719,6 +719,13 @@ impl SessionSlots {
 
     /// Take the next session identifier, which clause 27.2.2 does when a
     /// session context is created or loaded.
+    ///
+    /// The counter starts at one and is read before it steps, so the first
+    /// identifier handed out is one. Part 1 Table 41 gives contextCount an
+    /// initialization value of zero, and the reference implementation steps it
+    /// before reading, which also makes one the first identifier. Zero is what
+    /// the same table reserves in contextArray to mean that an element "is not
+    /// assigned", so it is the one value that may never be handed out.
     pub fn next_context_id(&mut self) -> u64 {
         let id = self.context_counter;
         self.context_counter = self.context_counter.saturating_add(1);
@@ -896,6 +903,7 @@ impl SessionSlots {
         self.sessions.clear();
         self.saved.clear();
         self.version.clear();
+        // One, not zero, for the reason next_context_id gives.
         self.context_counter = 1;
         self.object_counter = 1;
     }
